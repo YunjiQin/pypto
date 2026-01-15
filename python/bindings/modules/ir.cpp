@@ -15,6 +15,7 @@
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
 
+#include <any>
 #include <memory>
 #include <string>
 #include <tuple>
@@ -23,6 +24,7 @@
 
 #include "../module.h"
 #include "pypto/core/common.h"
+#include "pypto/core/error.h"
 #include "pypto/ir/core.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
@@ -44,6 +46,24 @@ namespace python {
 
 using namespace pypto::ir;  // NOLINT(build/namespaces)
 using pypto::DataType;
+
+template <typename T>
+bool TryConvertAnyToPy(const std::any& value, nb::object& out) {
+  if (value.type() != typeid(T)) {
+    return false;
+  }
+  out = nb::cast(std::any_cast<const T&>(value));
+  return true;
+}
+
+template <typename... Ts>
+nb::object AnyToPyObject(const std::any& value, const std::string& key) {
+  nb::object out;
+  if ((TryConvertAnyToPy<Ts>(value, out) || ...)) {
+    return out;
+  }
+  throw pypto::TypeError("Attribute '" + key + "' has unsupported type");
+}
 
 // Helper to bind a single field using reflection
 template <typename ClassType, typename PyClassType, typename FieldDesc>
@@ -130,7 +150,16 @@ void BindIR(nb::module_& m) {
   // Op - operation/function
   nb::class_<Op>(ir, "Op", "Represents callable operations in the IR")
       .def(nb::init<std::string>(), nb::arg("name"), "Create an operation with the given name")
-      .def_ro("name", &Op::name_, "Operation name");
+      .def_ro("name", &Op::name_, "Operation name")
+      .def(
+          "get_attr",
+          [](const Op& self, const std::string& key) -> nb::object {
+            const auto& value = self.GetAttrAny(key);
+            return AnyToPyObject<std::string, int, int64_t, bool, float, double>(value, key);
+          },
+          nb::arg("key"), "Get an attribute value (automatically determines type)")
+      .def("has_attr", &Op::HasAttr, nb::arg("key"), "Check if an attribute exists")
+      .def("get_attr_keys", &Op::GetAttrKeys, "Get all attribute keys");
 
   // GlobalVar - global function reference
   nb::class_<GlobalVar, Op>(ir, "GlobalVar",
