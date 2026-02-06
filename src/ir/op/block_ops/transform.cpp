@@ -22,6 +22,7 @@
 #include <utility>
 #include <vector>
 
+#include "pypto/codegen/cce/cce_codegen.h"
 #include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/expr.h"
@@ -236,6 +237,48 @@ TypePtr DeduceTileTransposeType(const std::vector<ExprPtr>& args,
 }
 
 // ============================================================================
+// CCE Codegen Functions
+// ============================================================================
+CCECodegenFunc MakeTileViewCodegenCCE() {
+  return [](const CallPtr& op, codegen::CCECodegen& codegen) -> std::string {
+    (void)op;
+    (void)codegen;
+    return "";
+  };
+}
+
+CCECodegenFunc MakeTileReshapeCodegenCCE() {
+  return [](const CallPtr& op, codegen::CCECodegen& codegen) -> std::string {
+    std::string target_var = codegen.GetCurrentResultTarget();
+    std::string input_var = codegen.GetExprAsCode(op->args_[0]);
+
+    codegen.Emit("TRESHAPE(" + target_var + ", " + input_var + ");");
+    return "";
+  };
+}
+
+CCECodegenFunc MakeTileTransposeCodegenCCE() {
+  return
+      [](const CallPtr& op, codegen::CCECodegen& codegen) -> std::string {
+        std::string target_var = codegen.GetCurrentResultTarget();
+        std::string input_var = codegen.GetExprAsCode(op->args_[0]);
+        int axis1 = codegen.GetConstIntValue(op->args_[1]);
+        int axis2 = codegen.GetConstIntValue(op->args_[2]);
+        size_t ndim = As<TileType>(op->args_[0]->GetType())->shape_.size();
+
+        INTERNAL_CHECK(ndim == 2) << "Codegen only supports 2D tiles, but got " << ndim << "D tile";
+        INTERNAL_CHECK(axis1 != axis2)
+            << "tile.transpose: axis1 and axis2 must be different, but got axis1=axis2=" << axis1;
+        INTERNAL_CHECK(axis1 >= 0 && axis1 < ndim && axis2 >= 0 && axis2 < ndim)
+            << "tile.transpose: axis1 and axis2 must be in range [0, " << ndim << "), but got axis1=" << axis1
+            << ", axis2=" << axis2;
+
+        codegen.Emit("TTRANS(" + target_var + ", " + input_var + ");");
+        return "";
+      };
+}
+
+// ============================================================================
 // Registration Function for Tile Transform Operations
 // ============================================================================
 
@@ -258,7 +301,8 @@ REGISTER_OP("block.reshape")
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
       return DeduceTileReshapeType(args, kwargs);
-    });
+    })
+    .f_codegen_cce(MakeTileReshapeCodegenCCE());
 
 REGISTER_OP("block.transpose")
     .set_op_category("BlockOp")
@@ -269,7 +313,8 @@ REGISTER_OP("block.transpose")
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
       return DeduceTileTransposeType(args, kwargs);
-    });
+    })
+    .f_codegen_cce(MakeTileTransposeCodegenCCE());
 
 }  // namespace ir
 }  // namespace pypto
