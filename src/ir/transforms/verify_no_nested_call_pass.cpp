@@ -42,6 +42,8 @@ std::string ErrorTypeToString(ErrorType type) {
       return "CALL_IN_BINARY_EXPR";
     case ErrorType::CALL_IN_UNARY_EXPR:
       return "CALL_IN_UNARY_EXPR";
+    case ErrorType::CALL_IN_WHILE_CONDITION:
+      return "CALL_IN_WHILE_CONDITION";
     default:
       return "UNKNOWN";
   }
@@ -91,6 +93,7 @@ class NoNestedCallVerifier : public IRVisitor {
   void VisitExpr_(const CastPtr& op) override { VisitUnaryExpr(op); }
   void VisitStmt_(const IfStmtPtr& op) override;
   void VisitStmt_(const ForStmtPtr& op) override;
+  void VisitStmt_(const WhileStmtPtr& op) override;
 
  private:
   std::vector<Diagnostic>& diagnostics_;
@@ -179,6 +182,19 @@ void NoNestedCallVerifier::VisitStmt_(const ForStmtPtr& op) {
   if (As<Call>(op->step_)) {
     RecordError(nested_call::ErrorType::CALL_IN_FOR_RANGE,
                 "For loop step expression cannot be a call expression", op->step_->span_);
+  }
+
+  // Continue with default traversal
+  IRVisitor::VisitStmt_(op);
+}
+
+void NoNestedCallVerifier::VisitStmt_(const WhileStmtPtr& op) {
+  if (!op) return;
+
+  // Check if condition is a call
+  if (As<Call>(op->condition_)) {
+    RecordError(nested_call::ErrorType::CALL_IN_WHILE_CONDITION,
+                "While loop condition cannot be a call expression", op->condition_->span_);
   }
 
   // Continue with default traversal
