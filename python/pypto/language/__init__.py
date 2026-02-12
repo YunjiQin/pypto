@@ -53,6 +53,7 @@ from .op.block_ops import (
     col_expand_div,
     col_expand_mul,
     col_expand_sub,
+    create_tile,
     expands,
     l0c_store,
     load,
@@ -147,6 +148,7 @@ __all__ = [
     "row_max",
     "row_sum",
     # Promoted block-only
+    "create_tile",
     "load",
     "store",
     "l0c_store",

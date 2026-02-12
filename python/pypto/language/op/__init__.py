@@ -32,6 +32,7 @@ from .block_ops import (
     col_expand_div,
     col_expand_mul,
     col_expand_sub,
+    create_tile,
     expands,
     l0c_store,
     load,
@@ -62,7 +63,6 @@ from .tensor_ops import assemble, create
 from .unified_ops import (
     add,
     cast,
-    create_tile,
     div,
     exp,
     matmul,
