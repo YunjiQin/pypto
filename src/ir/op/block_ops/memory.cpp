@@ -179,6 +179,21 @@ TypePtr DeduceBlockMoveType(const std::vector<ExprPtr>& args,
   return std::make_shared<TileType>(output_shape, tile_type->dtype_);
 }
 
+TypePtr DeduceBlockUbCopyType(const std::vector<ExprPtr>& args,
+                              const std::vector<std::pair<std::string, std::any>>& kwargs,
+                              const std::string& op_name) {
+  // Validate exactly 1 argument
+  CHECK(args.size() == 1) << "The operator " << op_name << " requires 1 argument, but got " << args.size();
+
+  // Validate argument is TileType
+  auto tile_type = As<TileType>(args[0]->GetType());
+  CHECK(tile_type) << "The operator " << op_name << " requires first argument to be a TileType, but got "
+                   << args[0]->GetType()->TypeName();
+
+  // Return TileType with same shape and dtype
+  return std::make_shared<TileType>(tile_type->shape_, tile_type->dtype_);
+}
+
 TypePtr DeduceBlockAllocType(const std::vector<ExprPtr>& args,
                              const std::vector<std::pair<std::string, std::any>>& kwargs,
                              const std::string& op_name) {
@@ -341,6 +356,15 @@ REGISTER_OP("block.move")
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
       return DeduceBlockMoveType(args, kwargs, "block.move");
+    });
+
+REGISTER_OP("block.ub_copy")
+    .set_op_category("BlockOp")
+    .set_description("Copy tile within UB (Unified Buffer) memory - UB to UB only")
+    .add_argument("tile", "Input tile (TileType) in UB memory")
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      return DeduceBlockUbCopyType(args, kwargs, "block.ub_copy");
     });
 
 REGISTER_OP("block.alloc")

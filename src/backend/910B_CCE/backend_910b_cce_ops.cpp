@@ -248,9 +248,47 @@ static std::string MakeBlockL0CStoreCodegenCCE(const ir::CallPtr& op, codegen::C
 static std::string MakeBlockMoveCodegenCCE(const ir::CallPtr& op, codegen::CodegenBase& codegen_base) {
   auto& codegen = dynamic_cast<codegen::CCECodegen&>(codegen_base);
   CHECK(op->args_.size() == 1) << "block.move requires 1 argument: src";
+
+  // Validate memory locations: can't UB→UB copies
+  auto src_type = ir::As<ir::TileType>(op->args_[0]->GetType());
+  INTERNAL_CHECK(src_type != nullptr) << "Internal error: block.move source must be TileType";
+  INTERNAL_CHECK(src_type->memref_.has_value())
+      << "Internal error: block.move source TileType must have MemRef (InitMemRef pass should have run)";
+
+  int target_memory = op->GetKwarg<int>("target_memory");
+  ir::MemorySpace src_mem = src_type->memref_.value()->memory_space_;
+  CHECK(!(src_mem == ir::MemorySpace::UB && target_memory == 1))
+      << "block.move: UB to UB move should use block.ub_copy";
+
   std::string src = codegen.GetExprAsCode(op->args_[0]);
   std::string dst = codegen.GetCurrentResultTarget();
 
+  codegen.Emit("TMOV(" + dst + ", " + src + ");");
+
+  return "";
+}
+
+// Helper function for block.ub_copy (UB to UB copy only)
+static std::string MakeBlockUbCopyCodegenCCE(const ir::CallPtr& op, codegen::CodegenBase& codegen_base) {
+  auto& codegen = dynamic_cast<codegen::CCECodegen&>(codegen_base);
+  CHECK(op->args_.size() == 1) << "block.ub_copy requires 1 argument: src";
+
+  // Validate memory locations: ONLY support UB→UB copies
+  auto src_type = ir::As<ir::TileType>(op->args_[0]->GetType());
+  INTERNAL_CHECK(src_type != nullptr) << "Internal error: block.ub_copy source must be TileType";
+  INTERNAL_CHECK(src_type->memref_.has_value())
+      << "Internal error: block.ub_copy source TileType must have MemRef (InitMemRef pass should have run)";
+
+  // Verify source is on UB
+  ir::MemorySpace src_mem = src_type->memref_.value()->memory_space_;
+  CHECK(src_mem == ir::MemorySpace::UB)
+      << "block.ub_copy: source must be on UB memory, got " << ir::MemorySpaceToString(src_mem);
+
+  // Get source and destination expressions
+  std::string src = codegen.GetExprAsCode(op->args_[0]);
+  std::string dst = codegen.GetCurrentResultTarget();
+
+  // Emit TMOV instruction for UB→UB copy
   codegen.Emit("TMOV(" + dst + ", " + src + ");");
 
   return "";
@@ -506,6 +544,12 @@ REGISTER_BACKEND_OP(Backend910B_CCE, "block.move")
     .set_pipe(ir::PipeType::MTE1)
     .f_codegen([](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
       return MakeBlockMoveCodegenCCE(op, codegen);
+    });
+
+REGISTER_BACKEND_OP(Backend910B_CCE, "block.ub_copy")
+    .set_pipe(ir::PipeType::V)
+    .f_codegen([](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
+      return MakeBlockUbCopyCodegenCCE(op, codegen);
     });
 
 REGISTER_BACKEND_OP(Backend910B_CCE, "block.get_block_idx")

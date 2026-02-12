@@ -317,3 +317,118 @@ class TestBasicMemoryReuse:
         _assert_all_have_memrefs(func)
         _assert_shares_memref(func, "tile_a", "tile_d")
         _assert_shares_memref(func, "tile_b", "tile_e")
+
+
+class TestViewOperationsMemoryReuse:
+    """Tests for view operations (reshape/view/transpose) with memory reuse."""
+
+    def test_reshape_shares_memref_with_input(self):
+        """Single reshape operation should share MemRef with input tile."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self, input_a: pl.Tensor[[64, 64], pl.FP32], output: pl.Tensor[[64, 64], pl.FP32]
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                tile_a: pl.Tile[[64, 64], pl.FP32] = pl.load(input_a, [0, 0], [64, 64])
+                tile_b: pl.Tile[[4096, 1], pl.FP32] = pl.reshape(tile_a, [4096, 1])
+                tile_c: pl.Tile[[4096, 1], pl.FP32] = pl.add(tile_b, tile_b)
+                tile_d: pl.Tile[[64, 64], pl.FP32] = pl.reshape(tile_c, [64, 64])
+                result: pl.Tensor[[64, 64], pl.FP32] = pl.store(tile_d, [0, 0], [64, 64], output)
+                return result
+
+        func = _run_memory_reuse(Before)
+
+        _assert_all_have_memrefs(func)
+        # tile_b should share MemRef with tile_a (view operation)
+        _assert_shares_memref(func, "tile_a", "tile_b")
+        # tile_d should share MemRef with tile_c (view operation)
+        _assert_shares_memref(func, "tile_c", "tile_d")
+
+    def test_reshape_chain_shares_memref(self):
+        """Chained reshapes should all share the same MemRef."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self, input_a: pl.Tensor[[64, 64], pl.FP32], output: pl.Tensor[[64, 64], pl.FP32]
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                tile_a: pl.Tile[[64, 64], pl.FP32] = pl.load(input_a, [0, 0], [64, 64])
+                tile_b: pl.Tile[[4096, 1], pl.FP32] = pl.reshape(tile_a, [4096, 1])
+                tile_c: pl.Tile[[1, 4096], pl.FP32] = pl.reshape(tile_b, [1, 4096])
+                tile_d: pl.Tile[[64, 64], pl.FP32] = pl.reshape(tile_c, [64, 64])
+                result: pl.Tensor[[64, 64], pl.FP32] = pl.store(tile_d, [0, 0], [64, 64], output)
+                return result
+
+        func = _run_memory_reuse(Before)
+
+        _assert_all_have_memrefs(func)
+        # All tiles in the chain should share the same MemRef
+        _assert_shares_memref(func, "tile_a", "tile_b")
+        _assert_shares_memref(func, "tile_b", "tile_c")
+        _assert_shares_memref(func, "tile_c", "tile_d")
+        # Transitive: tile_a and tile_d should also share
+        _assert_shares_memref(func, "tile_a", "tile_d")
+
+    def test_reshape_not_broken_by_memory_reuse(self):
+        """BasicMemoryReuse should propagate reuse to ALL variables sharing MemRef."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self, input_a: pl.Tensor[[64, 64], pl.FP32], output: pl.Tensor[[64, 64], pl.FP32]
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                # tile_c is dead before tile_a/tile_b are defined
+                tile_c: pl.Tile[[64, 64], pl.FP32] = pl.load(input_a, [0, 0], [64, 64])
+                _tile_d: pl.Tile[[64, 64], pl.FP32] = pl.add(tile_c, tile_c)
+
+                # tile_a and tile_b share MemRef (from InitMemRef)
+                tile_a: pl.Tile[[64, 64], pl.FP32] = pl.load(input_a, [0, 0], [64, 64])
+                _tile_b: pl.Tile[[4096, 1], pl.FP32] = pl.reshape(tile_a, [4096, 1])
+
+                # BasicMemoryReuse should identify: tile_a can reuse tile_c
+                # When tile_a reuses tile_c, tile_b should ALSO get tile_c's MemRef
+                tile_e: pl.Tile[[64, 64], pl.FP32] = pl.add(tile_a, tile_a)
+                result: pl.Tensor[[64, 64], pl.FP32] = pl.store(tile_e, [0, 0], [64, 64], output)
+                return result
+
+        func = _run_memory_reuse(Before)
+
+        _assert_all_have_memrefs(func)
+        # Verify tile_a and tile_b still share MemRef (propagated reuse)
+        _assert_shares_memref(func, "tile_a", "_tile_b")
+        # Verify both reused tile_c's buffer
+        _assert_shares_memref(func, "tile_a", "tile_c")
+        _assert_shares_memref(func, "_tile_b", "tile_c")
+
+    def test_reshape_shared_buffer_can_be_reused_after_all_dead(self):
+        """After all aliases are dead, shared buffer can be reused."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self, input_a: pl.Tensor[[64, 64], pl.FP32], output: pl.Tensor[[64, 64], pl.FP32]
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                # tile_a and tile_b share MemRef
+                tile_a: pl.Tile[[64, 64], pl.FP32] = pl.load(input_a, [0, 0], [64, 64])
+                _tile_b: pl.Tile[[4096, 1], pl.FP32] = pl.reshape(tile_a, [4096, 1])
+                _tile_c: pl.Tile[[64, 64], pl.FP32] = pl.add(tile_a, tile_a)
+                # Both tile_a and tile_b are dead after this point
+
+                # tile_d can reuse the shared buffer (tile_a/tile_b)
+                tile_d: pl.Tile[[64, 64], pl.FP32] = pl.load(input_a, [0, 0], [64, 64])
+                tile_e: pl.Tile[[64, 64], pl.FP32] = pl.add(tile_d, tile_d)
+                result: pl.Tensor[[64, 64], pl.FP32] = pl.store(tile_e, [0, 0], [64, 64], output)
+                return result
+
+        func = _run_memory_reuse(Before)
+
+        _assert_all_have_memrefs(func)
+        # tile_a and tile_b should still share MemRef
+        _assert_shares_memref(func, "tile_a", "_tile_b")
+        # tile_d should reuse the shared buffer (either tile_a or tile_b, they're the same)
+        _assert_shares_memref(func, "tile_d", "tile_a")

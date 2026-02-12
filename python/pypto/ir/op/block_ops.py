@@ -238,6 +238,26 @@ def move(
     return _ir_core.create_op_call("block.move", args, kwargs, actual_span)
 
 
+def ub_copy(
+    tile: Expr,
+    span: Optional[Span] = None,
+) -> Call:
+    """Copy tile within UB (Unified Buffer) memory.
+
+    This operation is specifically for UB→UB copies. Both source and destination
+    must be on UB memory. For other memory transfer patterns, use move().
+
+    Args:
+        tile: Input tile (TileType) in UB memory
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression that returns a TileType in UB memory space
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("block.ub_copy", [tile], {}, actual_span)
+
+
 def get_block_idx(span: Optional[Span] = None) -> Call:
     """Get the current block index.
 

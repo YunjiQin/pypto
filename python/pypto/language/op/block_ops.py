@@ -21,6 +21,7 @@ __all__ = [
     "store",
     "l0c_store",
     "move",
+    "ub_copy",
     "full",
     "get_block_idx",
     "add",
@@ -185,6 +186,23 @@ def move(tile: Tile, target_memory: int, transpose: bool = False) -> Tile:
         Tile wrapping the move operation
     """
     call_expr = _ir_ops.move(tile.unwrap(), target_memory, transpose)
+    return Tile(expr=call_expr)
+
+
+def ub_copy(tile: Tile) -> Tile:
+    """Copy tile within UB (Unified Buffer) memory.
+
+    This is a specialized operation for copying tiles within UB memory (UB→UB).
+    Both source and destination must be on UB. For other memory transfers,
+    use move() with the target_memory parameter.
+
+    Args:
+        tile: Input tile (must be in UB memory)
+
+    Returns:
+        Tile wrapping the ub_copy operation (result is in UB memory)
+    """
+    call_expr = _ir_ops.ub_copy(tile.unwrap())
     return Tile(expr=call_expr)
 
 

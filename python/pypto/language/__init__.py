@@ -53,6 +53,7 @@ from .op.block_ops import (
     col_expand_div,
     col_expand_mul,
     col_expand_sub,
+    create_tile,
     expands,
     l0c_store,
     load,
@@ -74,6 +75,7 @@ from .op.block_ops import (
     sqrt,
     store,
     sum,
+    ub_copy,
 )
 from .op.tensor_ops import assemble, create, dim
 from .op.unified_ops import (
@@ -147,10 +149,12 @@ __all__ = [
     "row_max",
     "row_sum",
     # Promoted block-only
+    "create_tile",
     "load",
     "store",
     "l0c_store",
     "move",
+    "ub_copy",
     "neg",
     "sqrt",
     "rsqrt",

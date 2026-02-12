@@ -32,6 +32,7 @@ from .block_ops import (
     col_expand_div,
     col_expand_mul,
     col_expand_sub,
+    create_tile,
     expands,
     l0c_store,
     load,
@@ -53,6 +54,7 @@ from .block_ops import (
     sqrt,
     store,
     sum,
+    ub_copy,
 )
 
 # Promoted tensor-only ops (accessible as pl.create, etc.)
@@ -62,7 +64,6 @@ from .tensor_ops import assemble, create, dim
 from .unified_ops import (
     add,
     cast,
-    create_tile,
     div,
     exp,
     matmul,
@@ -102,6 +103,7 @@ __all__ = [
     "store",
     "l0c_store",
     "move",
+    "ub_copy",
     "neg",
     "sqrt",
     "rsqrt",

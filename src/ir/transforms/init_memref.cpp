@@ -65,6 +65,9 @@ const std::map<std::string, std::optional<MemorySpace>> kBlockOpMemoryRules = {
     {"block.matmul_acc", MemorySpace::L0C},  // Fixed L0C
 };
 
+// Helper to check if operation is a view operation (zero-copy metadata transform)
+bool IsViewOperation(const std::string& op_name) { return op_name == "block.reshape"; }
+
 // Visitor to identify memory space for each variable
 class MemRefUsageVisitor : public IRVisitor {
  public:
@@ -252,8 +255,36 @@ class InitMemRefMutator : public IRMutator {
     // First visit the value (RHS)
     auto new_value = VisitExpr(op->value_);
 
-    // Check if the RHS is a block.store call
+    // Check if the RHS is a Call expression
     if (auto call = std::dynamic_pointer_cast<const Call>(op->value_)) {
+      LOG_DEBUG << "Processing AssignStmt for " << op->var_->name_ << " with call to " << call->op_->name_;
+
+      // Handle view operations: output should share MemRef with input tile
+      if (IsViewOperation(call->op_->name_) && call->args_.size() > 0) {
+        LOG_DEBUG << "Detected view operation: " << call->op_->name_;
+        // Get the input tile (first argument) after mutation
+        auto new_call = std::dynamic_pointer_cast<const Call>(new_value);
+        if (new_call && new_call->args_.size() > 0) {
+          auto input_tile_arg = new_call->args_[0];
+
+          // Extract MemRef from input tile
+          auto shared_memref = ExtractMemRefFromType(input_tile_arg->GetType());
+
+          // Create new variable with shared MemRef
+          if (shared_memref.has_value()) {
+            LOG_DEBUG << "Sharing MemRef from input tile to " << op->var_->name_;
+            TypePtr new_type = CloneTypeWithMemRef(op->var_->GetType(), shared_memref);
+            VarPtr new_var = std::make_shared<Var>(op->var_->name_, new_type, op->var_->span_);
+            var_map_[op->var_] = new_var;
+
+            return std::make_shared<AssignStmt>(new_var, new_value, op->span_);
+          } else {
+            LOG_DEBUG << "Input tile has no MemRef yet";
+          }
+        }
+      }
+
+      // Check if the RHS is a block.store call
       if (call->op_->name_ == "block.store" && call->args_.size() > 5) {
         // Get the 6th argument (output tensor) after mutation
         auto new_call = std::dynamic_pointer_cast<const Call>(new_value);

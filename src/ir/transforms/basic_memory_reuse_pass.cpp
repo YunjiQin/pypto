@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <climits>
 #include <map>
 #include <memory>
 #include <set>
@@ -65,13 +66,21 @@ std::map<StmtPtr, int> AssignDeclarationOrder(const std::vector<BasicBlock>& blo
 }
 
 /**
+ * @brief Result of lifetime computation
+ */
+struct LifetimeAnalysisResult {
+  std::vector<LifetimeInterval> lifetimes;
+  std::map<VarPtr, std::vector<VarPtr>> var_sharing_groups;
+};
+
+/**
  * @brief Compute lifetime intervals from dependencies
  *
  * This function identifies memory reuse opportunities using ONLY dependency
  * relationships (topological ordering), NOT execution timing simulation.
  */
-std::vector<LifetimeInterval> ComputeLifetimesFromDependencies(
-    const std::vector<BasicBlock>& blocks, const std::vector<DependencyEdge>& dependencies) {
+LifetimeAnalysisResult ComputeLifetimesFromDependencies(const std::vector<BasicBlock>& blocks,
+                                                        const std::vector<DependencyEdge>& dependencies) {
   std::vector<LifetimeInterval> lifetimes;
 
   // Step 1: Assign topological order to all statements
@@ -79,7 +88,7 @@ std::vector<LifetimeInterval> ComputeLifetimesFromDependencies(
 
   if (stmt_order.empty()) {
     LOG_WARN << "Failed to compute topological order";
-    return lifetimes;
+    return {lifetimes, {}};
   }
 
   // Step 2: Build maps: var -> defining stmt, var -> list of using stmts
@@ -129,9 +138,39 @@ std::vector<LifetimeInterval> ComputeLifetimesFromDependencies(
     }
   }
 
-  // Step 3: For each TileType variable with MemRef, compute lifetime (in definition order)
+  // Step 2.5: Build MemRef sharing groups
+  // Variables that share the same MemRef object (via shared_ptr) should be treated
+  // as a single logical buffer with merged lifetime
+  std::map<const MemRef*, std::vector<VarPtr>> memref_groups;
   for (const auto& var : ordered_vars) {
-    const auto& def_stmt = var_def_stmt[var];
+    auto tile_type = As<TileType>(var->GetType());
+    if (tile_type && tile_type->memref_.has_value()) {
+      const MemRef* memref_ptr = tile_type->memref_.value().get();
+      memref_groups[memref_ptr].push_back(var);
+    }
+  }
+
+  // Build reverse map: var -> all vars sharing same MemRef
+  std::map<VarPtr, std::vector<VarPtr>> var_sharing_groups;
+  for (const auto& [memref_ptr, vars] : memref_groups) {
+    if (vars.size() > 1) {
+      // Multiple variables share this MemRef
+      for (const auto& var : vars) {
+        var_sharing_groups[var] = vars;
+      }
+      LOG_DEBUG << "MemRef sharing group: " << vars.size() << " variables share same MemRef";
+    }
+  }
+
+  // Step 3: For each TileType variable with MemRef, compute lifetime (in definition order)
+  // For variables sharing MemRef, use MERGED lifetime
+  std::set<VarPtr> processed_vars;  // Track which vars we've already processed
+
+  for (const auto& var : ordered_vars) {
+    if (processed_vars.count(var)) {
+      continue;  // Already processed as part of a sharing group
+    }
+
     auto tile_type = As<TileType>(var->GetType());
     if (!tile_type || !tile_type->memref_.has_value()) {
       continue;  // Skip variables without MemRef
@@ -139,39 +178,63 @@ std::vector<LifetimeInterval> ComputeLifetimesFromDependencies(
 
     const auto& memref = tile_type->memref_.value();
 
-    // Def point
-    int def_point = stmt_order[def_stmt];
-
-    // Last use point (find maximum order among all use statements)
-    int last_use = def_point;  // At least def point
-    if (var_use_stmts.count(var)) {
-      LOG_DEBUG << "Variable " << var->name_ << " has " << var_use_stmts[var].size() << " use statements";
-      for (const auto& use_stmt : var_use_stmts[var]) {
-        if (stmt_order.count(use_stmt)) {
-          int use_order = stmt_order[use_stmt];
-          LOG_DEBUG << "  Use at order " << use_order;
-          last_use = std::max(last_use, use_order);
-        }
-      }
+    // Check if this variable shares MemRef with others
+    std::vector<VarPtr> sharing_group;
+    if (var_sharing_groups.count(var)) {
+      sharing_group = var_sharing_groups[var];
     } else {
-      LOG_DEBUG << "Variable " << var->name_ << " has no recorded uses";
+      sharing_group = {var};  // Single variable
     }
 
-    // Create lifetime interval
+    // Compute MERGED lifetime for all variables in the sharing group
+    int min_def_point = INT_MAX;
+    int max_last_use = INT_MIN;
+
+    for (const auto& group_var : sharing_group) {
+      const auto& def_stmt = var_def_stmt[group_var];
+      int def_point = stmt_order[def_stmt];
+      int last_use = def_point;
+
+      if (var_use_stmts.count(group_var)) {
+        LOG_DEBUG << "Variable " << group_var->name_ << " has " << var_use_stmts[group_var].size()
+                  << " use statements";
+        for (const auto& use_stmt : var_use_stmts[group_var]) {
+          if (stmt_order.count(use_stmt)) {
+            int use_order = stmt_order[use_stmt];
+            LOG_DEBUG << "  Use at order " << use_order;
+            last_use = std::max(last_use, use_order);
+          }
+        }
+      } else {
+        LOG_DEBUG << "Variable " << group_var->name_ << " has no recorded uses";
+      }
+
+      min_def_point = std::min(min_def_point, def_point);
+      max_last_use = std::max(max_last_use, last_use);
+    }
+
+    // Create ONE lifetime interval for the entire sharing group
+    // Use the first variable as the representative
     LifetimeInterval interval;
-    interval.variable = var;
-    interval.def_point = def_point;
-    interval.last_use_point = last_use;
+    interval.variable = sharing_group[0];
+    interval.def_point = min_def_point;
+    interval.last_use_point = max_last_use;
     interval.memory_space = memref->memory_space_;
     interval.size = memref->size_;
 
     lifetimes.push_back(interval);
 
-    LOG_DEBUG << "Lifetime for " << var->name_ << ": [" << def_point << ", " << last_use << "]"
+    // Mark all variables in the group as processed
+    for (const auto& group_var : sharing_group) {
+      processed_vars.insert(group_var);
+    }
+
+    LOG_DEBUG << "Lifetime for sharing group (representative: " << sharing_group[0]->name_
+              << ", size: " << sharing_group.size() << "): [" << min_def_point << ", " << max_last_use << "]"
               << " space=" << static_cast<int>(interval.memory_space) << " size=" << interval.size;
   }
 
-  return lifetimes;
+  return {lifetimes, var_sharing_groups};
 }
 
 /**
@@ -265,11 +328,14 @@ std::map<VarPtr, VarPtr> IdentifyReuseOpportunities(const std::vector<LifetimeIn
 /**
  * @brief Apply MemRef sharing to the statement tree
  */
-StmtPtr ApplyMemRefSharing(const StmtPtr& stmt, const std::map<VarPtr, VarPtr>& reuse_map) {
+StmtPtr ApplyMemRefSharing(const StmtPtr& stmt, const std::map<VarPtr, VarPtr>& reuse_map,
+                           const std::map<VarPtr, std::vector<VarPtr>>& var_sharing_groups) {
   // Custom IRMutator for MemRef sharing
   class MemRefSharingMutator : public IRMutator {
    public:
-    explicit MemRefSharingMutator(const std::map<VarPtr, VarPtr>& reuse_map) : reuse_map_(reuse_map) {}
+    explicit MemRefSharingMutator(const std::map<VarPtr, VarPtr>& reuse_map,
+                                  const std::map<VarPtr, std::vector<VarPtr>>& sharing_groups)
+        : reuse_map_(reuse_map), sharing_groups_(sharing_groups) {}
 
     StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
       // Check if this variable should reuse another's MemRef
@@ -306,6 +372,29 @@ StmtPtr ApplyMemRefSharing(const StmtPtr& stmt, const std::map<VarPtr, VarPtr>& 
         // This ensures that all subsequent references to the old variable will be replaced with the new one
         var_substitution_map_[op->var_] = new_var;
 
+        // CRITICAL: If this variable shares MemRef with others (view operations),
+        // we need to update ALL of them to use the new MemRef
+        if (sharing_groups_.count(op->var_)) {
+          const auto& sharing_group = sharing_groups_.at(op->var_);
+          for (const auto& shared_var : sharing_group) {
+            if (shared_var != op->var_) {
+              // Create new Var for shared variable with same reused MemRef
+              auto shared_tile_type = As<TileType>(shared_var->GetType());
+              if (shared_tile_type) {
+                auto new_shared_tile_type =
+                    std::make_shared<const TileType>(shared_tile_type->shape_, shared_tile_type->dtype_,
+                                                     source_memref,  // Same reused MemRef!
+                                                     shared_tile_type->tile_view_);
+                auto new_shared_var =
+                    std::make_shared<const Var>(shared_var->name_, new_shared_tile_type, shared_var->span_);
+                var_substitution_map_[shared_var] = new_shared_var;
+
+                LOG_DEBUG << "Propagating reuse to sharing group member: " << shared_var->name_;
+              }
+            }
+          }
+        }
+
         // Visit value expression (this will recursively apply substitutions)
         ExprPtr new_value = VisitExpr(op->value_);
 
@@ -328,13 +417,14 @@ StmtPtr ApplyMemRefSharing(const StmtPtr& stmt, const std::map<VarPtr, VarPtr>& 
 
    private:
     const std::map<VarPtr, VarPtr>& reuse_map_;
+    const std::map<VarPtr, std::vector<VarPtr>>& sharing_groups_;  // var -> sharing group
     // Maps old variable objects to new variable objects (with reused MemRef)
     // This is needed because IR nodes are immutable, so we create new Var objects
     // and need to replace all references to the old ones
     std::map<VarPtr, VarPtr> var_substitution_map_;
   };
 
-  MemRefSharingMutator mutator(reuse_map);
+  MemRefSharingMutator mutator(reuse_map, var_sharing_groups);
   return mutator.VisitStmt(stmt);
 }
 
@@ -358,22 +448,22 @@ FunctionPtr TransformBasicMemoryReuse(const FunctionPtr& func) {
   }
 
   // Step 2: Compute lifetimes based on dependency graph
-  auto lifetimes = ComputeLifetimesFromDependencies(graph.blocks, graph.dependencies);
+  auto analysis_result = ComputeLifetimesFromDependencies(graph.blocks, graph.dependencies);
 
-  if (lifetimes.empty()) {
+  if (analysis_result.lifetimes.empty()) {
     LOG_WARN << "No TileType variables found, skipping memory reuse";
     return func;
   }
 
   // Step 3: Identify reuse opportunities
-  auto reuse_map = IdentifyReuseOpportunities(lifetimes);
+  auto reuse_map = IdentifyReuseOpportunities(analysis_result.lifetimes);
 
   if (reuse_map.empty()) {
     return func;
   }
 
   // Step 4: Apply MemRef sharing
-  StmtPtr new_body = ApplyMemRefSharing(func->body_, reuse_map);
+  StmtPtr new_body = ApplyMemRefSharing(func->body_, reuse_map, analysis_result.var_sharing_groups);
 
   return std::make_shared<const Function>(func->name_, func->params_, func->return_types_, new_body,
                                           func->span_, func->func_type_);
