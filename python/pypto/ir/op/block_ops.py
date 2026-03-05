@@ -15,13 +15,13 @@ unary operations, and reduction operations.
 """
 
 from collections.abc import Sequence
-from typing import Any, Literal
+from typing import Any
 
 from pypto.pypto_core import DataType
 from pypto.pypto_core import ir as _ir_core
 from pypto.pypto_core.ir import Call, ConstFloat, ConstInt, Expr, MemorySpace, Span
 
-from ..utils import _get_span_or_capture, _normalize_expr, _to_make_tuple
+from ..utils import _get_span_or_capture, _normalize_expr, _to_make_tuple, resolve_cast_mode
 
 
 def _validate_offsets_shapes(offsets_tuple: _ir_core.MakeTuple, shapes_tuple: _ir_core.MakeTuple) -> None:
@@ -936,7 +936,7 @@ def rsqrt(tile: Expr, span: Span | None = None) -> Call:
 def cast(
     tile: Expr,
     target_type: int | DataType,
-    mode: Literal["none", "rint", "round", "floor", "ceil", "trunc", "odd"] = "round",
+    mode: str | int = "round",
     span: Span | None = None,
 ) -> Call:
     """Cast tile to target data type (element-wise).
@@ -944,7 +944,8 @@ def cast(
     Args:
         tile: Input tile (TileType)
         target_type: Target data type (DataType)
-        mode: Round Mode: None(0), RINT(1), ROUND(2), FLOOR(3), CEIL(4), TRUNC(5), ODD(6)
+        mode: Rounding mode — string name ("none", "rint", "round", "floor",
+              "ceil", "trunc", "odd") or int (0–6)
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
@@ -954,10 +955,7 @@ def cast(
         >>> tile_bf16 = ...  # TileType with BF16 dtype
         >>> tile_fp32 = block.cast(tile_bf16, DataType.FP32)
     """
-    modes = {"none": 0, "rint": 1, "round": 2, "floor": 3, "ceil": 4, "trunc": 5, "odd": 6}
-    mode_val = modes.get(mode)
-    if mode_val is None:
-        raise ValueError(f"Invalid rounding mode '{mode}'. Expected one of {list(modes.keys())}.")
+    mode_val = resolve_cast_mode(mode)
 
     actual_span = _get_span_or_capture(span)
     kwargs: dict[str, Any] = {"target_type": target_type, "mode": mode_val}

@@ -16,7 +16,7 @@ or ``pl.block.add``.
 """
 
 from collections.abc import Sequence
-from typing import Literal, TypeVar, overload
+from typing import TypeVar, overload
 
 __all__ = [
     "add",
@@ -35,6 +35,7 @@ __all__ = [
     "create_tile",
 ]
 
+from pypto.ir.utils import resolve_cast_mode
 from pypto.pypto_core import DataType
 from pypto.pypto_core.ir import MemorySpace
 
@@ -230,7 +231,7 @@ def row_sum(input: T, tmp_tile: Tile | None = None) -> T:
 def cast(
     input: Tensor,
     target_type: int | DataType,
-    mode: Literal["none", "rint", "round", "floor", "ceil", "trunc", "odd"] = "round",
+    mode: str | int = "round",
 ) -> Tensor: ...
 
 
@@ -238,7 +239,7 @@ def cast(
 def cast(
     input: Tile,
     target_type: int | DataType,
-    mode: Literal["none", "rint", "round", "floor", "ceil", "trunc", "odd"] = "round",
+    mode: str | int = "round",
 ) -> Tile: ...
 
 
@@ -246,14 +247,14 @@ def cast(
 def cast(
     input: Scalar,
     target_type: int | DataType,
-    mode: Literal["none", "rint", "round", "floor", "ceil", "trunc", "odd"] = "round",
+    mode: str | int = "round",
 ) -> Scalar: ...
 
 
 def cast(
     input: Tensor | Tile | Scalar,
     target_type: int | DataType,
-    mode: Literal["none", "rint", "round", "floor", "ceil", "trunc", "odd"] = "round",
+    mode: str | int = "round",
 ) -> Tensor | Tile | Scalar:
     """Type casting, dispatched by input type."""
     if isinstance(input, Tensor):
@@ -261,7 +262,7 @@ def cast(
     if isinstance(input, Tile):
         return _block.cast(input, target_type, mode)
     if isinstance(input, Scalar):
-        if mode != "round":
+        if resolve_cast_mode(mode) != 2:
             raise ValueError(f"cast: Scalar inputs do not support non-default mode, got mode={mode!r}")
         from pypto.pypto_core import ir as _ir_core  # noqa: PLC0415
 
