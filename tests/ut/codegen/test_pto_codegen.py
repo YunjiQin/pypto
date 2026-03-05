@@ -141,11 +141,12 @@ def test_pto_codegen_basic_mlir_structure():
 
     @pl.program
     class BasicProgram:
-        @pl.function
+        @pl.function(type=pl.FunctionType.InCore)
         def test_func(self, a: pl.Tensor[[32, 32], pl.FP32], b: pl.Tensor[[32, 32], pl.FP32]):
             tile_a = pl.load(a, offsets=[0, 0], shapes=[32, 32])
             tile_b = pl.add(tile_a, 1.0)
             pl.store(tile_b, offsets=[0, 0], shapes=[32, 32], output_tensor=b)
+            return  # noqa: PLR1711 - DSL requires explicit return to build IR return statement
 
     # Compile with PTOAS strategy (applies necessary passes + codegen)
     pm = PassManager.get_strategy(OptimizationStrategy.PTOAS)
@@ -169,7 +170,7 @@ def test_pto_codegen_tensor_parameters():
 
     @pl.program
     class TensorParamProgram:
-        @pl.function
+        @pl.function(type=pl.FunctionType.InCore)
         def tensor_param_func(
             self,
             input_a: pl.Tensor[[64, 64], pl.FP32],
@@ -180,6 +181,7 @@ def test_pto_codegen_tensor_parameters():
             tile_b = pl.load(input_b, offsets=[0, 0], shapes=[32, 32])
             tile_c = pl.mul(tile_a, tile_b)
             pl.store(tile_c, offsets=[0, 0], shapes=[32, 32], output_tensor=output)
+            return  # noqa: PLR1711 - DSL requires explicit return to build IR return statement
 
     pm = PassManager.get_strategy(OptimizationStrategy.PTOAS)
     transformed_program = pm.run_passes(TensorParamProgram)
@@ -206,12 +208,13 @@ def test_pto_codegen_alloc_tile():
 
     @pl.program
     class AllocTileProgram:
-        @pl.function
+        @pl.function(type=pl.FunctionType.InCore)
         def alloc_test(self, a: pl.Tensor[[32, 32], pl.FP32], b: pl.Tensor[[32, 32], pl.FP32]):
             tile_a = pl.load(a, offsets=[0, 0], shapes=[32, 32])
             tile_b = pl.load(a, offsets=[0, 0], shapes=[32, 32])
             tile_c = pl.mul(tile_a, tile_b)
             pl.store(tile_c, offsets=[0, 0], shapes=[32, 32], output_tensor=b)
+            return  # noqa: PLR1711 - DSL requires explicit return to build IR return statement
 
     pm = PassManager.get_strategy(OptimizationStrategy.PTOAS)
     transformed_program = pm.run_passes(AllocTileProgram)
@@ -231,10 +234,11 @@ def test_pto_codegen_block_load_lowering():
 
     @pl.program
     class LoadProgram:
-        @pl.function
+        @pl.function(type=pl.FunctionType.InCore)
         def load_test(self, input: pl.Tensor[[64, 64], pl.FP32], output: pl.Tensor[[64, 64], pl.FP32]):
             tile = pl.load(input, offsets=[0, 0], shapes=[32, 32])
             pl.store(tile, offsets=[0, 0], shapes=[32, 32], output_tensor=output)
+            return  # noqa: PLR1711 - DSL requires explicit return to build IR return statement
 
     pm = PassManager.get_strategy(OptimizationStrategy.PTOAS)
     transformed_program = pm.run_passes(LoadProgram)
@@ -260,10 +264,11 @@ def test_pto_codegen_block_store_lowering():
 
     @pl.program
     class StoreProgram:
-        @pl.function
+        @pl.function(type=pl.FunctionType.InCore)
         def store_test(self, input: pl.Tensor[[32, 32], pl.FP32], output: pl.Tensor[[32, 32], pl.FP32]):
             tile = pl.load(input, offsets=[0, 0], shapes=[32, 32])
             pl.store(tile, offsets=[0, 0], shapes=[32, 32], output_tensor=output)
+            return  # noqa: PLR1711 - DSL requires explicit return to build IR return statement
 
     pm = PassManager.get_strategy(OptimizationStrategy.PTOAS)
     transformed_program = pm.run_passes(StoreProgram)
@@ -282,7 +287,7 @@ def test_pto_codegen_block_mul():
 
     @pl.program
     class MulProgram:
-        @pl.function
+        @pl.function(type=pl.FunctionType.InCore)
         def mul_test(
             self,
             a: pl.Tensor[[32, 32], pl.FP32],
@@ -293,6 +298,7 @@ def test_pto_codegen_block_mul():
             tile_b = pl.load(b, offsets=[0, 0], shapes=[32, 32])
             tile_c = pl.mul(tile_a, tile_b)
             pl.store(tile_c, offsets=[0, 0], shapes=[32, 32], output_tensor=c)
+            return  # noqa: PLR1711 - DSL requires explicit return to build IR return statement
 
     pm = PassManager.get_strategy(OptimizationStrategy.PTOAS)
     transformed_program = pm.run_passes(MulProgram)
@@ -311,11 +317,12 @@ def test_pto_codegen_block_adds():
 
     @pl.program
     class AddsProgram:
-        @pl.function
+        @pl.function(type=pl.FunctionType.InCore)
         def adds_test(self, a: pl.Tensor[[32, 32], pl.FP32], b: pl.Tensor[[32, 32], pl.FP32]):
             tile_a = pl.load(a, offsets=[0, 0], shapes=[32, 32])
             tile_b = pl.add(tile_a, 3.14)
             pl.store(tile_b, offsets=[0, 0], shapes=[32, 32], output_tensor=b)
+            return  # noqa: PLR1711 - DSL requires explicit return to build IR return statement
 
     pm = PassManager.get_strategy(OptimizationStrategy.PTOAS)
     transformed_program = pm.run_passes(AddsProgram)
@@ -338,10 +345,11 @@ def test_pto_codegen_constants():
 
     @pl.program
     class ConstantProgram:
-        @pl.function
+        @pl.function(type=pl.FunctionType.InCore)
         def const_test(self, a: pl.Tensor[[32, 32], pl.FP32], b: pl.Tensor[[32, 32], pl.FP32]):
             tile_a = pl.load(a, offsets=[0, 0], shapes=[32, 32])
             pl.store(tile_a, offsets=[0, 0], shapes=[32, 32], output_tensor=b)
+            return  # noqa: PLR1711 - DSL requires explicit return to build IR return statement
 
     pm = PassManager.get_strategy(OptimizationStrategy.PTOAS)
     transformed_program = pm.run_passes(ConstantProgram)
@@ -362,7 +370,7 @@ def test_pto_codegen_ssa_naming():
 
     @pl.program
     class SSAProgram:
-        @pl.function
+        @pl.function(type=pl.FunctionType.InCore)
         def ssa_test(
             self,
             a: pl.Tensor[[32, 32], pl.FP32],
@@ -373,6 +381,7 @@ def test_pto_codegen_ssa_naming():
             tile_b = pl.load(b, offsets=[0, 0], shapes=[32, 32])
             tile_c = pl.mul(tile_a, tile_b)
             pl.store(tile_c, offsets=[0, 0], shapes=[32, 32], output_tensor=c)
+            return  # noqa: PLR1711 - DSL requires explicit return to build IR return statement
 
     pm = PassManager.get_strategy(OptimizationStrategy.PTOAS)
     transformed_program = pm.run_passes(SSAProgram)
@@ -393,10 +402,11 @@ def test_pto_codegen_code_generation_order():
 
     @pl.program
     class OrderProgram:
-        @pl.function
+        @pl.function(type=pl.FunctionType.InCore)
         def order_test(self, a: pl.Tensor[[32, 32], pl.FP32], b: pl.Tensor[[32, 32], pl.FP32]):
             tile = pl.load(a, offsets=[0, 0], shapes=[32, 32])
             pl.store(tile, offsets=[0, 0], shapes=[32, 32], output_tensor=b)
+            return  # noqa: PLR1711 - DSL requires explicit return to build IR return statement
 
     pm = PassManager.get_strategy(OptimizationStrategy.PTOAS)
     transformed_program = pm.run_passes(OrderProgram)
@@ -423,15 +433,17 @@ def test_pto_codegen_multiple_functions():
 
     @pl.program
     class MultiFunc:
-        @pl.function
+        @pl.function(type=pl.FunctionType.InCore)
         def func1(self, a: pl.Tensor[[32, 32], pl.FP32], b: pl.Tensor[[32, 32], pl.FP32]):
             tile = pl.load(a, offsets=[0, 0], shapes=[32, 32])
             pl.store(tile, offsets=[0, 0], shapes=[32, 32], output_tensor=b)
+            return  # noqa: PLR1711 - DSL requires explicit return to build IR return statement
 
-        @pl.function
+        @pl.function(type=pl.FunctionType.InCore)
         def func2(self, x: pl.Tensor[[32, 32], pl.FP32], y: pl.Tensor[[32, 32], pl.FP32]):
             tile = pl.load(x, offsets=[0, 0], shapes=[32, 32])
             pl.store(tile, offsets=[0, 0], shapes=[32, 32], output_tensor=y)
+            return  # noqa: PLR1711 - DSL requires explicit return to build IR return statement
 
     pm = PassManager.get_strategy(OptimizationStrategy.PTOAS)
     transformed_program = pm.run_passes(MultiFunc)
@@ -449,10 +461,11 @@ def test_pto_codegen_reusability():
 
     @pl.program
     class ReusableProgram:
-        @pl.function
+        @pl.function(type=pl.FunctionType.InCore)
         def test_func(self, a: pl.Tensor[[32, 32], pl.FP32], b: pl.Tensor[[32, 32], pl.FP32]):
             tile = pl.load(a, offsets=[0, 0], shapes=[32, 32])
             pl.store(tile, offsets=[0, 0], shapes=[32, 32], output_tensor=b)
+            return  # noqa: PLR1711 - DSL requires explicit return to build IR return statement
 
     pm = PassManager.get_strategy(OptimizationStrategy.PTOAS)
     transformed_program = pm.run_passes(ReusableProgram)

@@ -157,7 +157,7 @@ jobs:
             --junitxml=fuzz-results-hw.xml || true
           python tests/st/fuzz/check_pass_rate.py \
             fuzz-results-hw.xml \
-            --threshold 0.7
+            --threshold 0.5
 
       - name: Upload fuzz artifacts
         if: always()

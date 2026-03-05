@@ -34,7 +34,7 @@ class TestCCECodegenBasics:
         backend.set_backend_type(BackendType.CCE)
         ib = IRBuilder()
 
-        with ib.function("test_tadds_simple") as f:
+        with ib.function("test_tadds_simple", type=ir.FunctionType.InCore) as f:
             # Define input and output parameters (Global Tensors -> DDR)
             input_a = f.param("input_a", ir.TensorType([128, 128], DataType.FP32))
             input_b = f.param("input_b", ir.ScalarType(DataType.FP32))
@@ -96,7 +96,7 @@ class TestControlFlowCodegen:
         backend.set_backend_type(BackendType.CCE)
         ib = IRBuilder()
 
-        with ib.function("test_simple_for") as f:
+        with ib.function("test_simple_for", type=ir.FunctionType.InCore) as f:
             # Parameters
             input_tensor = f.param("input", ir.TensorType([128, 64], DataType.FP32))
             output_tensor = f.param("output", ir.TensorType([128, 64], DataType.FP32))
@@ -131,7 +131,7 @@ class TestControlFlowCodegen:
         backend.set_backend_type(BackendType.CCE)
         ib = IRBuilder()
 
-        with ib.function("test_nested_for") as f:
+        with ib.function("test_nested_for", type=ir.FunctionType.InCore) as f:
             # Parameters
             input_tensor = f.param("input", ir.TensorType([128, 128], DataType.FP32))
             output_tensor = f.param("output", ir.TensorType([128, 128], DataType.FP32))
@@ -184,7 +184,9 @@ class TestControlFlowCodegen:
         ret_stmt = ir.ReturnStmt([], span)
         seq = ir.SeqStmts([if_stmt, ret_stmt], span)
 
-        func = ir.Function("test_if", [], [ir.TensorType([1], DataType.FP32)], seq, span)
+        func = ir.Function(
+            "test_if", [], [ir.TensorType([1], DataType.FP32)], seq, span, type=ir.FunctionType.InCore
+        )
         program = ir.Program([func], "test_if", ir.Span.unknown())
 
         generator = codegen.CCECodegen()
@@ -224,7 +226,9 @@ class TestControlFlowCodegen:
         ret_stmt = ir.ReturnStmt([], span)
         seq = ir.SeqStmts([assign_a, assign_b, if_stmt, ret_stmt], span)
 
-        func = ir.Function("test_if_else", [], [ir.TensorType([1], DataType.FP32)], seq, span)
+        func = ir.Function(
+            "test_if_else", [], [ir.TensorType([1], DataType.FP32)], seq, span, type=ir.FunctionType.InCore
+        )
         program = ir.Program([func], "test_if_else", ir.Span.unknown())
 
         generator = codegen.CCECodegen()

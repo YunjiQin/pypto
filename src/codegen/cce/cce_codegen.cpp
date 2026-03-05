@@ -70,6 +70,8 @@ std::map<std::string, std::string> CCECodegen::Generate(const ir::ProgramPtr& pr
   std::vector<ir::FunctionPtr> orchestration_functions;
 
   for (const auto& [gvar, func] : program->functions_) {
+    INTERNAL_CHECK(func->func_type_ != ir::FunctionType::Opaque)
+        << "CCE backend doesn't support Opaque functions : " << func->name_;
     if (func->func_type_ == ir::FunctionType::Orchestration) {
       orchestration_functions.push_back(func);
     } else {

@@ -59,7 +59,7 @@ class PagedAttention:
 
     # AIC kernels
 
-    @pl.function
+    @pl.function(type=pl.FunctionType.InCore)
     def qk_matmul(
         self,
         qi: pl.Tensor[[16, 128], pl.BF16],
@@ -73,7 +73,7 @@ class PagedAttention:
         updated_sij: pl.Tensor[[16, 128], pl.FP32] = pl.store(s_tile, [0, 0], [16, 128], s_ij)
         return updated_sij
 
-    @pl.function
+    @pl.function(type=pl.FunctionType.InCore)
     def pv_matmul(
         self,
         pij: pl.Tensor[[16, 128], pl.BF16],
@@ -88,7 +88,7 @@ class PagedAttention:
 
     # AIV kernels
 
-    @pl.function
+    @pl.function(type=pl.FunctionType.InCore)
     def softmax_prepare(
         self,
         sij: pl.Tensor[[16, 128], pl.FP32],
@@ -119,8 +119,9 @@ class PagedAttention:
         pl.store(max_tile, [0, 0], [16, 1], mij)
         pl.store(sum_tile, [0, 0], [16, 1], lij)
         pl.store(pij_bf16_tile, [0, 0], [16, 128], pij)
+        return  # noqa: PLR1711 - DSL requires explicit return to build IR return statement
 
-    @pl.function
+    @pl.function(type=pl.FunctionType.InCore)
     def online_update(
         self,
         mij: pl.Tensor[[16, 1], pl.FP32],
@@ -160,6 +161,7 @@ class PagedAttention:
         pl.store(li_new_tile, [0, 0], [16, 1], li)
         pl.store(oi_updated_tile, [0, 0], [16, 128], oi)
         pl.store(dst_tile, [0, 0], [16, 128], dst)
+        return  # noqa: PLR1711 - DSL requires explicit return to build IR return statement
 
 
 def test_block_ops_codegen():

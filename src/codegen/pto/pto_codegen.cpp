@@ -172,12 +172,9 @@ std::string PTOCodegen::Generate(const ProgramPtr& program) {
   stream_ << "module {\n";
 
   for (const auto& [gvar, func] : program->functions_) {
-    if (func->func_type_ == ir::FunctionType::Orchestration) {
-      throw pypto::ValueError(
-          "PTO backend does not support Orchestration functions. "
-          "Function '" +
-          func->name_ + "' is marked as Orchestration. ");
-    }
+    INTERNAL_CHECK(func->func_type_ == ir::FunctionType::InCore)
+        << "PTO backend only supports InCore functions, but function '" << func->name_ << "' has type "
+        << ir::FunctionTypeToString(func->func_type_);
     GenerateFunction(func);
   }
 
