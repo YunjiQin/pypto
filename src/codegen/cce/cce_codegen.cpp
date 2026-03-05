@@ -804,11 +804,16 @@ class TensorAccessShapeCollector : public ir::IRVisitor {
       INTERNAL_CHECK(op->args_.size() > 2 && tensor_arg_idx < static_cast<int>(op->args_.size()))
           << "Internal error: " << op_name << " has unexpected argument count: " << op->args_.size();
       auto tensor_var = std::dynamic_pointer_cast<const ir::Var>(op->args_[tensor_arg_idx]);
-      auto shapes_tuple = std::dynamic_pointer_cast<const ir::MakeTuple>(op->args_[2]);
-      // Use only the first access shape per tensor (assumes all access windows
-      // for the same tensor have matching shapes)
-      if (tensor_var && shapes_tuple && access_shapes_.find(tensor_var) == access_shapes_.end()) {
-        access_shapes_[tensor_var] = shapes_tuple->elements_;
+
+      // Extract shape from TileType's shape_ of args_[0]
+      if (tensor_var && access_shapes_.find(tensor_var) == access_shapes_.end()) {
+        auto tile_var = std::dynamic_pointer_cast<const ir::Var>(op->args_[0]);
+        if (tile_var) {
+          auto tile_type = std::dynamic_pointer_cast<const ir::TileType>(tile_var->GetType());
+          if (tile_type) {
+            access_shapes_[tensor_var] = tile_type->shape_;
+          }
+        }
       }
     }
 

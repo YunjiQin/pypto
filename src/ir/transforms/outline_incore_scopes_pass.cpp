@@ -128,8 +128,8 @@ class StoreTargetCollector : public IRVisitor {
   void VisitExpr_(const CallPtr& op) override {
     auto opnode = std::dynamic_pointer_cast<const Op>(op->op_);
     if (opnode && opnode->name_ == "block.store") {
-      if (op->args_.size() >= 4) {
-        if (auto var = As<Var>(op->args_[3])) {
+      if (op->args_.size() >= 3) {
+        if (auto var = As<Var>(op->args_[2])) {
           store_targets.insert(var->name_);
         }
       }

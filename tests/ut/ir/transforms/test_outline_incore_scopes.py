@@ -433,7 +433,7 @@ class TestOutlineIncoreScopes:
                 buf: pl.Tensor[[16, 128], pl.FP32] = pl.create_tensor([16, 128], dtype=pl.FP32)
                 with pl.incore():
                     tile = pl.block.full([16, 128], dtype=pl.FP32, value=0.0)
-                    pl.store(tile, [0, 0], [16, 128], buf)
+                    pl.store(tile, [0, 0], buf)
                 result: pl.Tensor[[16, 128], pl.FP32] = pl.add(buf, x)
                 return result
 
@@ -462,8 +462,8 @@ class TestOutlineIncoreScopes:
                 with pl.incore():
                     tile_a = pl.block.full([16, 128], dtype=pl.FP32, value=0.0)
                     tile_b = pl.block.full([16, 1], dtype=pl.FP32, value=0.0)
-                    pl.store(tile_a, [0, 0], [16, 128], buf_a)
-                    pl.store(tile_b, [0, 0], [16, 1], buf_b)
+                    pl.store(tile_a, [0, 0], buf_a)
+                    pl.store(tile_b, [0, 0], buf_b)
                 result: pl.Tensor[[16, 128], pl.FP32] = pl.add(buf_a, x)
                 return result
 

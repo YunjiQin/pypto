@@ -299,9 +299,7 @@ class TestConvertTensorToBlockOps:
                     kj_l1_0, target_memory=pl.MemorySpace.Right, transpose=True
                 )
                 sij_l0c_0: pl.Tile[[16, 128], pl.FP32] = pl.matmul(qi_l0a_0, kj_l0b_0)
-                out_sij_0: pl.Tensor[[16, 128], pl.FP32] = pl.store(
-                    sij_l0c_0, [0, 0], [16, 128], output_tensor=sij_0
-                )
+                out_sij_0: pl.Tensor[[16, 128], pl.FP32] = pl.store(sij_l0c_0, [0, 0], output_tensor=sij_0)
                 return out_sij_0
 
             @pl.function(type=pl.FunctionType.Orchestration)
