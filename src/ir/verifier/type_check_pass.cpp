@@ -193,6 +193,138 @@ void TypeChecker::CheckTypeEquality(const TypePtr& type1, const TypePtr& type2, 
       }
     }
   }
+
+  // For TileType, also check tile_view
+  if (type1->GetKind() == ObjectKind::TileType) {
+    auto tile1 = std::dynamic_pointer_cast<const TileType>(type1);
+    auto tile2 = std::dynamic_pointer_cast<const TileType>(type2);
+
+    // Check if both have tile_view or both don't
+    if (tile1->tile_view_.has_value() != tile2->tile_view_.has_value()) {
+      std::ostringstream msg;
+      msg << "TileView presence mismatch in " << context << ": " << desc1
+          << (tile1->tile_view_.has_value() ? " has" : " doesn't have") << " tile_view, but " << desc2
+          << (tile2->tile_view_.has_value() ? " has" : " doesn't have") << " tile_view";
+      RecordError(typecheck::ErrorType::TYPE_KIND_MISMATCH, msg.str(), span);
+      return;
+    }
+
+    // If both have tile_view, compare the fields
+    if (tile1->tile_view_.has_value() && tile2->tile_view_.has_value()) {
+      const auto& view1 = tile1->tile_view_.value();
+      const auto& view2 = tile2->tile_view_.value();
+
+      // Check valid_shape dimensions count
+      if (view1.valid_shape.size() != view2.valid_shape.size()) {
+        std::ostringstream msg;
+        msg << "TileView valid_shape dimension count mismatch in " << context << ": " << desc1 << " has "
+            << view1.valid_shape.size() << " dimensions, but " << desc2 << " has " << view2.valid_shape.size()
+            << " dimensions";
+        RecordError(typecheck::ErrorType::SHAPE_DIMENSION_MISMATCH, msg.str(), span);
+        return;
+      }
+
+      // Check each valid_shape dimension
+      for (size_t i = 0; i < view1.valid_shape.size(); ++i) {
+        const auto& dim1 = view1.valid_shape[i];
+        const auto& dim2 = view2.valid_shape[i];
+
+        if (!dim1 || !dim2) continue;
+
+        // Try to compare as constants
+        if (!IsSameConstant(dim1, dim2)) {
+          // Check if both are ConstInt but different values
+          auto const_int1 = As<ConstInt>(dim1);
+          auto const_int2 = As<ConstInt>(dim2);
+          if (const_int1 && const_int2) {
+            std::ostringstream msg;
+            msg << "TileView valid_shape dimension mismatch in " << context << ": " << desc1
+                << " valid_shape[" << i << "] = " << const_int1->value_ << ", but " << desc2
+                << " valid_shape[" << i << "] = " << const_int2->value_;
+            RecordError(typecheck::ErrorType::SHAPE_VALUE_MISMATCH, msg.str(), span);
+          }
+          // For symbolic dimensions, we skip detailed checking
+          // A more sophisticated analysis would be needed for symbolic shape verification
+        }
+      }
+
+      // Check stride dimensions count
+      if (view1.stride.size() != view2.stride.size()) {
+        std::ostringstream msg;
+        msg << "TileView stride dimension count mismatch in " << context << ": " << desc1 << " has "
+            << view1.stride.size() << " dimensions, but " << desc2 << " has " << view2.stride.size()
+            << " dimensions";
+        RecordError(typecheck::ErrorType::SHAPE_DIMENSION_MISMATCH, msg.str(), span);
+        return;
+      }
+
+      // Check each stride dimension
+      for (size_t i = 0; i < view1.stride.size(); ++i) {
+        const auto& stride1 = view1.stride[i];
+        const auto& stride2 = view2.stride[i];
+
+        if (!stride1 || !stride2) continue;
+
+        if (!IsSameConstant(stride1, stride2)) {
+          auto const_int1 = As<ConstInt>(stride1);
+          auto const_int2 = As<ConstInt>(stride2);
+          if (const_int1 && const_int2) {
+            std::ostringstream msg;
+            msg << "TileView stride dimension mismatch in " << context << ": " << desc1 << " stride[" << i
+                << "] = " << const_int1->value_ << ", but " << desc2 << " stride[" << i
+                << "] = " << const_int2->value_;
+            RecordError(typecheck::ErrorType::SHAPE_VALUE_MISMATCH, msg.str(), span);
+          }
+        }
+      }
+
+      // Check start_offset
+      if (view1.start_offset && view2.start_offset) {
+        if (!IsSameConstant(view1.start_offset, view2.start_offset)) {
+          auto const_int1 = As<ConstInt>(view1.start_offset);
+          auto const_int2 = As<ConstInt>(view2.start_offset);
+          if (const_int1 && const_int2) {
+            std::ostringstream msg;
+            msg << "TileView start_offset mismatch in " << context << ": " << desc1
+                << " start_offset = " << const_int1->value_ << ", but " << desc2
+                << " start_offset = " << const_int2->value_;
+            RecordError(typecheck::ErrorType::SHAPE_VALUE_MISMATCH, msg.str(), span);
+          }
+        }
+      }
+
+      // Check blayout
+      if (view1.blayout != view2.blayout) {
+        std::ostringstream msg;
+        msg << "TileView blayout mismatch in " << context << ": " << desc1 << " blayout != " << desc2
+            << " blayout";
+        RecordError(typecheck::ErrorType::TYPE_KIND_MISMATCH, msg.str(), span);
+      }
+
+      // Check slayout
+      if (view1.slayout != view2.slayout) {
+        std::ostringstream msg;
+        msg << "TileView slayout mismatch in " << context << ": " << desc1 << " slayout != " << desc2
+            << " slayout";
+        RecordError(typecheck::ErrorType::TYPE_KIND_MISMATCH, msg.str(), span);
+      }
+
+      // Check fractal
+      if (view1.fractal != view2.fractal) {
+        std::ostringstream msg;
+        msg << "TileView fractal mismatch in " << context << ": " << desc1 << " fractal = " << view1.fractal
+            << ", but " << desc2 << " fractal = " << view2.fractal;
+        RecordError(typecheck::ErrorType::SHAPE_VALUE_MISMATCH, msg.str(), span);
+      }
+
+      // Check pad
+      if (view1.pad != view2.pad) {
+        std::ostringstream msg;
+        msg << "TileView pad mismatch in " << context << ": " << desc1 << " pad != " << desc2 << " pad";
+        RecordError(typecheck::ErrorType::TYPE_KIND_MISMATCH, msg.str(), span);
+      }
+    }
+  }
 }
 
 bool TypeChecker::IsSameConstant(const ExprPtr& expr1, const ExprPtr& expr2) const {

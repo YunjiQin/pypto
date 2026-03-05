@@ -355,10 +355,10 @@ class TestNestedControlFlow:
                 x_tile: pl.Tile[[64], pl.FP32] = pl.load(x, [0], [64])
                 if n == 0:
                     y_tile: pl.Tile[[64], pl.FP32] = pl.block.add(x_tile, x_tile)
-                    z: pl.Tile[[64], pl.FP32] = pl.yield_(y_tile)
+                    z = pl.yield_(y_tile)
                 else:
                     y_tile: pl.Tile[[64], pl.FP32] = pl.block.mul(x_tile, x_tile)
-                    z: pl.Tile[[64], pl.FP32] = pl.yield_(y_tile)
+                    z = pl.yield_(y_tile)
                 out_0: pl.Tensor[[64], pl.FP32] = pl.store(z, [0], out_0)
                 return out_0
 
@@ -448,10 +448,10 @@ class TestNestedControlFlow:
                 acc_tile: pl.Tile[[64], pl.FP32] = pl.load(acc, [0], [64])
                 if n == 0:
                     y_tile: pl.Tile[[64], pl.FP32] = pl.block.add(acc_tile, acc_tile)
-                    z: pl.Tile[[64], pl.FP32] = pl.yield_(y_tile)
+                    z = pl.yield_(y_tile)
                 else:
                     y_tile: pl.Tile[[64], pl.FP32] = pl.block.mul(acc_tile, acc_tile)
-                    z: pl.Tile[[64], pl.FP32] = pl.yield_(y_tile)
+                    z = pl.yield_(y_tile)
                 out_0: pl.Tensor[[64], pl.FP32] = pl.store(z, [0], out_0)
                 return out_0
 
