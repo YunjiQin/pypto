@@ -203,7 +203,14 @@ TypePtr DeduceBlockMoveType(const std::vector<ExprPtr>& args,
     output_shape = input_shape;
   }
 
-  tile_view.valid_shape = output_shape;
+  // Preserve input valid_shape (may be narrower than shape_); transpose if needed
+  auto input_valid_shape = (tile_type->tile_view_ && !tile_type->tile_view_->valid_shape.empty())
+                               ? tile_type->tile_view_->valid_shape
+                               : input_shape;
+  if (transpose && input_valid_shape.size() == 2) {
+    std::swap(input_valid_shape[0], input_valid_shape[1]);
+  }
+  tile_view.valid_shape = input_valid_shape;
 
   // Return TileType with computed shape and same dtype (no explicit MemRef)
   return std::make_shared<TileType>(output_shape, tile_type->dtype_, std::nullopt, tile_view);

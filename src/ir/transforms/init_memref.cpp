@@ -288,7 +288,7 @@ class InitMemRefMutator : public IRMutator {
       if (call->op_->name_ == "block.store") {
         // Get the 3rd argument (output tensor) after mutation
         auto new_call = std::dynamic_pointer_cast<const Call>(new_value);
-        if (new_call) {
+        if (new_call && new_call->args_.size() > 2) {
           auto output_tensor_arg = new_call->args_[2];
 
           // Extract MemRef from the output tensor

@@ -278,8 +278,14 @@ void TypeChecker::CheckTypeEquality(const TypePtr& type1, const TypePtr& type2, 
         }
       }
 
-      // Check start_offset
-      if (view1.start_offset && view2.start_offset) {
+      // Check start_offset presence
+      if (static_cast<bool>(view1.start_offset) != static_cast<bool>(view2.start_offset)) {
+        std::ostringstream msg;
+        msg << "TileView start_offset presence mismatch in " << context << ": " << desc1
+            << (view1.start_offset ? " has" : " doesn't have") << " start_offset, but " << desc2
+            << (view2.start_offset ? " has" : " doesn't have") << " start_offset";
+        RecordError(typecheck::ErrorType::TYPE_KIND_MISMATCH, msg.str(), span);
+      } else if (view1.start_offset && view2.start_offset) {
         if (!IsSameConstant(view1.start_offset, view2.start_offset)) {
           auto const_int1 = As<ConstInt>(view1.start_offset);
           auto const_int2 = As<ConstInt>(view2.start_offset);

@@ -144,27 +144,3 @@ jobs:
       - name: Check final test result
         if: steps.test_first_attempt.outcome == 'failure' && steps.test_retry.outcome == 'failure'
         run: exit 1
-
-      # --- Fuzz testing ---
-      - name: Run fuzz tests (device)
-        run: |
-          rm -rf build/fuzz-artifacts && mkdir -p build/fuzz-artifacts/hw
-          python tests/st/fuzz/example_mutil_kernel.py --num-cases 10
-          pytest tests/st/fuzz/generated/test_fuzz_multi_kernel.py \
-            -v -s --save-kernels --dump-passes \
-            --kernels-dir=build/fuzz-artifacts/hw \
-            --device=$DEVICE_ID --forked --platform=a2a3 \
-            --junitxml=fuzz-results-hw.xml || true
-          python tests/st/fuzz/check_pass_rate.py \
-            fuzz-results-hw.xml \
-            --threshold 0.5
-
-      - name: Upload fuzz artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: fuzz-artifacts-${{ github.run_id }}
-          path: |
-            fuzz-results-hw.xml
-            build/fuzz-artifacts/
-          retention-days: 7

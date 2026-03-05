@@ -292,8 +292,9 @@ static std::string MakeBlockStoreCodegenPTO(const CallPtr& op, codegen::CodegenB
   INTERNAL_CHECK(offsets_tuple) << "block.store second argument must be a tuple (offsets)";
 
   // Get tile type and extract shape for height/width
-  // Prefer valid_shape from tile_view_ (set by block.load); fall back to allocated shape_
+  // The tile's valid_shape is required and used to determine the store dimensions.
   auto tile_type = As<ir::TileType>(tile->GetType());
+  INTERNAL_CHECK(tile_type) << "block.store first argument must have TileType";
   INTERNAL_CHECK(tile_type->tile_view_.has_value()) << "block.store tile must have TileView with valid_shape";
   auto& valid_shape = tile_type->tile_view_->valid_shape;
   INTERNAL_CHECK(valid_shape.size() == 2) << "block.store tile valid_shape must be 2D";

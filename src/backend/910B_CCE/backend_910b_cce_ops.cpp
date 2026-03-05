@@ -433,7 +433,7 @@ REGISTER_BACKEND_OP(Backend910B_CCE, "block.load")
 REGISTER_BACKEND_OP(Backend910B_CCE, "block.store")
     .f_infer_pipe([](const ir::CallPtr& call) -> ir::PipeType {
       CHECK(call != nullptr) << "block.store infer_pipe received null call";
-      CHECK(call->args_.size() == 4) << "block.store requires 4 arguments";
+      CHECK(call->args_.size() == 3) << "block.store requires 3 arguments";
       auto src_type = ir::As<ir::TileType>(call->args_[0]->GetType());
       if (src_type && src_type->memref_.has_value() && (*src_type->memref_ != nullptr)) {
         auto src_mem = (*src_type->memref_)->memory_space_;
