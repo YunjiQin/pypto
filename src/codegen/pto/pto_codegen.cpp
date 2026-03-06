@@ -340,6 +340,13 @@ void PTOCodegen::EmitMakeTensorViews(const FunctionPtr& func) {
     if (auto tensor_type = As<TensorType>(param->GetType())) {
       std::string tensor_view = tensor_to_view_[param->name_];
 
+      bool layout_DN = false;
+      if (tensor_type->tensor_view_.has_value()) {
+        if (tensor_type->tensor_view_.value().layout == ir::TensorLayout::DN) {
+          layout_DN = true;
+        }
+      }
+
       stream_ << GetIndent() << tensor_view << " = pto.make_tensor_view ";
       stream_ << "%arg" << i;
 
@@ -356,12 +363,18 @@ void PTOCodegen::EmitMakeTensorViews(const FunctionPtr& func) {
 
       stream_ << " strides = [";
       if (tensor_type->shape_.size() == 2) {
-        if (auto var = As<ir::Var>(tensor_type->shape_[1])) {
-          stream_ << var_to_mlir_.at(var->name_);
+        std::string row_stride;
+        int idx = layout_DN ? 0 : 1;
+        if (auto var = As<ir::Var>(tensor_type->shape_[idx])) {
+          row_stride = var_to_mlir_.at(var->name_);
         } else {
-          stream_ << GetOrEmitIndexConstant(GetConstIntValue(tensor_type->shape_[1]));
+          row_stride = GetOrEmitIndexConstant(GetConstIntValue(tensor_type->shape_[idx]));
         }
-        stream_ << ", " << GetOrEmitIndexConstant(1);
+        if (layout_DN) {
+          stream_ << GetOrEmitIndexConstant(1) << ", " << row_stride;
+        } else {
+          stream_ << row_stride << ", " << GetOrEmitIndexConstant(1);
+        }
       } else if (tensor_type->shape_.size() == 1) {
         stream_ << GetOrEmitIndexConstant(1);
       }

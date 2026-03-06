@@ -55,13 +55,13 @@ class TestMatmul(PTOTestCase):
                 b: pl.Tensor[[K, N], pl.FP32],
                 c: pl.Out[pl.Tensor[[M, N], pl.FP32]],
             ) -> pl.Tensor[[M, N], pl.FP32]:
-                tile_a_l1 = pl.block.load(a, offsets=[0, 0], shapes=[M, K], target_memory=pl.MemorySpace.Mat)
-                tile_b_l1 = pl.block.load(b, offsets=[0, 0], shapes=[K, N], target_memory=pl.MemorySpace.Mat)
-                tile_a_l0a = pl.block.move(tile_a_l1, target_memory=pl.MemorySpace.Left)
-                tile_b_l0b = pl.block.move(tile_b_l1, target_memory=pl.MemorySpace.Right)
-                tile_c_l0c = pl.block.matmul(tile_a_l0a, tile_b_l0b)
+                tile_a_l1 = pl.load(a, offsets=[0, 0], shapes=[M, K], target_memory=pl.MemorySpace.Mat)
+                tile_b_l1 = pl.load(b, offsets=[0, 0], shapes=[K, N], target_memory=pl.MemorySpace.Mat)
+                tile_a_l0a = pl.move(tile_a_l1, target_memory=pl.MemorySpace.Left)
+                tile_b_l0b = pl.move(tile_b_l1, target_memory=pl.MemorySpace.Right)
+                tile_c_l0c = pl.matmul(tile_a_l0a, tile_b_l0b)
                 # store can support l0c -> GM directly
-                out_c = pl.block.store(tile_c_l0c, offsets=[0, 0], output_tensor=c)
+                out_c = pl.store(tile_c_l0c, offsets=[0, 0], output_tensor=c)
                 return out_c
 
             @pl.function(type=pl.FunctionType.Orchestration)
@@ -116,14 +116,14 @@ class TestMatmulTranspose(PTOTestCase):
                 b: pl.Tensor[[K, N], pl.FP32, pl.DN],
                 c: pl.Out[pl.Tensor[[M, N], pl.FP32]],
             ) -> pl.Tensor[[M, N], pl.FP32]:
-                tile_a_l1 = pl.block.load(a, offsets=[0, 0], shapes=[M, K], target_memory=pl.MemorySpace.Mat)
-                tile_b_l1 = pl.block.load(
+                tile_a_l1 = pl.load(a, offsets=[0, 0], shapes=[M, K], target_memory=pl.MemorySpace.Mat)
+                tile_b_l1 = pl.load(
                     b, offsets=[0, 0], shapes=[K, N], target_memory=pl.MemorySpace.Mat, transpose=True
                 )
-                tile_a_l0a = pl.block.move(tile_a_l1, target_memory=pl.MemorySpace.Left)
-                tile_b_l0b = pl.block.move(tile_b_l1, target_memory=pl.MemorySpace.Right)
-                tile_c_l0c = pl.block.matmul(tile_a_l0a, tile_b_l0b)
-                out_c = pl.block.store(tile_c_l0c, offsets=[0, 0], output_tensor=c)
+                tile_a_l0a = pl.move(tile_a_l1, target_memory=pl.MemorySpace.Left)
+                tile_b_l0b = pl.move(tile_b_l1, target_memory=pl.MemorySpace.Right)
+                tile_c_l0c = pl.matmul(tile_a_l0a, tile_b_l0b)
+                out_c = pl.store(tile_c_l0c, offsets=[0, 0], output_tensor=c)
                 return out_c
 
             @pl.function(type=pl.FunctionType.Orchestration)
