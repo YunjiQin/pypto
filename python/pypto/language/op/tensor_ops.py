@@ -44,7 +44,7 @@ __all__ = [
 
 from pypto.ir.op import tensor_ops as _ir_ops
 from pypto.pypto_core import DataType
-from pypto.pypto_core.ir import Expr
+from pypto.pypto_core.ir import Expr, TensorLayout
 
 from ..typing import IntLike, Scalar, Tensor
 
@@ -61,17 +61,20 @@ def _normalize_intlike(seq: Sequence[IntLike]) -> list[int | Expr]:
     return [elem.unwrap() if isinstance(elem, Scalar) else elem for elem in seq]
 
 
-def create_tensor(shape: Sequence[IntLike], dtype: DataType) -> Tensor:
+def create_tensor(
+    shape: Sequence[IntLike], dtype: DataType, layout: TensorLayout = TensorLayout.ND
+) -> Tensor:
     """Create a new tensor with specified shape and dtype.
 
     Args:
         shape: List of dimension sizes (int or Expr)
         dtype: Data type of tensor elements
+        layout: Tensor layout (default: ND)
 
     Returns:
         Tensor wrapping the create operation
     """
-    call_expr = _ir_ops.create(_normalize_intlike(shape), dtype)
+    call_expr = _ir_ops.create(_normalize_intlike(shape), dtype, layout)
     return Tensor(expr=call_expr)
 
 

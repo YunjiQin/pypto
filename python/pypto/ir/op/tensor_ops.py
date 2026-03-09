@@ -14,19 +14,23 @@ from typing import Any
 
 from pypto.pypto_core import DataType
 from pypto.pypto_core import ir as _ir_core
-from pypto.pypto_core.ir import Call, ConstInt, Expr, ScalarType, Span
+from pypto.pypto_core.ir import Call, ConstInt, Expr, ScalarType, Span, TensorLayout
 
 from ..utils import _get_span_or_capture, _normalize_expr, _to_make_tuple, resolve_cast_mode
 
 
 def create(
-    shape: Sequence[int | Expr] | _ir_core.MakeTuple, dtype: DataType, span: Span | None = None
+    shape: Sequence[int | Expr] | _ir_core.MakeTuple,
+    dtype: DataType,
+    layout: TensorLayout = TensorLayout.ND,
+    span: Span | None = None,
 ) -> Call:
     """Create a new tensor with specified shape and dtype.
 
     Args:
         shape: List of dimension sizes (int or Expr), or a MakeTuple
         dtype: Data type of tensor elements
+        layout: Tensor layout (default: ND)
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
@@ -37,7 +41,7 @@ def create(
     shape_tuple = _to_make_tuple(shape, actual_span)
 
     args = [shape_tuple]
-    kwargs: dict[str, Any] = {"dtype": dtype}
+    kwargs: dict[str, Any] = {"dtype": dtype, "layout": layout}
 
     return _ir_core.create_op_call("tensor.create", args, kwargs, actual_span)
 

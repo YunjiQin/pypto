@@ -72,7 +72,14 @@ REGISTER_ORCHESTRATION_OP(tensor_create, ("tensor.create")) {
     oss << codegen.GenerateExprString(result_type->shape_[i]);
   }
   oss << "};\n";
-  oss << "Tensor " << result_var << " = make_tensor(" << result_var << "_shapes, " << ndim << ", "
+
+  // check layout DN
+  std::string runtime_func = "make_tensor";
+  if (result_type->tensor_view_.has_value() && result_type->tensor_view_->layout == TensorLayout::DN) {
+    CHECK(ndim == 2) << "only support 2D tensor for DN layout now";
+    runtime_func = "make_tensor_2d_dn";
+  }
+  oss << "Tensor " << result_var << " = " << runtime_func << "(" << result_var << "_shapes, " << ndim << ", "
       << codegen.GetRuntimeDataTypeString(result_type->dtype_) << ");";
   return oss.str();
 }

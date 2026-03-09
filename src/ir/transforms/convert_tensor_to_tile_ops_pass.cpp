@@ -641,7 +641,8 @@ IncoreTransformResult TransformIncoreFunction(const FunctionPtr& func) {
     // Create tile.load(var, zeros, shape, valid_shapes=shape, target_memory=Vec)
     auto offsets = MakeZeroOffsets(tensor_type->shape_.size(), span);
     auto shapes = MakeShapeTuple(tensor_type->shape_, span);
-    std::vector<std::pair<std::string, std::any>> load_kwargs = {{"target_memory", MemorySpace::Vec}};
+    std::vector<std::pair<std::string, std::any>> load_kwargs = {{"target_memory", MemorySpace::Vec},
+                                                                 {"transpose", false}};
     auto load_call = op_registry.Create("tile.load", {var, offsets, shapes, shapes}, load_kwargs, span);
 
     // Create tile variable

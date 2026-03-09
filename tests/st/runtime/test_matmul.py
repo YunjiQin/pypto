@@ -189,12 +189,7 @@ class TestMatmulOperations:
 
     @pytest.mark.parametrize(
         "m,k,n",
-        [
-            # (64, 64, 64),
-            # (128, 64, 128),
-            (64, 128, 64),
-            # (32, 64, 32)
-        ],
+        [(64, 64, 64), (128, 64, 128), (64, 128, 64), (32, 64, 32)],
     )
     def test_matmul_transpose(self, test_runner, m, k, n):
         """Test matmul with B transposed (C = A @ B^T)."""
@@ -218,12 +213,7 @@ class TestMatmulOperations:
 
     @pytest.mark.parametrize(
         "m,k,n",
-        [
-            # (64, 64, 64),
-            # (128, 64, 128),
-            (64, 128, 64),
-            # (32, 64, 32)
-        ],
+        [(64, 64, 64), (128, 64, 128), (64, 128, 64), (32, 64, 32)],
     )
     def test_matmul_transpose_pto(self, test_runner, m, k, n):
         """Test matmul with B transposed (C = A @ B^T)."""

@@ -124,7 +124,20 @@ TypePtr DeduceTensorCreateType(const std::vector<ExprPtr>& args,
     }
   }
 
-  return std::make_shared<TensorType>(shape, dtype);
+  // Extract layout from kwargs (default: ND)
+  TensorLayout layout = TensorLayout::ND;
+  for (const auto& [key, value] : kwargs) {
+    if (key == "layout") {
+      layout = AnyCast<TensorLayout>(value, "kwarg key: layout");
+      break;
+    }
+  }
+
+  auto tensor_type = std::make_shared<TensorType>(shape, dtype);
+  if (layout != TensorLayout::ND) {
+    tensor_type->tensor_view_ = TensorView({}, layout);
+  }
+  return tensor_type;
 }
 
 TypePtr DeduceTensorSliceType(const std::vector<ExprPtr>& args,
@@ -253,6 +266,7 @@ REGISTER_OP("tensor.create")
     .set_description("Create a new tensor with specified shape and dtype")
     .add_argument("shape", "Shape dimensions (TupleType of ScalarType(INT64))")
     .set_attr<DataType>("dtype")
+    .set_attr<TensorLayout>("layout")
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
       return DeduceTensorCreateType(args, kwargs);

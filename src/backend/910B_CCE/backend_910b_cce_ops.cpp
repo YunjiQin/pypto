@@ -17,6 +17,7 @@
  * Each registration specifies the pipe type and CCE codegen function.
  */
 
+#include <algorithm>
 #include <any>
 #include <cstddef>
 #include <cstdint>
@@ -47,17 +48,24 @@ namespace backend {
  * @param codegen The CCE codegen instance
  * @param tensor_struct The TensorData struct pointer name
  * @param offsets Tuple of offset expressions for each dimension
+ * @param transpose DN load for matmul transpose
  * @return C++ expression string for total offset computation
  */
 static std::string ComputeStrideBasedOffset(codegen::CCECodegen& codegen, const std::string& tensor_struct,
-                                            const ir::MakeTuplePtr& offsets) {
+                                            const ir::MakeTuplePtr& offsets, bool transpose = false) {
   // Build offset computation: offset[0] * compute_stride(dim=0) + offset[1] * compute_stride(dim=1) + ...
   // Note: start_offset is already added to the base pointer, so we don't add it here
   std::ostringstream offset_computation;
   offset_computation << "(0";
 
+  auto offset_elems = offsets->elements_;
+  if (transpose) {
+    INTERNAL_CHECK(offset_elems.size() >= 2)
+        << "Internal error: transpose requires at least 2 offset dimensions, got " << offset_elems.size();
+    std::iter_swap(offset_elems.rbegin(), offset_elems.rbegin() + 1);
+  }
   for (size_t i = 0; i < offsets->elements_.size(); ++i) {
-    offset_computation << " + " << codegen.GetExprAsCode(offsets->elements_[i]) << " * compute_stride("
+    offset_computation << " + " << codegen.GetExprAsCode(offset_elems[i]) << " * compute_stride("
                        << tensor_struct << ", " << i << ")";
   }
 
@@ -134,8 +142,7 @@ static std::string MakeTileExpandsCodegenCCE(const std::string& cce_op_name, con
 // IR signature: (tensor, offsets_tuple, shapes_tuple, validshape) = 4 args
 static std::string MakeTileLoadCodegenCCE(const ir::CallPtr& op, codegen::CodegenBase& codegen_base) {
   auto& codegen = dynamic_cast<codegen::CCECodegen&>(codegen_base);
-  CHECK(op->args_.size() == 5)
-      << "tile.load requires 5 arguments: tensor, offsets, shapes, validshape, transpose";
+  CHECK(op->args_.size() == 4) << "tile.load requires 4 arguments: tensor, offsets, shapes, validshape";
 
   auto src_tensor_var_ptr = std::dynamic_pointer_cast<const ir::Var>(op->args_[0]);
   CHECK(src_tensor_var_ptr != nullptr) << "tile.load source tensor must be a Var";
@@ -163,7 +170,7 @@ static std::string MakeTileLoadCodegenCCE(const ir::CallPtr& op, codegen::Codege
                                               shapes_tuple->elements_);
 
   // Compute stride-based offset and emit load
-  std::string offset = ComputeStrideBasedOffset(codegen, src_struct, offsets_tuple);
+  std::string offset = ComputeStrideBasedOffset(codegen, src_struct, offsets_tuple, transpose);
   std::string var_name = codegen.GetCurrentResultTarget();
 
   codegen.Emit("TASSIGN(" + gm_name + ", " + src_ptr + " + " + offset + ");");

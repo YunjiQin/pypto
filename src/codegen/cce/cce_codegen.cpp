@@ -909,7 +909,17 @@ void CCECodegen::GenerateGlobalTensorTypeDeclaration(
   if (tensor_struct_ptr.has_value()) {
     global_instance << ", {}, {";
     for (size_t i = 0; i < shape_dims.size(); i++) {
-      global_instance << "compute_stride(" << tensor_struct_ptr.value() << ", " << std::to_string(i) << ")";
+      // For DN layout, swap the last two stride indices to match transposed memory order
+      size_t stride_idx = i;
+      if (layout == "Layout::DN" && shape_dims.size() >= 2) {
+        if (i == shape_dims.size() - 2) {
+          stride_idx = shape_dims.size() - 1;
+        } else if (i == shape_dims.size() - 1) {
+          stride_idx = shape_dims.size() - 2;
+        }
+      }
+      global_instance << "compute_stride(" << tensor_struct_ptr.value() << ", " << std::to_string(stride_idx)
+                      << ")";
       if (i != shape_dims.size() - 1) {
         global_instance << ", ";
       }
