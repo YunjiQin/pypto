@@ -561,21 +561,17 @@ class TestExpandMixedKernelVectorOpClassification:
             def main_incore_0(
                 self,
                 x: pl.Tensor[[16, 128], pl.BF16],
-                y: pl.Tensor[[128, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16, pl.DN],
                 out_0: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
             ) -> pl.Tensor[[16, 128], pl.FP32]:
                 x_l1: pl.Tile[[16, 128], pl.BF16] = pl.load(
                     x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat
                 )
-                x_left: pl.Tile[[16, 128], pl.BF16] = pl.move(
-                    x_l1, target_memory=pl.MemorySpace.Left, transpose=False
-                )
+                x_left: pl.Tile[[16, 128], pl.BF16] = pl.move(x_l1, target_memory=pl.MemorySpace.Left)
                 y_l1: pl.Tile[[128, 128], pl.BF16] = pl.load(
-                    y, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat
+                    y, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat, transpose=True
                 )
-                y_right: pl.Tile[[128, 128], pl.BF16] = pl.move(
-                    y_l1, target_memory=pl.MemorySpace.Right, transpose=True
-                )
+                y_right: pl.Tile[[128, 128], pl.BF16] = pl.move(y_l1, target_memory=pl.MemorySpace.Right)
                 z_tile: pl.Tile[[16, 128], pl.FP32] = pl.matmul(x_left, y_right)
                 out_0: pl.Tensor[[16, 128], pl.FP32] = pl.store(z_tile, [0, 0], out_0)
                 return out_0
@@ -584,7 +580,7 @@ class TestExpandMixedKernelVectorOpClassification:
             def main(
                 self,
                 x: pl.Tensor[[16, 128], pl.BF16],
-                y: pl.Tensor[[128, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16, pl.DN],
             ) -> pl.Tensor[[16, 128], pl.FP32]:
                 out_0: pl.Tensor[[16, 128], pl.FP32] = pl.create_tensor([16, 128], dtype=pl.FP32)
                 z: pl.Tensor[[16, 128], pl.FP32] = self.main_incore_0(x, y, out_0)
@@ -856,21 +852,17 @@ class TestExpandMixedKernelRealisticPatterns:
             def main_incore_0(
                 self,
                 x: pl.Tensor[[16, 128], pl.BF16],
-                y: pl.Tensor[[128, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16, pl.DN],
                 out_0: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
             ) -> pl.Tensor[[16, 128], pl.FP32]:
                 x_l1: pl.Tile[[16, 128], pl.BF16] = pl.load(
                     x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat
                 )
-                x_left: pl.Tile[[16, 128], pl.BF16] = pl.move(
-                    x_l1, target_memory=pl.MemorySpace.Left, transpose=False
-                )
+                x_left: pl.Tile[[16, 128], pl.BF16] = pl.move(x_l1, target_memory=pl.MemorySpace.Left)
                 y_l1: pl.Tile[[128, 128], pl.BF16] = pl.load(
-                    y, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat
+                    y, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat, transpose=True
                 )
-                y_right: pl.Tile[[128, 128], pl.BF16] = pl.move(
-                    y_l1, target_memory=pl.MemorySpace.Right, transpose=True
-                )
+                y_right: pl.Tile[[128, 128], pl.BF16] = pl.move(y_l1, target_memory=pl.MemorySpace.Right)
                 z_tile: pl.Tile[[16, 128], pl.FP32] = pl.matmul(x_left, y_right)
                 z_vec: pl.Tile[[16, 128], pl.FP32] = pl.exp(z_tile)
                 out_0: pl.Tensor[[16, 128], pl.FP32] = pl.store(z_vec, [0, 0], out_0)
@@ -880,7 +872,7 @@ class TestExpandMixedKernelRealisticPatterns:
             def main(
                 self,
                 x: pl.Tensor[[16, 128], pl.BF16],
-                y: pl.Tensor[[128, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16, pl.DN],
             ) -> pl.Tensor[[16, 128], pl.FP32]:
                 out_0: pl.Tensor[[16, 128], pl.FP32] = pl.create_tensor([16, 128], dtype=pl.FP32)
                 z: pl.Tensor[[16, 128], pl.FP32] = self.main_incore_0(x, y, out_0)

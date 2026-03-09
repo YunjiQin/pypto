@@ -123,7 +123,7 @@ class BatchQKMatmulTestCase(PTOTestCase):
             def KernelQkMatmul(
                 self,
                 query: pl.Tensor[[query_rows, head_dim], pl.BF16],
-                key_cache: pl.Tensor[[key_cache_rows, head_dim], pl.BF16],
+                key_cache: pl.Tensor[[head_dim, key_cache_rows], pl.BF16, pl.DN],
                 sij_batch: pl.Out[pl.Tensor[[batch_q_tile, block_size], pl.FP32]],
                 block_table: pl.Tensor[[block_table_flat_size], pl.INT32],
                 batch_count: pl.Scalar[pl.INDEX],
@@ -145,12 +145,13 @@ class BatchQKMatmulTestCase(PTOTestCase):
                     )
                     kj_l1 = pl.load(
                         key_cache,
-                        [kj_row, 0],
-                        [block_size, head_dim],
+                        [0, kj_row],
+                        [head_dim, block_size],
                         target_memory=pl.MemorySpace.Mat,
+                        transpose=True,
                     )
                     qi_l0a = pl.move(qi_l1, target_memory=pl.MemorySpace.Left)
-                    kj_l0b = pl.move(kj_l1, target_memory=pl.MemorySpace.Right, transpose=True)
+                    kj_l0b = pl.move(kj_l1, target_memory=pl.MemorySpace.Right)
                     sij_l0c = pl.matmul(qi_l0a, kj_l0b)
                     sij_batch_new = pl.store(sij_l0c, [b * q_tile, 0], sij_batch)
                 return sij_batch_new
@@ -159,7 +160,7 @@ class BatchQKMatmulTestCase(PTOTestCase):
             def Orchestrator(
                 self,
                 query: pl.Tensor[[query_rows, head_dim], pl.BF16],
-                key_cache: pl.Tensor[[key_cache_rows, head_dim], pl.BF16],
+                key_cache: pl.Tensor[[head_dim, key_cache_rows], pl.BF16, pl.DN],
                 block_table: pl.Tensor[[block_table_flat_size], pl.INT32],
                 config: pl.Tensor[[5], pl.INT64],
             ) -> pl.Tensor[[batch_q_tile, block_size], pl.FP32]:
