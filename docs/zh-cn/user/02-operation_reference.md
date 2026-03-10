@@ -31,7 +31,7 @@
 
 | 名称 | 签名 | 说明 |
 | ---- | ---- | ---- |
-| `create` / `create_tensor` | `(shape: Sequence[IntLike], dtype: DataType) -> Tensor` | 创建新张量 |
+| `create` / `create_tensor` | `(shape: Sequence[IntLike], dtype: DataType, layout: TensorLayout = None) -> Tensor` | 创建新张量（可选 `layout` 参数，如 `pl.DN`、`pl.NZ`） |
 | `read` | `(tensor: Tensor, indices: Sequence[IntLike]) -> Scalar` | 读取指定索引的标量。语法糖：`A[i, j]` |
 | `dim` | `(tensor: Tensor, axis: int) -> Scalar` | 获取维度大小（支持负索引） |
 | `slice` | `(tensor: Tensor, shape: Sequence[IntLike], offset: Sequence[IntLike]) -> Tensor` | 切片。语法糖：`A[0:16, :]` |

@@ -163,6 +163,11 @@ std::vector<std::pair<std::string, std::any>> DeserializeKwargs(const msgpack::o
           throw TypeError("Missing 'value' field for TensorLayout kwarg: " + key);
         }
         kwargs.emplace_back(key, StringToTensorLayout(value_str));
+      } else if (type_name == "MemorySpace") {
+        if (value_str.empty()) {
+          throw TypeError("Missing 'value' field for MemorySpace kwarg: " + key);
+        }
+        kwargs.emplace_back(key, StringToMemorySpace(value_str));
       } else {
         // Try to deserialize as DataType
         try {

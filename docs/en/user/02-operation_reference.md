@@ -31,7 +31,7 @@ Operate on `Tensor` objects (DDR memory).
 
 | Name | Signature | Description |
 | ---- | --------- | ----------- |
-| `create` / `create_tensor` | `(shape: Sequence[IntLike], dtype: DataType) -> Tensor` | Create a new tensor |
+| `create` / `create_tensor` | `(shape: Sequence[IntLike], dtype: DataType, layout: TensorLayout = None) -> Tensor` | Create a new tensor (optional `layout`, e.g. `pl.DN`, `pl.NZ`) |
 | `read` | `(tensor: Tensor, indices: Sequence[IntLike]) -> Scalar` | Read scalar at indices. Sugar: `A[i, j]` |
 | `dim` | `(tensor: Tensor, axis: int) -> Scalar` | Get dimension size (supports negative indexing) |
 | `slice` | `(tensor: Tensor, shape: Sequence[IntLike], offset: Sequence[IntLike]) -> Tensor` | Slice. Sugar: `A[0:16, :]` |
@@ -203,4 +203,4 @@ Compare types: `EQ=0, NE=1, LT=2, LE=3, GT=4, GE=5`
 | `const` | `(value: int \| float, dtype: DataType) -> int \| float` | Typed constant |
 | `incore` | `() -> IncoreContext` | Context manager for InCore scope |
 | `dynamic` | `(name: str) -> DynVar` | Create dynamic dimension variable |
-| `create_tensor` | `(shape: Sequence[IntLike], dtype: DataType) -> Tensor` | Create tensor (promoted from `pl.tensor`) |
+| `create_tensor` | `(shape: Sequence[IntLike], dtype: DataType, layout: TensorLayout = None) -> Tensor` | Create tensor (promoted from `pl.tensor`) |

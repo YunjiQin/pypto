@@ -476,6 +476,10 @@ void BindIR(nb::module_& m) {
             result[key.c_str()] = AnyCast<float>(value, "converting to Python: " + key);
           } else if (value.type() == typeid(DataType)) {
             result[key.c_str()] = AnyCast<DataType>(value, "converting to Python: " + key);
+          } else if (value.type() == typeid(MemorySpace)) {
+            result[key.c_str()] = AnyCast<MemorySpace>(value, "converting to Python: " + key);
+          } else if (value.type() == typeid(TensorLayout)) {
+            result[key.c_str()] = AnyCast<TensorLayout>(value, "converting to Python: " + key);
           }
         }
         return result;
@@ -977,7 +981,8 @@ void BindIR(nb::module_& m) {
               nb::list py_kwargs_list;
               for (const auto& [key, val] : kwargs) {
                 nb::object py_val =
-                    AnyToPyObject<DataType, MemorySpace, bool, int, std::string, double>(val, key);
+                    AnyToPyObject<DataType, MemorySpace, TensorLayout, bool, int, std::string, double>(val,
+                                                                                                       key);
                 nb::tuple pair = nb::make_tuple(nb::cast(key), py_val);
                 py_kwargs_list.append(pair);
               }

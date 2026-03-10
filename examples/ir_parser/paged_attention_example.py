@@ -300,7 +300,7 @@ def build_paged_attention_program(
 
                         # Key/Value views: physical block row = cur_block_idx * block_size
                         kv_block_row = cur_block_idx * block_size_cfg
-                        kj: pl.Tensor[[head_dim_cfg, block_size_cfg], pl.BF16] = pl.slice(
+                        kj: pl.Tensor[[head_dim_cfg, block_size_cfg], pl.BF16, pl.DN] = pl.slice(
                             key_cache,
                             [head_dim_cfg, block_size_cfg],  # type: ignore[reportArgumentType]
                             [kv_block_row, 0],

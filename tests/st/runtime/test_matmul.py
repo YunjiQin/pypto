@@ -161,7 +161,7 @@ class TestMatmulTransposePTO(TestMatmulTranspose):
     __test__ = False
 
     def get_name(self) -> str:
-        return f"matmul_pto_{self.M}x{self.K}x{self.N}"
+        return f"matmul_transpose_pto_{self.M}x{self.K}x{self.N}"
 
     def get_strategy(self) -> OptimizationStrategy:
         return OptimizationStrategy.PTOAS

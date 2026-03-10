@@ -114,7 +114,7 @@ def build_paged_attention_program(
                         cur_block_idx = pl.tensor.read(block_table, [b_idx * BLOCK_NUM_CFG + bn])
                         valid_len = pl.min(BLOCK_SIZE_CFG, cur_seq - bn * BLOCK_SIZE_CFG)
                         kv_block_row = cur_block_idx * BLOCK_SIZE_CFG
-                        kj: pl.Tensor[[HEAD_DIM_CFG, BLOCK_SIZE_CFG], pl.BF16] = pl.slice(
+                        kj: pl.Tensor[[HEAD_DIM_CFG, BLOCK_SIZE_CFG], pl.BF16, pl.DN] = pl.slice(
                             key_cache, [HEAD_DIM_CFG, BLOCK_SIZE_CFG], [kv_block_row, 0]
                         )
                         vj: pl.Tensor[[BLOCK_SIZE_CFG, HEAD_DIM_CFG], pl.BF16] = pl.slice(

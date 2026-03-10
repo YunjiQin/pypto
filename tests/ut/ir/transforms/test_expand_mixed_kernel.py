@@ -599,6 +599,13 @@ class TestExpandMixedKernelVectorOpClassification:
         aic_str = ir.python_print(aic_func)
         assert "tile.move(" not in aic_str
 
+        # Verify DN layout and transpose metadata are preserved in split functions
+        main_func = After.get_function("main")
+        assert main_func is not None
+        main_str = ir.python_print(main_func)
+        assert "TensorLayout.DN" in main_str
+        assert "transpose=True" in aiv_str
+
     def test_tile_sub_is_vector(self):
         """tile.sub should be classified as VECTOR, not CUBE."""
 
@@ -894,6 +901,13 @@ class TestExpandMixedKernelRealisticPatterns:
         assert "matmul" in aic_str
         assert "tile.move(" not in aic_str
         assert "tile.load(" not in aic_str
+
+        # Verify DN layout and transpose metadata are preserved in split functions
+        main_func = After.get_function("main")
+        assert main_func is not None
+        main_str = ir.python_print(main_func)
+        assert "TensorLayout.DN" in main_str
+        assert "transpose=True" in aiv_str
 
 
 class TestExpandMixedKernelMultipleInCore:

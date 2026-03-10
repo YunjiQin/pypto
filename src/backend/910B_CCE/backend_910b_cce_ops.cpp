@@ -154,7 +154,7 @@ static std::string MakeTileLoadCodegenCCE(const ir::CallPtr& op, codegen::Codege
   auto shapes_tuple = std::dynamic_pointer_cast<const ir::MakeTuple>(op->args_[2]);
   CHECK(shapes_tuple != nullptr) << "tile.load third argument must be a tuple (shapes)";
 
-  bool transpose = op->GetKwarg<bool>("transpose");
+  bool transpose = op->GetKwarg<bool>("transpose", false);
 
   auto src_tensor_type = std::dynamic_pointer_cast<const ir::TensorType>(src_tensor_var_ptr->GetType());
   CHECK(src_tensor_type != nullptr) << "tile.load source must be TensorType";

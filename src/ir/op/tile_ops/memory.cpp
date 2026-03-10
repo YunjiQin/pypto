@@ -115,6 +115,10 @@ TypePtr DeduceTileLoadType(const std::vector<ExprPtr>& args,
       << " only supports transpose=true when target_memory is Mat (L1), but got "
       << static_cast<int>(target_memory);
 
+  CHECK(!transpose || shapes_tuple->elements_.size() == 2)
+      << "The operator " << op_name << " only supports transpose=true for 2D loads, but got "
+      << shapes_tuple->elements_.size() << "D";
+
   // Nz/Zn for transpose false/true
   TileView tile_view;
   if (target_memory == MemorySpace::Mat) {
