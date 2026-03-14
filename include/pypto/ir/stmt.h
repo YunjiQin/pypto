@@ -661,6 +661,36 @@ class SeqStmts : public Stmt {
                           std::make_tuple(reflection::UsualField(&SeqStmts::stmts_, "stmts")));
   }
 
+  /**
+   * @brief Create a normalized statement from a list of statements
+   *
+   * Flattens nested SeqStmts and unwraps single-child sequences:
+   * - Flatten({a, SeqStmts({b, c}), d}, span) → SeqStmts({a, b, c, d})
+   * - Flatten({a}, span) → a
+   * - Flatten({}, span) → SeqStmts({})
+   */
+  static StmtPtr Flatten(std::vector<StmtPtr> stmts, Span span) {
+    std::vector<StmtPtr> flat;
+    for (auto& s : stmts) {
+      if (auto seq = std::dynamic_pointer_cast<const SeqStmts>(s)) {
+        // Recursively flatten nested SeqStmts
+        for (const auto& inner : seq->stmts_) {
+          if (auto inner_seq = std::dynamic_pointer_cast<const SeqStmts>(inner)) {
+            flat.insert(flat.end(), inner_seq->stmts_.begin(), inner_seq->stmts_.end());
+          } else {
+            flat.push_back(inner);
+          }
+        }
+      } else {
+        flat.push_back(std::move(s));
+      }
+    }
+    if (flat.size() == 1) {
+      return flat[0];
+    }
+    return std::make_shared<SeqStmts>(std::move(flat), std::move(span));
+  }
+
  public:
   std::vector<StmtPtr> stmts_;  // List of statements
 };
@@ -698,6 +728,36 @@ class OpStmts : public Stmt {
   static constexpr auto GetFieldDescriptors() {
     return std::tuple_cat(Stmt::GetFieldDescriptors(),
                           std::make_tuple(reflection::UsualField(&OpStmts::stmts_, "stmts")));
+  }
+
+  /**
+   * @brief Create a normalized statement from a list of op statements
+   *
+   * Flattens nested OpStmts and unwraps single-child sequences:
+   * - Flatten({a, OpStmts({b, c}), d}, span) → OpStmts({a, b, c, d})
+   * - Flatten({a}, span) → a
+   * - Flatten({}, span) → OpStmts({})
+   */
+  static StmtPtr Flatten(std::vector<StmtPtr> stmts, Span span) {
+    std::vector<StmtPtr> flat;
+    for (auto& s : stmts) {
+      if (auto ops = std::dynamic_pointer_cast<const OpStmts>(s)) {
+        // Recursively flatten nested OpStmts
+        for (const auto& inner : ops->stmts_) {
+          if (auto inner_ops = std::dynamic_pointer_cast<const OpStmts>(inner)) {
+            flat.insert(flat.end(), inner_ops->stmts_.begin(), inner_ops->stmts_.end());
+          } else {
+            flat.push_back(inner);
+          }
+        }
+      } else {
+        flat.push_back(std::move(s));
+      }
+    }
+    if (flat.size() == 1) {
+      return flat[0];
+    }
+    return std::make_shared<OpStmts>(std::move(flat), std::move(span));
   }
 
  public:
