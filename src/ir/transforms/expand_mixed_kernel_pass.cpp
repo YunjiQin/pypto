@@ -337,7 +337,8 @@ std::string GetStmtOpName(const StmtPtr& stmt) {
 
 bool IsSideEffectOp(const StmtPtr& stmt) {
   static const std::unordered_set<std::string> side_effect_ops = {
-      "system.tpush_to_aiv", "system.tpush_to_aic", "tile.store", "tile.assemble"};
+      "system.tpush_to_aiv",  "system.tpush_to_aic", "system.tpop_from_aic",
+      "system.tpop_from_aiv", "tile.store",          "tile.assemble"};
   return side_effect_ops.count(GetStmtOpName(stmt)) > 0;
 }
 
@@ -362,19 +363,45 @@ void CollectAllAssignStmts(const std::vector<StmtPtr>& stmts,
 
 void FindLiveRootsRecursive(const std::vector<StmtPtr>& stmts, std::unordered_set<std::string>& live) {
   for (const auto& stmt : stmts) {
-    if (std::dynamic_pointer_cast<const ReturnStmt>(stmt) || IsSideEffectOp(stmt)) {
+    if (std::dynamic_pointer_cast<const ReturnStmt>(stmt) ||
+        std::dynamic_pointer_cast<const YieldStmt>(stmt) || IsSideEffectOp(stmt)) {
       outline_utils::VarRefCollector refs;
       refs.VisitStmt(stmt);
       live.insert(refs.var_refs.begin(), refs.var_refs.end());
+      // Mark LHS of side-effect assignments as live for downstream propagation
+      if (auto assign = std::dynamic_pointer_cast<const AssignStmt>(stmt)) {
+        live.insert(assign->var_->name_);
+      }
     }
+    // Collect variable refs from control expressions and iter_args init values
+    auto collect_iter_arg_refs = [&](const auto& loop_stmt) {
+      for (const auto& iter_arg : loop_stmt->iter_args_) {
+        outline_utils::VarRefCollector refs;
+        refs.VisitExpr(iter_arg->initValue_);
+        live.insert(refs.var_refs.begin(), refs.var_refs.end());
+      }
+    };
+    auto collect_expr_refs = [&](const ExprPtr& expr) {
+      outline_utils::VarRefCollector refs;
+      refs.VisitExpr(expr);
+      live.insert(refs.var_refs.begin(), refs.var_refs.end());
+    };
+
     if (auto for_stmt = std::dynamic_pointer_cast<const ForStmt>(stmt)) {
+      collect_expr_refs(for_stmt->start_);
+      collect_expr_refs(for_stmt->stop_);
+      collect_expr_refs(for_stmt->step_);
+      collect_iter_arg_refs(for_stmt);
       FindLiveRootsRecursive(FlattenBody(for_stmt->body_), live);
     } else if (auto if_stmt = std::dynamic_pointer_cast<const IfStmt>(stmt)) {
+      collect_expr_refs(if_stmt->condition_);
       FindLiveRootsRecursive(FlattenBody(if_stmt->then_body_), live);
       if (if_stmt->else_body_.has_value()) {
         FindLiveRootsRecursive(FlattenBody(if_stmt->else_body_.value()), live);
       }
     } else if (auto while_stmt = std::dynamic_pointer_cast<const WhileStmt>(stmt)) {
+      collect_expr_refs(while_stmt->condition_);
+      collect_iter_arg_refs(while_stmt);
       FindLiveRootsRecursive(FlattenBody(while_stmt->body_), live);
     }
   }
@@ -385,7 +412,7 @@ std::vector<StmtPtr> FilterDeadCode(const std::vector<StmtPtr>& stmts,
   std::vector<StmtPtr> result;
   for (const auto& stmt : stmts) {
     if (auto assign = std::dynamic_pointer_cast<const AssignStmt>(stmt)) {
-      if (live.count(assign->var_->name_)) {
+      if (live.count(assign->var_->name_) || IsSideEffectOp(stmt)) {
         result.push_back(stmt);
       }
     } else if (auto for_stmt = std::dynamic_pointer_cast<const ForStmt>(stmt)) {
@@ -575,7 +602,6 @@ ExpandedKernel ExpandMixedFunction(const FunctionPtr& func, bool create_group = 
       aic_stmts_no_return.push_back(s);
     }
   }
-
   // DCE on AIC (recursive)
   auto aic_final = EliminateDeadCode(aic_stmts_no_return);
 
@@ -681,39 +707,34 @@ FunctionPtr RewriteGroupCaller(const FunctionPtr& group_func, const std::string&
   std::vector<StmtPtr> new_stmts;
 
   for (const auto& stmt : stmts) {
-    // Case 1: AssignStmt(var, Call(GlobalVar(incore_name), args))
-    if (auto assign = std::dynamic_pointer_cast<const AssignStmt>(stmt)) {
-      auto call = std::dynamic_pointer_cast<const Call>(assign->value_);
-      if (call) {
-        auto gv = std::dynamic_pointer_cast<const GlobalVar>(call->op_);
-        if (gv && gv->name_ == incore_name) {
-          auto aic_call =
-              std::make_shared<Call>(std::make_shared<GlobalVar>(aic_name), call->args_, stmt->span_);
-          new_stmts.push_back(std::make_shared<EvalStmt>(aic_call, stmt->span_));
+    // Extract the Call targeting incore_name (from AssignStmt or EvalStmt)
+    CallPtr call;
+    auto assign = std::dynamic_pointer_cast<const AssignStmt>(stmt);
+    if (assign) {
+      call = std::dynamic_pointer_cast<const Call>(assign->value_);
+    } else if (auto eval = std::dynamic_pointer_cast<const EvalStmt>(stmt)) {
+      call = std::dynamic_pointer_cast<const Call>(eval->expr_);
+    }
 
+    if (call) {
+      auto gv = std::dynamic_pointer_cast<const GlobalVar>(call->op_);
+      if (gv && gv->name_ == incore_name) {
+        // Emit AIC call (always fire-and-forget)
+        auto aic_call =
+            std::make_shared<Call>(std::make_shared<GlobalVar>(aic_name), call->args_, stmt->span_);
+        new_stmts.push_back(std::make_shared<EvalStmt>(aic_call, stmt->span_));
+
+        // Emit AIV call: AssignStmt preserves return value, EvalStmt for void
+        if (assign) {
           auto aiv_call = std::make_shared<Call>(std::make_shared<GlobalVar>(aiv_name), call->args_,
                                                  call->GetType(), stmt->span_);
           new_stmts.push_back(std::make_shared<AssignStmt>(assign->var_, aiv_call, stmt->span_));
-          continue;
-        }
-      }
-    }
-
-    // Case 2: EvalStmt(Call(GlobalVar(incore_name), args)) — no return
-    if (auto eval = std::dynamic_pointer_cast<const EvalStmt>(stmt)) {
-      auto call = std::dynamic_pointer_cast<const Call>(eval->expr_);
-      if (call) {
-        auto gv = std::dynamic_pointer_cast<const GlobalVar>(call->op_);
-        if (gv && gv->name_ == incore_name) {
-          auto aic_call =
-              std::make_shared<Call>(std::make_shared<GlobalVar>(aic_name), call->args_, stmt->span_);
-          new_stmts.push_back(std::make_shared<EvalStmt>(aic_call, stmt->span_));
-
+        } else {
           auto aiv_call =
               std::make_shared<Call>(std::make_shared<GlobalVar>(aiv_name), call->args_, stmt->span_);
           new_stmts.push_back(std::make_shared<EvalStmt>(aiv_call, stmt->span_));
-          continue;
         }
+        continue;
       }
     }
 
