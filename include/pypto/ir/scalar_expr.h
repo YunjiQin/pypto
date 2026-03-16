@@ -536,7 +536,7 @@ inline ExprPtr MakeBitNot(const ExprPtr& operand, const Span& span = Span::unkno
 }
 
 inline ExprPtr MakeNot(const ExprPtr& operand, const Span& span = Span::unknown()) {
-  return std::make_shared<Not>(operand, GetScalarDtype(operand), span);
+  return std::make_shared<Not>(operand, DataType::BOOL, span);
 }
 
 }  // namespace ir

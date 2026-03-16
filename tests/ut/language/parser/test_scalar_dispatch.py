@@ -175,11 +175,16 @@ class TestScalarNot:
                 out: pl.Tensor[[2, 16, 128], pl.FP32],
             ) -> pl.Tensor[[2, 16, 128], pl.FP32]:
                 a: pl.Scalar[pl.INT64] = pl.tensor.read(config, [0])
-                b: pl.Scalar[pl.INT64] = not a
+                b: pl.Scalar[pl.BOOL] = not a
                 _ = b
                 return out
 
         assert isinstance(Before, ir.Program)
+        func = list(Before.functions.values())[0]
+        assert isinstance(func.body, ir.SeqStmts)
+        let_stmt = func.body.stmts[1]
+        assert isinstance(let_stmt, ir.AssignStmt)
+        assert isinstance(let_stmt.value, ir.Not)
         printed = Before.as_python()
         assert "not a" in printed
         ir.assert_structural_equal(Before, pl.parse_program(printed))
@@ -201,6 +206,11 @@ class TestScalarNot:
                 return out
 
         assert isinstance(Before, ir.Program)
+        func = list(Before.functions.values())[0]
+        assert isinstance(func.body, ir.SeqStmts)
+        let_stmt = func.body.stmts[1]
+        assert isinstance(let_stmt, ir.AssignStmt)
+        assert isinstance(let_stmt.value, ir.BitNot)
         printed = Before.as_python()
         assert "~a" in printed
         ir.assert_structural_equal(Before, pl.parse_program(printed))

@@ -65,15 +65,15 @@ class TestScalarMakeHelpers:
         assert isinstance(result, ir.Not)
         assert cast(ir.Var, result.operand).name == "x"
 
-    def test_not_preserves_dtype(self):
-        """Test ir.not_ preserves the operand dtype."""
+    def test_not_returns_bool(self):
+        """Test ir.not_ always returns BOOL type, consistent with logical operators."""
         span = ir.Span.unknown()
         x = ir.Var("x", ir.ScalarType(DataType.INT32), span)
 
         result = ir.not_(x)
 
         assert isinstance(result, ir.Not)
-        assert result.type == ir.ScalarType(DataType.INT32)
+        assert result.type == ir.ScalarType(DataType.BOOL)
 
     def test_bit_not_creation(self):
         """Test ir.bit_not creates a BitNot expression for integer types."""
