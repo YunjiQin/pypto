@@ -71,6 +71,7 @@ find_package(nanobind CONFIG REQUIRED)
 
 # Include directories
 include_directories(${CMAKE_SOURCE_DIR}/include)
+include_directories(${CMAKE_SOURCE_DIR})
 
 # External dependencies
 include(${CMAKE_SOURCE_DIR}/cmake/libbacktrace.cmake)
@@ -116,8 +117,9 @@ set(PYPTO_SOURCES
     src/ir/op/type_inference.cpp
 
     # IR - Arith
-    src/ir/arith/const_int_bound.cc
-    src/ir/arith/modular_set.cc
+    src/ir/arith/const_int_bound.cpp
+    src/ir/arith/modular_set.cpp
+    src/ir/arith/rewrite_simplify.cpp
 
     # IR - Transforms
     src/ir/transforms/allocate_memory_addr_pass.cpp
