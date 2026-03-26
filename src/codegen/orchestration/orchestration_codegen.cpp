@@ -543,21 +543,21 @@ std::string GenerateConfigFunction(int expected_arg_count) {
   return oss.str();
 }
 
-// Returns the submit-task call prefix for the given core type and backend.
-// A2/A3: pto2_rt_submit_aiv_task(id, params, n)
-//         pto2_rt_submit_aic_task(id, params, n)
-// A5:    pto2_rt_submit_task(id, PTO2_WORKER_VECTOR, params, n)
-//         pto2_rt_submit_task(id, PTO2_WORKER_CUBE,   params, n)
-// Returns {func_call_with_rt_and_id_prefix, extra_worker_arg_or_empty}.
-// Caller emits: prefix << func_id << extra << ", " << task_var << ", " << n << ");\n"
-std::pair<std::string, std::string> CoreTypeToSubmitParts(CoreType core_type) {
-  bool is_a5 = pypto::backend::GetBackendType() == pypto::backend::BackendType::Ascend950;
-  if (is_a5) {
-    std::string worker = core_type == CoreType::CUBE ? "PTO2_WORKER_CUBE" : "PTO2_WORKER_VECTOR";
-    return {"pto2_rt_submit_task(", ", " + worker};
-  }
+// Returns true when targeting an A5 (Ascend950) backend.
+bool IsA5Backend() { return pypto::backend::GetBackendType() == pypto::backend::BackendType::Ascend950; }
+
+// Returns "rt, " for A5 backends (explicit PTO2Runtime* argument), "" otherwise (TLS-based).
+std::string RtArg() { return IsA5Backend() ? "rt, " : ""; }
+
+// Returns "rt" for A5 backends (PTO2_SCOPE(rt)), "" for A2/A3 (PTO2_SCOPE()).
+std::string ScopeArg() { return IsA5Backend() ? "rt" : ""; }
+
+// Returns the opening of a pto2_rt_submit_{aic,aiv}_task call up to (and including) any rt arg.
+// A2/A3: "pto2_rt_submit_aic_task("    caller appends: func_id << ", " << params << ");"
+// A5:    "pto2_rt_submit_aic_task(rt, " caller appends: func_id << ", " << params << ");"
+std::string CoreTypeToSubmitPrefix(CoreType core_type) {
   std::string func = core_type == CoreType::CUBE ? "pto2_rt_submit_aic_task" : "pto2_rt_submit_aiv_task";
-  return {func + "(", ""};
+  return func + "(" + RtArg();
 }
 
 // Removed DataTypeToPTO2Enum — now uses DataTypeToString from dtype.h
@@ -709,7 +709,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
     code_ << Indent() << "for (int64_t " << loop_var << " = " << start_expr << "; " << loop_var << " < "
           << stop_expr << "; " << loop_var << " += " << step_expr << ") {\n";
     indent_ += 4;
-    code_ << Indent() << "PTO2_SCOPE() {\n";
+    code_ << Indent() << "PTO2_SCOPE(" << ScopeArg() << ") {\n";
     indent_ += 4;
 
     auto saved = current_return_vars_;
@@ -1005,8 +1005,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
     for (const auto& p : params) {
       code_ << ind << task_var << "." << p.kind << "(" << p.value << ");\n";
     }
-    auto [submit_prefix, worker_arg] = CoreTypeToSubmitParts(core_type);
-    code_ << ind << submit_prefix << func_id << worker_arg << ", " << task_var << ");\n";
+    code_ << ind << CoreTypeToSubmitPrefix(core_type) << func_id << ", " << task_var << ");\n";
 
     task_counter_++;
   }
@@ -1052,7 +1051,8 @@ class OrchestrationStmtCodegen : public CodegenBase {
     }
     code_ << ind << "MixedKernels mixed_" << task_counter_ << " = {" << aic_id << ", " << aiv_id
           << ", INVALID_KERNEL_ID};\n";
-    code_ << ind << "pto2_rt_submit_task(mixed_" << task_counter_ << ", " << task_var << ");\n";
+    code_ << ind << "pto2_rt_submit_task(" << RtArg() << "mixed_" << task_counter_ << ", " << task_var
+          << ");\n";
 
     task_counter_++;
   }
@@ -1116,7 +1116,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
   // Visit a branch body (then/else) inside a PTO2_SCOPE, with return vars scoped.
   void VisitScopedBranchBody(const StmtPtr& body, const std::vector<VarPtr>& return_vars) {
     indent_ += 4;
-    code_ << Indent() << "PTO2_SCOPE() {\n";
+    code_ << Indent() << "PTO2_SCOPE(" << ScopeArg() << ") {\n";
     indent_ += 4;
 
     auto saved = current_return_vars_;
@@ -1156,7 +1156,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
     size_t ndim = result_type->shape_.size();
     size_t array_len = ndim == 0 ? 1 : ndim;
     std::ostringstream oss;
-    oss << "uint64_t " << emit_var << "_shapes[" << array_len << "] = {";
+    oss << "uint32_t " << emit_var << "_shapes[" << array_len << "] = {";
     if (ndim == 0) {
       oss << "1";
     } else {
@@ -1327,7 +1327,9 @@ OrchestrationResult GenerateOrchestration(const ir::ProgramPtr& program, const i
 
   // 5. Entry function
   oss << "__attribute__((visibility(\"default\")))\n";
-  oss << "void aicpu_orchestration_entry(OrchArg* orch, int arg_count, "
+  std::string rt_param = IsA5Backend() ? "PTO2Runtime* rt, " : "";
+  oss << "void aicpu_orchestration_entry(" << rt_param
+      << "OrchArg* orch, int arg_count, "
          "int orch_thread_num, int orch_thread_index) {\n";
   oss << "    (void)arg_count;\n";
   oss << "    (void)orch_thread_num;\n";
@@ -1360,7 +1362,7 @@ OrchestrationResult GenerateOrchestration(const ir::ProgramPtr& program, const i
   stmt_codegen.VisitStmt(func->body_);
 
   // 10. Emit generated code inside PTO2_SCOPE (required by runtime: scope_stack_top must be >= 0)
-  oss << "\n    PTO2_SCOPE() {\n";
+  oss << "\n    PTO2_SCOPE(" << ScopeArg() << ") {\n";
   oss << stmt_codegen.GetGeneratedCode();
   oss << "    }\n";
 

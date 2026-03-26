@@ -84,8 +84,11 @@ PTO2OrchestrationConfig aicpu_orchestration_config(OrchArg* orch_args) {
 }
 
 // 阶段 4：入口函数签名
+// A2/A3：
 void aicpu_orchestration_entry(OrchArg* orch,
     int arg_count, int orch_thread_num, int orch_thread_index) {
+// A5（Ascend950）：在参数列表前增加 PTO2Runtime* rt
+// void aicpu_orchestration_entry(PTO2Runtime* rt, OrchArg* orch, ...)
 ```
 
 ### 阶段 5–6：张量设置
@@ -110,11 +113,14 @@ Tensor tmp = make_tensor(tmp_shapes, 2, DataType::FLOAT32);
 
 ```cpp
 // 阶段 7–9：顶层 PTO2_SCOPE 包裹所有任务提交
+// A2/A3：PTO2_SCOPE()   A5：PTO2_SCOPE(rt)
 PTO2_SCOPE() {
     PTOParam params_t0;
     params_t0.add_input(ext_a);
     params_t0.add_input(ext_b);
     params_t0.add_output(ext_output);
+    // A2/A3：pto2_rt_submit_aiv_task(0, params_t0)
+    // A5：   pto2_rt_submit_aiv_task(rt, 0, params_t0)
     pto2_rt_submit_aiv_task(0, params_t0);
 
     // ForStmt 示例 — 普通 for 循环，不嵌套独立的 PTO2_SCOPE
@@ -166,6 +172,18 @@ Tensor& result = ext_output;  // 别名 — result 引用 ext_output
 
 如果返回名称与 `Out`/`InOut` 参数名称匹配，则不需要别名。`InOut` 参数永不生成别名 — 其本身已是外部张量。
 
+### 后端差异（A5 / Ascend950）
+
+针对 Ascend950（`BackendType::Ascend950`）时，生成的 C++ 在三处有所不同：
+
+| 元素 | A2/A3 | A5 |
+| ---- | ----- | -- |
+| 入口函数 | `aicpu_orchestration_entry(OrchArg* orch, ...)` | `aicpu_orchestration_entry(PTO2Runtime* rt, OrchArg* orch, ...)` |
+| Scope 宏 | `PTO2_SCOPE()` | `PTO2_SCOPE(rt)` |
+| 提交调用 | `pto2_rt_submit_aiv_task(id, params)` | `pto2_rt_submit_aiv_task(rt, id, params)` |
+
+`rt` 参数是显式的 `PTO2Runtime*` 指针，A5 通过调用链传递，而非依赖线程局部存储。
+
 ### 核心类型推断
 
 代码生成器根据被调用函数的 `MemorySpace` 决定提交到 AIC（CUBE）还是 AIV（VECTOR）：
@@ -204,6 +222,8 @@ pto2_rt_submit_aiv_task(0, params_t0);
 PTOParam params_t0;
 // ... add_input / add_output / add_scalar 调用 ...
 MixedKernels mixed_0 = {aic_id, aiv_id, INVALID_KERNEL_ID};
+// A2/A3：pto2_rt_submit_task(mixed_0, params_t0)
+// A5：   pto2_rt_submit_task(rt, mixed_0, params_t0)
 pto2_rt_submit_task(mixed_0, params_t0);
 ```
 
@@ -255,6 +275,7 @@ PTO2OrchestrationConfig aicpu_orchestration_config(OrchArg* orch_args) {
 
 void aicpu_orchestration_entry(OrchArg* orch,
     int arg_count, int orch_thread_num, int orch_thread_index) {
+    // 注意：A5 在参数列表前增加 PTO2Runtime* rt
     (void)arg_count;
     (void)orch_thread_num;
     (void)orch_thread_index;
@@ -268,12 +289,15 @@ void aicpu_orchestration_entry(OrchArg* orch,
     uint32_t c_shapes[2] = {16, 16};
     Tensor c = make_tensor(c_shapes, 2, DataType::FLOAT32);
 
+    // A2/A3：PTO2_SCOPE()   A5：PTO2_SCOPE(rt)
     PTO2_SCOPE() {
         // 任务 0: kernel_add (a + b → c)
         PTOParam params_t0;
         params_t0.add_input(ext_a);
         params_t0.add_input(ext_b);
         params_t0.add_output(c);
+        // A2/A3：pto2_rt_submit_aiv_task(0, params_t0)
+        // A5：   pto2_rt_submit_aiv_task(rt, 0, params_t0)
         pto2_rt_submit_aiv_task(0, params_t0);
 
         // 任务 1: kernel_add (c + b → d)
@@ -345,6 +369,7 @@ else:
 ```cpp
 // 生成的 C++
 if (condition) {
+    // A2/A3：PTO2_SCOPE()   A5：PTO2_SCOPE(rt)
     PTO2_SCOPE() {
         PTOParam params_t0;
         // ... add_input / add_output 调用 ...

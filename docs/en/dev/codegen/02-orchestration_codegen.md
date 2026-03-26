@@ -84,8 +84,11 @@ PTO2OrchestrationConfig aicpu_orchestration_config(OrchArg* orch_args) {
 }
 
 // Phase 4: Entry function signature
+// A2/A3:
 void aicpu_orchestration_entry(OrchArg* orch,
     int arg_count, int orch_thread_num, int orch_thread_index) {
+// A5 (Ascend950): PTO2Runtime* rt prepended
+// void aicpu_orchestration_entry(PTO2Runtime* rt, OrchArg* orch, ...)
 ```
 
 ### Phase 5–6: Tensor Setup
@@ -110,11 +113,14 @@ All task submission is wrapped in a top-level `PTO2_SCOPE()`:
 
 ```cpp
 // Phase 7–9: Top-level PTO2_SCOPE wraps all task submissions
+// A2/A3: PTO2_SCOPE()   A5: PTO2_SCOPE(rt)
 PTO2_SCOPE() {
     PTOParam params_t0;
     params_t0.add_input(ext_a);
     params_t0.add_input(ext_b);
     params_t0.add_output(ext_output);
+    // A2/A3: pto2_rt_submit_aiv_task(0, params_t0)
+    // A5:    pto2_rt_submit_aiv_task(rt, 0, params_t0)
     pto2_rt_submit_aiv_task(0, params_t0);
 
     // ForStmt example — plain for loop, no nested PTO2_SCOPE
@@ -166,6 +172,18 @@ Tensor& result = ext_output;  // alias — result refers to ext_output
 
 If the return name matches the `Out`/`InOut` arg name, no alias is needed. `InOut` params are never aliased — they are already the external tensor.
 
+### Backend Differences (A5 / Ascend950)
+
+When targeting Ascend950 (`BackendType::Ascend950`), the generated C++ differs in three ways:
+
+| Element | A2/A3 | A5 |
+| ------- | ----- | -- |
+| Entry function | `aicpu_orchestration_entry(OrchArg* orch, ...)` | `aicpu_orchestration_entry(PTO2Runtime* rt, OrchArg* orch, ...)` |
+| Scope macro | `PTO2_SCOPE()` | `PTO2_SCOPE(rt)` |
+| Submit calls | `pto2_rt_submit_aiv_task(id, params)` | `pto2_rt_submit_aiv_task(rt, id, params)` |
+
+The `rt` parameter is an explicit `PTO2Runtime*` pointer that A5 passes through the call chain instead of relying on thread-local storage.
+
 ### Core Type Inference
 
 The codegen determines whether to submit to AIC (CUBE) or AIV (VECTOR) based on the callee's `MemorySpace`:
@@ -204,6 +222,8 @@ When a kernel uses both AIC and AIV cores (mixed kernel), the codegen generates 
 PTOParam params_t0;
 // ... add_input / add_output / add_scalar calls ...
 MixedKernels mixed_0 = {aic_id, aiv_id, INVALID_KERNEL_ID};
+// A2/A3: pto2_rt_submit_task(mixed_0, params_t0)
+// A5:    pto2_rt_submit_task(rt, mixed_0, params_t0)
 pto2_rt_submit_task(mixed_0, params_t0);
 ```
 
@@ -255,6 +275,7 @@ PTO2OrchestrationConfig aicpu_orchestration_config(OrchArg* orch_args) {
 
 void aicpu_orchestration_entry(OrchArg* orch,
     int arg_count, int orch_thread_num, int orch_thread_index) {
+    // Note: A5 adds PTO2Runtime* rt as the first parameter
     (void)arg_count;
     (void)orch_thread_num;
     (void)orch_thread_index;
@@ -268,12 +289,15 @@ void aicpu_orchestration_entry(OrchArg* orch,
     uint32_t c_shapes[2] = {16, 16};
     Tensor c = make_tensor(c_shapes, 2, DataType::FLOAT32);
 
+    // A2/A3: PTO2_SCOPE()   A5: PTO2_SCOPE(rt)
     PTO2_SCOPE() {
         // Task 0: kernel_add (a + b → c)
         PTOParam params_t0;
         params_t0.add_input(ext_a);
         params_t0.add_input(ext_b);
         params_t0.add_output(c);
+        // A2/A3: pto2_rt_submit_aiv_task(0, params_t0)
+        // A5:    pto2_rt_submit_aiv_task(rt, 0, params_t0)
         pto2_rt_submit_aiv_task(0, params_t0);
 
         // Task 1: kernel_add (c + b → d)
@@ -346,6 +370,7 @@ else:
 ```cpp
 // Generated C++
 if (condition) {
+    // A2/A3: PTO2_SCOPE()   A5: PTO2_SCOPE(rt)
     PTO2_SCOPE() {
         PTOParam params_t0;
         // ... add_input / add_output calls ...
