@@ -725,6 +725,54 @@ class TestAutoMoveInsertion:
         _assert_var_memory_space(printed, "y_tile_Right", "Right")
         assert "pl.tile.matmul(x_tile_Left, y_tile_Right)" in printed
 
+    def test_matmul_moves_are_inserted_at_first_consumer(self):
+        """Auto-inserted moves should be materialized at first constrained use."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                lhs: pl.Tensor[[4, 128], pl.BF16],
+                rhs0: pl.Tensor[[128, 64], pl.BF16],
+                rhs1: pl.Tensor[[128, 64], pl.BF16],
+                out_0: pl.Out[pl.Tensor[[4, 64], pl.FP32]],
+            ) -> pl.Tensor[[4, 64], pl.FP32]:
+                lhs_tile: pl.Tile[[4, 128], pl.BF16] = pl.load(
+                    lhs, [0, 0], [4, 128], target_memory=pl.MemorySpace.Mat
+                )
+                rhs0_tile: pl.Tile[[128, 64], pl.BF16] = pl.load(
+                    rhs0, [0, 0], [128, 64], target_memory=pl.MemorySpace.Mat
+                )
+                rhs1_tile: pl.Tile[[128, 64], pl.BF16] = pl.load(
+                    rhs1, [0, 0], [128, 64], target_memory=pl.MemorySpace.Mat
+                )
+                _acc0: pl.Tile[[4, 64], pl.FP32] = pl.matmul(lhs_tile, rhs0_tile)
+                acc1: pl.Tile[[4, 64], pl.FP32] = pl.matmul(lhs_tile, rhs1_tile)
+                out_0_store: pl.Tensor[[4, 64], pl.FP32] = pl.store(acc1, [0, 0], out_0)
+                return out_0_store
+
+            @pl.function
+            def main(
+                self,
+                lhs: pl.Tensor[[4, 128], pl.BF16],
+                rhs0: pl.Tensor[[128, 64], pl.BF16],
+                rhs1: pl.Tensor[[128, 64], pl.BF16],
+            ) -> pl.Tensor[[4, 64], pl.FP32]:
+                out_0: pl.Tensor[[4, 64], pl.FP32] = pl.create_tensor([4, 64], dtype=pl.FP32)
+                result: pl.Tensor[[4, 64], pl.FP32] = self.main_incore_0(lhs, rhs0, rhs1, out_0)
+                return result
+
+        After = passes.infer_tile_memory_space()(Before)
+        printed = ir.python_print(After)
+
+        first_rhs_move = printed.index("rhs0_tile_Right")
+        first_matmul = printed.index("pl.tile.matmul(lhs_tile_Left, rhs0_tile_Right)")
+        second_rhs_move = printed.index("rhs1_tile_Right")
+        second_matmul = printed.index("pl.tile.matmul(lhs_tile_Left, rhs1_tile_Right)")
+
+        assert first_rhs_move < first_matmul < second_rhs_move < second_matmul
+
     def test_no_move_when_already_correct(self):
         """No move inserted when input already in correct space."""
 
@@ -765,6 +813,32 @@ class TestAutoMoveInsertion:
         assert printed.count("pl.tile.move") == 2
         # Matmul uses the original moved vars
         assert "pl.tile.matmul(x_left, y_right)" in printed
+
+    def test_eval_stmt_consumer_collects_and_inserts_move(self):
+        """EvalStmt consumers should also trigger required auto-inserted moves."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[16, 16], pl.FP32],
+                value: pl.Scalar[pl.FP32],
+                out_0: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                x_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(
+                    x, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat
+                )
+                pl.tile.write(x_tile, [0, 0], value)
+                return out_0
+
+        After = passes.infer_tile_memory_space()(Before)
+        printed = ir.python_print(After)
+
+        _assert_var_memory_space(printed, "x_tile", "Mat")
+        _assert_var_memory_space(printed, "x_tile_Vec", "Vec")
+        assert "pl.tile.write(x_tile_Vec, [0, 0], value)" in printed
+        assert printed.count("pl.tile.move") == 1
 
     def test_store_no_move_for_vec(self):
         """tile.store accepts Vec — no move needed for Vec tile."""
