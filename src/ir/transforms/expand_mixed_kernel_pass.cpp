@@ -588,7 +588,7 @@ ExpandedKernel ExpandMixedFunction(const FunctionPtr& func, bool create_group = 
   (void)aic_clone_map_unused;
   auto aic_func = std::make_shared<Function>(aic_name, aic_params, func->param_directions_,
                                              std::vector<TypePtr>{}, aic_cloned_body, func->span_,
-                                             FunctionType::AIC, std::nullopt, std::nullopt, func->split_);
+                                             FunctionType::AIC, std::nullopt, std::nullopt, func->attrs_);
 
   // Create AIV function with deep clone (fresh Vars for all params and locals,
   // ensuring no shared Var pointers with AIC for structural equality)
@@ -727,7 +727,7 @@ ExpandedKernel ExpandMixedFunction(const FunctionPtr& func, bool create_group = 
   (void)aiv_clone_map_unused;
   auto aiv_func = std::make_shared<Function>(aiv_name, aiv_params, func->param_directions_,
                                              func->return_types_, aiv_cloned_body, func->span_,
-                                             FunctionType::AIV, std::nullopt, std::nullopt, func->split_);
+                                             FunctionType::AIV, std::nullopt, std::nullopt, func->attrs_);
 
   if (!create_group) {
     return {aic_func, aiv_func, std::nullopt};
@@ -940,7 +940,7 @@ FunctionPtr AddGMSlotBufferParam(const FunctionPtr& func) {
   auto new_directions = func->param_directions_;
   new_directions.push_back(ParamDirection::In);
   return std::make_shared<Function>(func->name_, new_params, new_directions, func->return_types_, func->body_,
-                                    func->span_, func->func_type_, func->level_, func->role_);
+                                    func->span_, func->func_type_, func->level_, func->role_, func->attrs_);
 }
 
 StmtPtr RewriteCallsForGMBuffer(const StmtPtr& body, const std::unordered_set<std::string>& modified_funcs,
@@ -1076,9 +1076,9 @@ void InjectGMSlotBufferInPlace(std::vector<FunctionPtr>& functions) {
 
     if (!mod_callees.empty()) {
       auto nb = RewriteCallsForGMBuffer(func->body_, mod_callees, gm_param);
-      func =
-          std::make_shared<Function>(func->name_, func->params_, func->param_directions_, func->return_types_,
-                                     nb, func->span_, func->func_type_, func->level_, func->role_);
+      func = std::make_shared<Function>(func->name_, func->params_, func->param_directions_,
+                                        func->return_types_, nb, func->span_, func->func_type_, func->level_,
+                                        func->role_, func->attrs_);
     }
   }
 }
@@ -1138,7 +1138,7 @@ Pass ExpandMixedKernel() {
         FunctionType new_type = (combined == CoreAffinity::CUBE) ? FunctionType::AIC : FunctionType::AIV;
         auto converted = std::make_shared<Function>(func->name_, func->params_, func->param_directions_,
                                                     func->return_types_, func->body_, func->span_, new_type,
-                                                    std::nullopt, std::nullopt, func->split_);
+                                                    std::nullopt, std::nullopt, func->attrs_);
         new_functions.push_back(converted);
         continue;
       }
