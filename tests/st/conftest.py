@@ -48,7 +48,6 @@ from harness.core.test_runner import (  # noqa: E402
     _precompile_cache,
     prebuild_binaries,
     precompile_test_cases,
-    pregenerate_golden_inputs,
 )
 from pypto import LogLevel, set_log_level  # noqa: E402
 from pypto.runtime.runner import RunConfig  # noqa: E402
@@ -215,10 +214,7 @@ def test_config(request) -> RunConfig:
 def test_runner(test_config) -> TestRunner:
     """Session-scoped fixture providing a test runner instance.
 
-    Session scope is used because:
-    1. The runner caches compiled runtime binaries
-    2. Building the runtime takes significant time
-    3. The same runner can be reused across all tests
+    Session scope is used because the same runner can be reused across all tests.
     """
     return TestRunner(test_config)
 
@@ -395,42 +391,29 @@ def pytest_collection_finish(session: pytest.Session) -> None:
     n_fail = len(_precompile_cache) - n_ok
     print(f"[PyPTO] Pre-compilation done — {n_ok} ok, {n_fail} failed\n")
 
-    # ── Phase 0: pre-generate golden inputs ──────────────────────────────────
-    # Only makes sense when there are successful pre-compilations (golden.py
-    # files must exist before we can load and call generate_inputs).
-    if n_ok > 0:
+    # ── Phase 2: pre-build binary artifacts ──────────────────────────────
+    # Compile incore kernels and orchestration .so in parallel.
+    # Results are saved to work_dir/cache/.
+    if n_ok > 0 and not session.config.getoption("--codegen-only"):
         ok_cases = [
             tc
             for tc in test_cases
             if _cache_key(tc) in _precompile_cache and _precompile_cache[_cache_key(tc)][1] is None
         ]
+        platform: str = session.config.getoption("--platform")
+        pto_isa_commit: str | None = session.config.getoption("--pto-isa-commit")
+        # Ensure SIMPLER_ROOT is available before prebuild_binaries checks it.
+        # This hook runs before session fixtures, so setup_simpler_dependency
+        # may not have set it yet.
+        _init_simpler_root_if_needed()
         print(
-            f"[PyPTO] Pre-generating golden inputs for {len(ok_cases)} test case(s)"
+            f"[PyPTO] Pre-building binary artifacts for {len(ok_cases)} test case(s)"
             f" in parallel (workers={workers_str})…"
         )
-        n_gen = pregenerate_golden_inputs(ok_cases, cache_dir, max_workers=max_workers)
-        print(f"[PyPTO] Golden inputs pre-generated — {n_gen} case(s) cached\n")
-
-        # ── Phase 2: pre-build binary artifacts ──────────────────────────────
-        # Compile incore kernels, orchestration .so, and runtime binaries in parallel.
-        # Results are saved to work_dir/cache/ and the global binary_cache/runtimes/
-        # directory. _execute_on_device installs a write-through patch so subsequent
-        # CodeRunner calls serve from disk without recompiling.
-        if not session.config.getoption("--codegen-only"):
-            platform: str = session.config.getoption("--platform")
-            pto_isa_commit: str | None = session.config.getoption("--pto-isa-commit")
-            # Ensure SIMPLER_ROOT is available before prebuild_binaries checks it.
-            # This hook runs before session fixtures, so setup_simpler_dependency
-            # may not have set it yet.
-            _init_simpler_root_if_needed()
-            print(
-                f"[PyPTO] Pre-building binary artifacts for {len(ok_cases)} test case(s)"
-                f" in parallel (workers={workers_str})…"
-            )
-            n_built = prebuild_binaries(
-                ok_cases, cache_dir, platform, max_workers=max_workers, pto_isa_commit=pto_isa_commit
-            )
-            print(f"[PyPTO] Binary pre-build done — {n_built} case(s) compiled\n")
+        n_built = prebuild_binaries(
+            ok_cases, cache_dir, platform, max_workers=max_workers, pto_isa_commit=pto_isa_commit
+        )
+        print(f"[PyPTO] Binary pre-build done — {n_built} case(s) compiled\n")
 
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:  # noqa: ARG001
