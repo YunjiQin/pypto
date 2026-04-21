@@ -12,25 +12,31 @@
 from pypto.runtime.runner import RunConfig, RunResult
 
 from harness.core.harness import (
-    A2A3_ONLY,
-    A5_ONLY,
-    ALL_PLATFORMS,
+    ALL_PLATFORM_IDS,
+    ONBOARD_PLATFORM_IDS,
+    ONBOARD_PLATFORMS,
     PLATFORMS,
+    SIM_PLATFORM_IDS,
+    SIM_PLATFORMS,
     PTOTestCase,
     ScalarSpec,
     TensorSpec,
+    platform_to_backend,
 )
 from harness.core.test_runner import TestRunner
 
 __all__ = [
-    "A2A3_ONLY",
-    "A5_ONLY",
-    "ALL_PLATFORMS",
+    "ALL_PLATFORM_IDS",
+    "ONBOARD_PLATFORM_IDS",
+    "ONBOARD_PLATFORMS",
     "PLATFORMS",
+    "SIM_PLATFORM_IDS",
+    "SIM_PLATFORMS",
     "PTOTestCase",
     "TensorSpec",
     "ScalarSpec",
     "RunConfig",
     "RunResult",
     "TestRunner",
+    "platform_to_backend",
 ]

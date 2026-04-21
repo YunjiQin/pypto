@@ -499,60 +499,57 @@ class BiDirectNoSplitTest(PTOTestCase):
 
 
 class TestCrossCore:
-    """Cross-core communication system tests."""
+    """Cross-core communication system tests.
+
+    The 9 cases below intentionally do not parametrize over ``platform``.
+    They exercise the cross-core compile/runtime pipeline using the default
+    backend (Ascend910B) and rely on the session-wide ``--platform`` value
+    chosen by CI to pick the execution target (a2a3, a2a3sim or a5sim).
+    """
 
     def test_tpush_tpop_v2c_updown(self, test_runner):
         """V2C updown pipe: compile through full pipeline and verify kernel artifacts."""
-        test_case = V2CUDTest()
-        result = test_runner.run(test_case)
+        result = test_runner.run(V2CUDTest())
         assert result.passed, f"Cross-core V2C updown compilation failed: {result.error}"
 
     def test_tpush_tpop_v2c_leftright(self, test_runner):
         """V2C left-right pipe: compile through full pipeline and verify kernel artifacts."""
-        test_case = V2CLRTest()
-        result = test_runner.run(test_case)
+        result = test_runner.run(V2CLRTest())
         assert result.passed, f"Cross-core V2C left-right compilation failed: {result.error}"
 
     def test_tpush_tpop_v2c_nosplit(self, test_runner):
         """V2C no-split pipe: compile through full pipeline and verify correctness."""
-        test_case = V2CNoSplitTest()
-        result = test_runner.run(test_case)
+        result = test_runner.run(V2CNoSplitTest())
         assert result.passed, f"Cross-core V2C no-split compilation failed: {result.error}"
 
     def test_tpop_c2v_leftright(self, test_runner):
         """C2V left-right pipe: compile through full pipeline and verify correctness."""
-        test_case = C2VLRTest()
-        result = test_runner.run(test_case)
+        result = test_runner.run(C2VLRTest())
         assert result.passed, f"Cross-core C2V left-right compilation failed: {result.error}"
 
     def test_tpop_c2v_updown(self, test_runner):
         """C2V updown pipe: compile through full pipeline and verify correctness."""
-        test_case = C2VUDTest()
-        result = test_runner.run(test_case)
+        result = test_runner.run(C2VUDTest())
         assert result.passed, f"Cross-core C2V updown compilation failed: {result.error}"
 
     def test_tpop_c2v_nosplit(self, test_runner):
         """C2V no-split pipe: compile through full pipeline and verify correctness."""
-        test_case = C2VNoSplitTest()
-        result = test_runner.run(test_case)
+        result = test_runner.run(C2VNoSplitTest())
         assert result.passed, f"Cross-core C2V no-split compilation failed: {result.error}"
 
     def test_tpop_bidirect_updown(self, test_runner):
         """Bidirect updown pipe: compile through full pipeline and verify correctness."""
-        test_case = BiDirectUDTest()
-        result = test_runner.run(test_case)
+        result = test_runner.run(BiDirectUDTest())
         assert result.passed, f"Cross-core bidirect updown compilation failed: {result.error}"
 
     def test_tpop_bidirect_leftright(self, test_runner):
         """Bidirect left-right pipe: compile through full pipeline and verify correctness."""
-        test_case = BiDirectLRTest()
-        result = test_runner.run(test_case)
+        result = test_runner.run(BiDirectLRTest())
         assert result.passed, f"Cross-core bidirect left-right compilation failed: {result.error}"
 
     def test_tpop_bidirect_nosplit(self, test_runner):
         """Bidirect no-split pipe: compile through full pipeline and verify correctness."""
-        test_case = BiDirectNoSplitTest()
-        result = test_runner.run(test_case)
+        result = test_runner.run(BiDirectNoSplitTest())
         assert result.passed, f"Cross-core bidirect no-split compilation failed: {result.error}"
 
 
