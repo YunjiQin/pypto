@@ -381,6 +381,7 @@ class ASTParser:
         func_level: ir.Level | None = None,
         func_role: ir.Role | None = None,
         func_attrs: dict[str, Any] | None = None,
+        parse_body: bool = True,
     ) -> ir.Function:
         """Parse function definition and build IR.
 
@@ -390,6 +391,9 @@ class ASTParser:
             func_level: Hierarchy level (default: None)
             func_role: Function role (default: None)
             func_attrs: Function-level attributes dict (default: None)
+            parse_body: If True (default), parse the function body as DSL.
+                If False, create a signature-only IR Function with empty body
+                (used for HOST Worker functions whose body is pure Python).
 
         Returns:
             IR Function object
@@ -439,13 +443,10 @@ class ASTParser:
                 else:
                     f.return_type(return_type)
 
-            # Parse function body. Docstrings (bare-string expressions anywhere
-            # in the body) are rerouted as leading_comments on the next stmt by
-            # parse_statement — no separate skip is needed here.
-            self._parse_body_siblings(func_def.body)
-            # Function body is the outermost scope — sweep all remaining
-            # pending comments (including any beyond end_lineno) as tails.
-            self._discard_tail_block_comments(func_def.body, upper_line=None)
+            # Parse function body (skipped for signature-only functions like HOST Workers)
+            if parse_body:
+                self._parse_body_siblings(func_def.body)
+                self._discard_tail_block_comments(func_def.body, upper_line=None)
 
         # Exit function scope
         self.scope_manager.exit_scope()

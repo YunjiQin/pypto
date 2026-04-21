@@ -32,26 +32,26 @@ namespace pypto {
 namespace codegen {
 
 /**
- * @brief Distributed code generator for Linqu hierarchy runtime C++ code
+ * @brief Distributed code generator for simpler runtime Python orchestration
  *
- * Generates complete C++ source files that use the Linqu LevelRuntime API
- * (submit_worker, submit_orchestrator, tree_reduce) from PyPTO IR programs
+ * Generates Python source code that uses the simpler distributed runtime API
+ * (orch.submit_next_level, orch.submit_sub) from PyPTO IR programs
  * that have been lowered through OutlineHierarchyScopes.
  *
- * Call-site lowering: infers C++ dispatch pattern from callee function metadata:
- * - Worker functions -> rt_lN.submit_worker(...)
- * - Orchestrator functions -> rt_lN.submit_orchestrator(...)
- * - Plain functions -> regular C++ function call
+ * Call-site lowering: infers Python dispatch pattern from callee function metadata:
+ * - CHIP-level Worker functions -> orch.submit_next_level(callable, task_args, config)
+ * - HOST-level Worker functions -> orch.submit_sub(callable_id, task_args)
+ * - Orchestrator functions -> nested orchestrator call
  */
 class DistributedCodegen : public CodegenBase {
  public:
   DistributedCodegen() = default;
 
   /**
-   * @brief Generate distributed C++ code from a Program
+   * @brief Generate distributed Python code from a Program
    *
    * @param program IR Program (after OutlineHierarchyScopes)
-   * @return Complete C++ source code as a string
+   * @return Complete Python source code as a string
    */
   [[nodiscard]] std::string Generate(const ir::ProgramPtr& program);
 
@@ -81,27 +81,22 @@ class DistributedCodegen : public CodegenBase {
 
  private:
   // Code structure emission
-  void EmitIncludes();
-  void EmitUsingDeclarations();
-  void EmitTopologyConstants();
-  void EmitTraceHelpers();
+  void EmitImports();
   void EmitFunction(const ir::FunctionPtr& func);
-  void EmitMain();
+  void EmitEntryFunction();
 
   // Call-site lowering
   void EmitCallToWorker(const ir::CallPtr& call, const ir::FunctionPtr& callee);
-  void EmitCallToOrchestrator(const ir::CallPtr& call, const ir::FunctionPtr& callee);
   void EmitDistIntrinsic(const ir::CallPtr& call);
   void EmitTreeReduce(const ir::CallPtr& call);
 
   // Helpers
-  [[nodiscard]] std::string RuntimeVarForLevel(ir::Level level) const;
-  [[nodiscard]] std::string CppTypeForIRType(const ir::TypePtr& type) const;
+  [[nodiscard]] std::string ParamDirectionToTensorArgType(ir::ParamDirection dir) const;
   [[nodiscard]] std::vector<ir::FunctionPtr> SortFunctionsByRoleAndLevel() const;
   void ClassifyFunctions();
-  void CollectNeededRuntimes(const ir::FunctionPtr& func, std::set<int>& needed) const;
   [[nodiscard]] std::string SanitizeName(const std::string& name) const;
   std::string FormatArgs(const std::vector<ir::ExprPtr>& args);
+  [[nodiscard]] bool IsSubWorker(const ir::FunctionPtr& func) const;
 
   ir::ProgramPtr program_;
   CodeEmitter emitter_;
@@ -118,6 +113,7 @@ class DistributedCodegen : public CodegenBase {
   std::string current_expr_value_;
   std::set<std::string> declared_vars_;
   bool is_worker_context_{false};
+  int task_args_counter_{0};  // Counter for generating unique TaskArgs variable names
 };
 
 }  // namespace codegen

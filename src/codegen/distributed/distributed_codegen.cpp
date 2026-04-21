@@ -50,27 +50,28 @@ std::string DistributedCodegen::Generate(const ir::ProgramPtr& program) {
   CHECK(!workers_.empty() || !orchestrators_.empty())
       << "Program has no distributed functions (no functions with level/role metadata)";
 
-  EmitIncludes();
-  EmitUsingDeclarations();
+  EmitImports();
   emitter_.EmitLine("");
 
-  // Anonymous namespace for internal functions
-  emitter_.EmitLine("namespace {");
-  emitter_.EmitLine("");
-
-  EmitTopologyConstants();
-  EmitTraceHelpers();
-
-  // Emit functions sorted by role and level (workers before orchestrators)
-  auto sorted = SortFunctionsByRoleAndLevel();
-  for (const auto& func : sorted) {
-    EmitFunction(func);
+  // Emit the highest-level orchestrator as the entry function.
+  // In an L3 program, this is the HOST Orchestrator.
+  if (!orchestrators_.empty()) {
+    // Use the orchestrator with the highest level as the entry
+    ir::FunctionPtr best_orch = orchestrators_.begin()->second;
+    int best_level = 0;
+    for (const auto& [name, func] : orchestrators_) {
+      if (func->level_.has_value()) {
+        int level = ir::LevelToLinquLevel(*func->level_);
+        if (level > best_level) {
+          best_level = level;
+          best_orch = func;
+        }
+      }
+    }
+    EmitFunction(best_orch);
+  } else if (entry_func_) {
+    EmitEntryFunction();
   }
-
-  emitter_.EmitLine("}  // namespace");
-  emitter_.EmitLine("");
-
-  EmitMain();
 
   return emitter_.GetCode();
 }
@@ -84,8 +85,12 @@ void DistributedCodegen::ClassifyFunctions() {
     all_funcs_[func->name_] = func;
 
     if (!func->level_.has_value() && !func->role_.has_value()) {
-      // Entry function: no level/role metadata
-      entry_func_ = func;
+      // Functions without level/role: chip-level functions (Orchestration, InCore, etc.)
+      // or a true entry function (Opaque with no level/role).
+      // Only treat Opaque functions as entry; chip functions are ignored by distributed codegen.
+      if (func->func_type_ == ir::FunctionType::Opaque) {
+        entry_func_ = func;
+      }
       continue;
     }
 
@@ -107,7 +112,6 @@ void DistributedCodegen::ClassifyFunctions() {
 // ========================================================================
 
 std::vector<ir::FunctionPtr> DistributedCodegen::SortFunctionsByRoleAndLevel() const {
-  // Collect non-entry functions
   std::vector<ir::FunctionPtr> funcs;
   for (const auto& [name, func] : all_funcs_) {
     if (func != entry_func_) {
@@ -115,14 +119,11 @@ std::vector<ir::FunctionPtr> DistributedCodegen::SortFunctionsByRoleAndLevel() c
     }
   }
 
-  // Simple sort: workers before orchestrators, lower level before higher level
   std::sort(funcs.begin(), funcs.end(), [](const ir::FunctionPtr& a, const ir::FunctionPtr& b) {
-    // Workers before orchestrators
     bool a_worker = a->role_.has_value() && *a->role_ == ir::Role::Worker;
     bool b_worker = b->role_.has_value() && *b->role_ == ir::Role::Worker;
     if (a_worker != b_worker) return a_worker;
 
-    // Lower level before higher level
     int a_level = a->level_.has_value() ? ir::LevelToLinquLevel(*a->level_) : 0;
     int b_level = b->level_.has_value() ? ir::LevelToLinquLevel(*b->level_) : 0;
     if (a_level != b_level) return a_level < b_level;
@@ -137,113 +138,33 @@ std::vector<ir::FunctionPtr> DistributedCodegen::SortFunctionsByRoleAndLevel() c
 // Code structure emission
 // ========================================================================
 
-void DistributedCodegen::EmitIncludes() {
-  emitter_.EmitLine("#include \"core/tensor.h\"");
-  emitter_.EmitLine("#include \"runtime/level_runtime.h\"");
-  emitter_.EmitLine("#include \"runtime/tree_reduce.h\"");
-  emitter_.EmitLine("");
-  emitter_.EmitLine("#include <cstdlib>");
-  emitter_.EmitLine("#include <functional>");
-  emitter_.EmitLine("#include <future>");
-  emitter_.EmitLine("#include <string>");
-  emitter_.EmitLine("#include <vector>");
-}
-
-void DistributedCodegen::EmitUsingDeclarations() {
-  emitter_.EmitLine("");
-  emitter_.EmitLine("using linqu::LinquTensor;");
-  emitter_.EmitLine("using linqu::LevelRuntime;");
-}
-
-void DistributedCodegen::EmitTopologyConstants() {
-  // env_int helper
-  emitter_.EmitLine("int env_int(const char* name, int fallback) {");
-  emitter_.IncreaseIndent();
-  emitter_.EmitLine("const char* v = std::getenv(name);");
-  emitter_.EmitLine("return v ? std::atoi(v) : fallback;");
-  emitter_.DecreaseIndent();
-  emitter_.EmitLine("}");
-  emitter_.EmitLine("");
-
-  // Topology constants for used levels
-  for (int level : used_levels_) {
-    std::string var_name = "kNumL" + std::to_string(level);
-    std::string env_name = "NUM_L" + std::to_string(level);
-    emitter_.EmitLine("const int " + var_name + " = env_int(\"" + env_name + "\", 1);");
-  }
-  emitter_.EmitLine("");
-}
-
-void DistributedCodegen::EmitTraceHelpers() {
-  // tpid helper for each used level
-  for (int level : used_levels_) {
-    std::string func_name = "tpid_l" + std::to_string(level);
-    emitter_.EmitLine("int " + func_name + "() { return 0; }");
-  }
-  emitter_.EmitLine("");
+void DistributedCodegen::EmitImports() {
+  emitter_.EmitLine("from simpler.task_interface import TaskArgs, TensorArgType, make_tensor_arg");
 }
 
 void DistributedCodegen::EmitFunction(const ir::FunctionPtr& func) {
   declared_vars_.clear();
+  task_args_counter_ = 0;
 
   bool is_worker = func->role_.has_value() && *func->role_ == ir::Role::Worker;
   is_worker_context_ = is_worker;
 
-  // Determine return type
-  std::string return_type = "void";
-  if (!is_worker && !func->return_types_.empty()) {
-    return_type = CppTypeForIRType(func->return_types_[0]);
+  // Build function signature
+  // Orchestrators: def func(orch, _args, config, *, tensors, callables, sub_ids, _keep):
+  // Workers are not emitted as Python functions (they run on device or as registered callables)
+  if (is_worker) {
+    is_worker_context_ = false;
+    return;
   }
 
-  // Build parameter list
-  std::ostringstream params;
-  // Add runtime parameter for orchestrators
-  if (!is_worker && func->level_.has_value()) {
-    int linqu_level = ir::LevelToLinquLevel(*func->level_);
-    params << "LevelRuntime& rt_l" << linqu_level;
-    if (!func->params_.empty()) {
-      params << ", ";
-    }
-  }
-
-  for (size_t i = 0; i < func->params_.size(); ++i) {
-    const auto& param = func->params_[i];
-    std::string cpp_type = CppTypeForIRType(param->GetType());
-
-    // Workers take tensors by reference, scalars by value
-    if (std::dynamic_pointer_cast<const ir::TensorType>(param->GetType())) {
-      params << cpp_type << "& " << SanitizeName(param->name_hint_);
-    } else {
-      params << cpp_type << " " << SanitizeName(param->name_hint_);
-    }
-
-    if (i + 1 < func->params_.size()) {
-      params << ", ";
-    }
-  }
-
-  // Emit function signature
-  emitter_.EmitLine("static " + return_type + " " + func->name_ + "(" + params.str() + ") {");
+  std::ostringstream sig;
+  sig << "def " << func->name_ << "(orch, _args, config, *, tensors, callables, sub_ids, _keep):";
+  emitter_.EmitLine(sig.str());
   emitter_.IncreaseIndent();
 
   // Register parameter names
   for (const auto& param : func->params_) {
     declared_vars_.insert(SanitizeName(param->name_hint_));
-  }
-
-  // For orchestrators: create runtimes for levels they submit to
-  if (!is_worker) {
-    std::set<int> needed_runtimes;
-    CollectNeededRuntimes(func, needed_runtimes);
-    // Remove the function's own level (already received as parameter)
-    if (func->level_.has_value()) {
-      needed_runtimes.erase(ir::LevelToLinquLevel(*func->level_));
-    }
-    for (int level : needed_runtimes) {
-      std::string rt_var = "rt_l" + std::to_string(level);
-      emitter_.EmitLine("LevelRuntime " + rt_var + "(kNumL" + std::to_string(level) + ");");
-      declared_vars_.insert(rt_var);
-    }
   }
 
   // Emit body
@@ -252,34 +173,18 @@ void DistributedCodegen::EmitFunction(const ir::FunctionPtr& func) {
   }
 
   emitter_.DecreaseIndent();
-  emitter_.EmitLine("}");
   emitter_.EmitLine("");
   is_worker_context_ = false;
 }
 
-void DistributedCodegen::EmitMain() {
+void DistributedCodegen::EmitEntryFunction() {
   if (!entry_func_) return;
 
   declared_vars_.clear();
+  task_args_counter_ = 0;
 
-  // Build parameter list
-  std::ostringstream params;
-  for (size_t i = 0; i < entry_func_->params_.size(); ++i) {
-    const auto& param = entry_func_->params_[i];
-    std::string cpp_type = CppTypeForIRType(param->GetType());
-    params << cpp_type << " " << SanitizeName(param->name_hint_);
-    if (i + 1 < entry_func_->params_.size()) {
-      params << ", ";
-    }
-  }
-
-  // Determine return type
-  std::string return_type = "void";
-  if (!entry_func_->return_types_.empty()) {
-    return_type = CppTypeForIRType(entry_func_->return_types_[0]);
-  }
-
-  emitter_.EmitLine(return_type + " " + entry_func_->name_ + "(" + params.str() + ") {");
+  // Entry function signature
+  emitter_.EmitLine("def entry(orch, _args, config, *, tensors, callables, sub_ids, _keep):");
   emitter_.IncreaseIndent();
 
   // Register parameter names
@@ -287,22 +192,13 @@ void DistributedCodegen::EmitMain() {
     declared_vars_.insert(SanitizeName(param->name_hint_));
   }
 
-  // Create runtime objects for each used level
-  for (int level : used_levels_) {
-    std::string rt_var = "rt_l" + std::to_string(level);
-    emitter_.EmitLine("LevelRuntime " + rt_var + "(kNumL" + std::to_string(level) + ");");
-  }
-  if (!used_levels_.empty()) {
-    emitter_.EmitLine("");
-  }
-
-  // Emit entry function body
+  // Emit body
   if (entry_func_->body_) {
     VisitStmt(entry_func_->body_);
   }
 
   emitter_.DecreaseIndent();
-  emitter_.EmitLine("}");
+  emitter_.EmitLine("");
 }
 
 // ========================================================================
@@ -314,24 +210,25 @@ void DistributedCodegen::VisitStmt_(const ir::AssignStmtPtr& op) {
 
   std::string var_name = SanitizeName(op->var_->name_hint_);
 
-  // Set context for expression visitor
   current_target_var_ = var_name;
   current_expr_value_ = "";
 
-  // Check if the value is a Call to a hierarchy function
+  // Check if the value is a Call to a hierarchy function or chip function
   if (auto call = std::dynamic_pointer_cast<const ir::Call>(op->value_)) {
     auto gv = std::dynamic_pointer_cast<const ir::GlobalVar>(call->op_);
     if (gv) {
       auto callee = program_->GetFunction(gv->name_);
-      if (callee && callee->role_.has_value()) {
-        if (*callee->role_ == ir::Role::Worker) {
+      if (callee) {
+        if (callee->role_.has_value() && *callee->role_ == ir::Role::Worker) {
           EmitCallToWorker(call, callee);
           declared_vars_.insert(var_name);
           current_target_var_ = "";
           return;
         }
-        if (*callee->role_ == ir::Role::Orchestrator) {
-          EmitCallToOrchestrator(call, callee);
+        // Chip-level function called from HOST orchestrator → submit_next_level
+        if (callee->func_type_ == ir::FunctionType::Orchestration ||
+            callee->func_type_ == ir::FunctionType::InCore) {
+          EmitCallToWorker(call, callee);
           declared_vars_.insert(var_name);
           current_target_var_ = "";
           return;
@@ -344,12 +241,8 @@ void DistributedCodegen::VisitStmt_(const ir::AssignStmtPtr& op) {
   VisitExpr(op->value_);
 
   if (!current_expr_value_.empty()) {
-    if (declared_vars_.count(var_name)) {
-      emitter_.EmitLine(var_name + " = " + current_expr_value_ + ";");
-    } else {
-      emitter_.EmitLine("auto " + var_name + " = " + current_expr_value_ + ";");
-      declared_vars_.insert(var_name);
-    }
+    emitter_.EmitLine(var_name + " = " + current_expr_value_);
+    declared_vars_.insert(var_name);
     current_expr_value_ = "";
   }
 
@@ -363,24 +256,15 @@ void DistributedCodegen::VisitStmt_(const ir::EvalStmtPtr& op) {
   current_expr_value_ = "";
   VisitExpr(op->expr_);
 
-  // If the expression produced a value (not emitted as a statement), emit it
   if (!current_expr_value_.empty()) {
-    emitter_.EmitLine(current_expr_value_ + ";");
+    emitter_.EmitLine(current_expr_value_);
     current_expr_value_ = "";
   }
 }
 
-void DistributedCodegen::VisitStmt_(const ir::ReturnStmtPtr& op) {
-  INTERNAL_CHECK(op != nullptr) << "Internal error: null ReturnStmt";
-
-  // Workers are void — skip return value
-  if (is_worker_context_ || op->value_.empty()) {
-    return;
-  }
-
-  VisitExpr(op->value_[0]);
-  emitter_.EmitLine("return " + current_expr_value_ + ";");
-  current_expr_value_ = "";
+void DistributedCodegen::VisitStmt_(const ir::ReturnStmtPtr& /* op */) {
+  // L3 orchestrator functions return via output tensor side effects.
+  // No Python return statement is generated.
 }
 
 void DistributedCodegen::VisitStmt_(const ir::ForStmtPtr& op) {
@@ -401,16 +285,16 @@ void DistributedCodegen::VisitStmt_(const ir::ForStmtPtr& op) {
   std::string step = current_expr_value_;
   current_expr_value_ = "";
 
-  emitter_.EmitLine("for (int " + loop_var + " = " + start + "; " + loop_var + " < " + stop + "; " +
-                    loop_var + " += " + step + ") {");
+  emitter_.EmitLine("for " + loop_var + " in range(" + start + ", " + stop + ", " + step + "):");
   emitter_.IncreaseIndent();
 
   if (op->body_) {
     VisitStmt(op->body_);
+  } else {
+    emitter_.EmitLine("pass");
   }
 
   emitter_.DecreaseIndent();
-  emitter_.EmitLine("}");
 }
 
 void DistributedCodegen::VisitStmt_(const ir::IfStmtPtr& op) {
@@ -420,19 +304,17 @@ void DistributedCodegen::VisitStmt_(const ir::IfStmtPtr& op) {
   std::string condition = current_expr_value_;
   current_expr_value_ = "";
 
-  emitter_.EmitLine("if (" + condition + ") {");
+  emitter_.EmitLine("if " + condition + ":");
   emitter_.IncreaseIndent();
   VisitStmt(op->then_body_);
   emitter_.DecreaseIndent();
 
   if (op->else_body_.has_value()) {
-    emitter_.EmitLine("} else {");
+    emitter_.EmitLine("else:");
     emitter_.IncreaseIndent();
     VisitStmt(*op->else_body_);
     emitter_.DecreaseIndent();
   }
-
-  emitter_.EmitLine("}");
 }
 
 void DistributedCodegen::VisitStmt_(const ir::SeqStmtsPtr& op) {
@@ -452,13 +334,23 @@ void DistributedCodegen::VisitExpr_(const ir::CallPtr& op) {
   // Check if callee is a GlobalVar (program function reference)
   if (auto gv = std::dynamic_pointer_cast<const ir::GlobalVar>(op->op_)) {
     auto callee = program_->GetFunction(gv->name_);
-    if (callee && callee->role_.has_value()) {
-      if (*callee->role_ == ir::Role::Worker) {
+    if (callee) {
+      if (callee->role_.has_value() && *callee->role_ == ir::Role::Worker) {
         EmitCallToWorker(op, callee);
         return;
       }
-      if (*callee->role_ == ir::Role::Orchestrator) {
-        EmitCallToOrchestrator(op, callee);
+      if (callee->role_.has_value() && *callee->role_ == ir::Role::Orchestrator) {
+        // Orchestrator-to-orchestrator calls: emit as direct function call
+        current_expr_value_ = callee->name_ +
+                              "(orch, _args, config, "
+                              "tensors=tensors, callables=callables, sub_ids=sub_ids, _keep=_keep)";
+        return;
+      }
+      // Chip-level function (Orchestration/InCore with no role) called from HOST orchestrator
+      // → treat as submit_next_level (chip dispatch)
+      if (callee->func_type_ == ir::FunctionType::Orchestration ||
+          callee->func_type_ == ir::FunctionType::InCore) {
+        EmitCallToWorker(op, callee);
         return;
       }
     }
@@ -473,7 +365,7 @@ void DistributedCodegen::VisitExpr_(const ir::CallPtr& op) {
     return;
   }
 
-  // Regular op call (e.g., add, mul) — emit as function call
+  // Regular op call
   current_expr_value_ = op->op_->name_ + "(" + FormatArgs(op->args_) + ")";
 }
 
@@ -494,7 +386,7 @@ void DistributedCodegen::VisitExpr_(const ir::ConstFloatPtr& op) {
 
 void DistributedCodegen::VisitExpr_(const ir::ConstBoolPtr& op) {
   INTERNAL_CHECK(op != nullptr) << "Internal error: null ConstBool";
-  current_expr_value_ = op->value_ ? "true" : "false";
+  current_expr_value_ = op->value_ ? "True" : "False";
 }
 
 // ========================================================================
@@ -502,102 +394,71 @@ void DistributedCodegen::VisitExpr_(const ir::ConstBoolPtr& op) {
 // ========================================================================
 
 void DistributedCodegen::EmitCallToWorker(const ir::CallPtr& call, const ir::FunctionPtr& callee) {
-  INTERNAL_CHECK_SPAN(callee->level_.has_value(), call->span_)
-      << "Worker function must have a level: " << callee->name_;
+  bool is_sub = IsSubWorker(callee);
+  std::string ta_var = "_ta_" + std::to_string(task_args_counter_++);
 
-  std::string rt_var = RuntimeVarForLevel(*callee->level_);
+  // Build TaskArgs from callee's parameter directions
+  emitter_.EmitLine(ta_var + " = TaskArgs()");
 
-  // Evaluate all call arguments
-  std::vector<std::string> input_names;
-  std::vector<std::string> all_arg_strs;
-
-  for (const auto& arg : call->args_) {
-    VisitExpr(arg);
+  for (size_t i = 0; i < call->args_.size(); ++i) {
+    VisitExpr(call->args_[i]);
     std::string arg_str = current_expr_value_;
     current_expr_value_ = "";
-    all_arg_strs.push_back(arg_str);
 
-    // Tensor args are inputs
-    if (std::dynamic_pointer_cast<const ir::TensorType>(arg->GetType())) {
-      input_names.push_back(arg_str);
+    // Only tensor args get add_tensor; skip scalar args for now
+    if (std::dynamic_pointer_cast<const ir::TensorType>(call->args_[i]->GetType())) {
+      std::string tag = "TensorArgType.INPUT";
+      if (i < callee->param_directions_.size()) {
+        tag = ParamDirectionToTensorArgType(callee->param_directions_[i]);
+      }
+      emitter_.EmitLine(ta_var + ".add_tensor(make_tensor_arg(tensors[\"" + arg_str + "\"]), " + tag + ")");
     }
   }
 
-  // If there's an assignment target, declare it as the output tensor
+  // If this call has an assignment target (return value) but the callee already
+  // has Out/InOut parameters, the output is already covered by those params.
+  // Only add the target as OUTPUT_EXISTING if the callee has no explicit Out params.
   std::string target = current_target_var_;
-  std::vector<std::string> output_names;
-  if (!target.empty()) {
-    // Declare the output variable before submit
-    if (!declared_vars_.count(target)) {
-      emitter_.EmitLine("LinquTensor " + target + ";");
-      declared_vars_.insert(target);
+  if (!target.empty() && !callee->return_types_.empty()) {
+    bool has_out_param = false;
+    for (const auto& dir : callee->param_directions_) {
+      if (dir == ir::ParamDirection::Out || dir == ir::ParamDirection::InOut) {
+        has_out_param = true;
+        break;
+      }
     }
-    output_names.push_back(target);
+    if (!has_out_param) {
+      emitter_.EmitLine(ta_var + ".add_tensor(make_tensor_arg(tensors[\"" + target +
+                        "\"]), "
+                        "TensorArgType.OUTPUT_EXISTING)");
+    }
   }
 
-  // Build lambda argument list (include output if present)
-  std::ostringstream lambda_args;
-  for (size_t i = 0; i < all_arg_strs.size(); ++i) {
-    if (i > 0) lambda_args << ", ";
-    lambda_args << all_arg_strs[i];
+  if (is_sub) {
+    // HOST Worker = SubWorker: orch.submit_sub(callable_id, task_args)
+    emitter_.EmitLine("orch.submit_sub(sub_ids[\"" + callee->name_ + "\"], " + ta_var + ")");
+  } else {
+    // CHIP Worker: orch.submit_next_level(callable, task_args, config)
+    emitter_.EmitLine("_keep.append(" + ta_var + ")");
+    emitter_.EmitLine("orch.submit_next_level(callables[\"" + callee->name_ + "\"], " + ta_var + ", config)");
   }
 
-  // Build input/output vectors
-  std::ostringstream inputs;
-  inputs << "{";
-  for (size_t i = 0; i < input_names.size(); ++i) {
-    if (i > 0) inputs << ", ";
-    inputs << input_names[i];
+  // If this call has an assignment target (return value), alias it to the OUT
+  // parameter tensor.  In simpler's runtime model, the callee writes in-place
+  // to the OUT parameter, so the return value is the same tensor.
+  if (!target.empty() && !callee->return_types_.empty()) {
+    // Find the first Out/InOut parameter — that is the tensor the return value aliases
+    for (size_t i = 0; i < callee->param_directions_.size() && i < call->args_.size(); ++i) {
+      if (callee->param_directions_[i] == ir::ParamDirection::Out ||
+          callee->param_directions_[i] == ir::ParamDirection::InOut) {
+        VisitExpr(call->args_[i]);
+        std::string out_arg = current_expr_value_;
+        current_expr_value_ = "";
+        emitter_.EmitLine("tensors[\"" + target + "\"] = tensors[\"" + out_arg + "\"]");
+        break;
+      }
+    }
   }
-  inputs << "}";
-
-  std::ostringstream outputs;
-  outputs << "{";
-  for (size_t i = 0; i < output_names.size(); ++i) {
-    if (i > 0) outputs << ", ";
-    outputs << output_names[i];
-  }
-  outputs << "}";
-
-  // Emit: rt_lN.submit_worker("name", [&](){ callee(args); }, {inputs}, {outputs});
-  emitter_.EmitLine(rt_var + ".submit_worker(\"" + callee->name_ + "\", [&]() {");
-  emitter_.IncreaseIndent();
-  emitter_.EmitLine(callee->name_ + "(" + lambda_args.str() + ");");
-  emitter_.DecreaseIndent();
-  emitter_.EmitLine("}, " + inputs.str() + ", " + outputs.str() + ");");
-}
-
-void DistributedCodegen::EmitCallToOrchestrator(const ir::CallPtr& call, const ir::FunctionPtr& callee) {
-  INTERNAL_CHECK_SPAN(callee->level_.has_value(), call->span_)
-      << "Orchestrator function must have a level: " << callee->name_;
-
-  std::string rt_var = RuntimeVarForLevel(*callee->level_);
-
-  // Build argument list
-  std::ostringstream lambda_args;
-  // Pass the runtime as first arg to the orchestrator
-  lambda_args << rt_var;
-  for (const auto& arg : call->args_) {
-    VisitExpr(arg);
-    lambda_args << ", " << current_expr_value_;
-    current_expr_value_ = "";
-  }
-
-  // Determine return type
-  std::string return_type = "LinquTensor";
-  if (!callee->return_types_.empty()) {
-    return_type = CppTypeForIRType(callee->return_types_[0]);
-  }
-
-  // Emit: [auto target = ] rt_lN.submit_orchestrator("name", [&]()->ReturnType{ return callee(args); });
-  std::string target = current_target_var_;
-  std::string prefix = target.empty() ? "" : "auto " + target + " = ";
-  emitter_.EmitLine(prefix + rt_var + ".submit_orchestrator(\"" + callee->name_ + "\", [&]() -> " +
-                    return_type + " {");
-  emitter_.IncreaseIndent();
-  emitter_.EmitLine("return " + callee->name_ + "(" + lambda_args.str() + ");");
-  emitter_.DecreaseIndent();
-  emitter_.EmitLine("});");
 }
 
 void DistributedCodegen::EmitDistIntrinsic(const ir::CallPtr& call) {
@@ -608,12 +469,10 @@ void DistributedCodegen::EmitDistIntrinsic(const ir::CallPtr& call) {
     return;
   }
 
-  // Fallback for other dist.* ops
   current_expr_value_ = op_name + "(" + FormatArgs(call->args_) + ")";
 }
 
 void DistributedCodegen::EmitTreeReduce(const ir::CallPtr& call) {
-  // tree_reduce(tensor, reduce_op, level_runtime)
   std::string target = current_target_var_;
   std::ostringstream args;
   for (size_t i = 0; i < call->args_.size(); ++i) {
@@ -626,7 +485,7 @@ void DistributedCodegen::EmitTreeReduce(const ir::CallPtr& call) {
   if (!target.empty()) {
     current_expr_value_ = "tree_reduce(" + args.str() + ")";
   } else {
-    emitter_.EmitLine("tree_reduce(" + args.str() + ");");
+    emitter_.EmitLine("tree_reduce(" + args.str() + ")");
   }
 }
 
@@ -634,59 +493,28 @@ void DistributedCodegen::EmitTreeReduce(const ir::CallPtr& call) {
 // Helpers
 // ========================================================================
 
-namespace {
-
-/// Helper visitor to find GlobalVar calls in a function body
-class CallCollector : public ir::IRVisitor {
- public:
-  std::set<std::string> called_names_;
-
-  void VisitExpr_(const ir::CallPtr& op) override {
-    if (auto gv = std::dynamic_pointer_cast<const ir::GlobalVar>(op->op_)) {
-      called_names_.insert(gv->name_);
-    }
-    // Visit args
-    for (const auto& arg : op->args_) {
-      VisitExpr(arg);
-    }
-  }
-};
-
-}  // namespace
-
-void DistributedCodegen::CollectNeededRuntimes(const ir::FunctionPtr& func, std::set<int>& needed) const {
-  if (!func->body_) return;
-
-  // Walk the function body to find actual calls to program functions
-  CallCollector collector;
-  collector.VisitStmt(func->body_);
-
-  for (const auto& name : collector.called_names_) {
-    auto it = all_funcs_.find(name);
-    if (it == all_funcs_.end()) continue;
-    const auto& callee = it->second;
-    if (callee->level_.has_value()) {
-      needed.insert(ir::LevelToLinquLevel(callee->level_.value()));
-    }
-  }
+bool DistributedCodegen::IsSubWorker(const ir::FunctionPtr& func) const {
+  // A SubWorker is a HOST-level Worker (runs as Python callable in fork).
+  // A CHIP-level function (Orchestration/InCore/Worker) runs via ChipCallable → submit_next_level.
+  // A function with no level (chip-level by default) is also submit_next_level.
+  if (!func->level_.has_value()) return false;  // chip-level function
+  int linqu_level = ir::LevelToLinquLevel(*func->level_);
+  return linqu_level >= 3;  // HOST (3) and above → SubWorker
 }
 
-std::string DistributedCodegen::RuntimeVarForLevel(ir::Level level) const {
-  return "rt_l" + std::to_string(ir::LevelToLinquLevel(level));
-}
-
-std::string DistributedCodegen::CppTypeForIRType(const ir::TypePtr& type) const {
-  if (std::dynamic_pointer_cast<const ir::TensorType>(type)) {
-    return "LinquTensor";
+std::string DistributedCodegen::ParamDirectionToTensorArgType(ir::ParamDirection dir) const {
+  switch (dir) {
+    case ir::ParamDirection::In:
+      return "TensorArgType.INPUT";
+    case ir::ParamDirection::Out:
+      return "TensorArgType.OUTPUT_EXISTING";
+    case ir::ParamDirection::InOut:
+      return "TensorArgType.INOUT";
   }
-  if (auto scalar = std::dynamic_pointer_cast<const ir::ScalarType>(type)) {
-    return scalar->dtype_.ToCTypeString();
-  }
-  return "auto";
+  return "TensorArgType.INPUT";
 }
 
 std::string DistributedCodegen::SanitizeName(const std::string& name) const {
-  // Replace characters invalid in C++ identifiers (e.g., '.' -> '_')
   std::string result = name;
   for (auto& c : result) {
     if (c == '.') c = '_';

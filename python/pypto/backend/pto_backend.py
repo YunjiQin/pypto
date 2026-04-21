@@ -882,6 +882,10 @@ def generate(
     when ``skip_ptoas=True``, the raw MLIR (.pto) content is returned directly
     without invoking ptoas.
 
+    For programs containing L3+ distributed functions (level=HOST or above),
+    the distributed codegen path generates Python orchestration code alongside
+    the standard PTO kernel artifacts.
+
     Args:
         transformed_program: Program after pass pipeline
         output_dir: Base output directory (used for ptoas intermediates when skip_ptoas=False)
@@ -891,6 +895,153 @@ def generate(
     Returns:
         Dict mapping relative file paths to their content.
     """
+    # Check for distributed functions (level >= HOST = Linqu level 3)
+    has_distributed = any(
+        f.level is not None and _ir_core.level_to_linqu_level(f.level) >= 3
+        for f in transformed_program.functions.values()
+    )
+
+    if has_distributed:
+        return _generate_with_distributed(transformed_program, output_dir, skip_ptoas)
+
+    return _generate_single_chip(transformed_program, output_dir, skip_ptoas)
+
+
+def _generate_with_distributed(
+    transformed_program: _ir_core.Program,
+    output_dir: str,
+    skip_ptoas: bool,
+) -> dict[str, str]:
+    """Generate artifacts for a distributed (L3+) program.
+
+    Output directory layout mirrors the distributed execution hierarchy::
+
+      orchestration/host_orch.py        — L3 HOST orchestrator (Python)
+      next_levels/{chip_task_name}/     — each L2 chip task (complete sub-dir)
+          orchestration/{name}.cpp
+          kernels/{core_type}/{kernel}.pto
+          kernel_config.py
+      sub_workers/{name}.py             — each SubWorker callable
+    """
+    result_files: dict[str, str] = {}
+
+    # 1. L3 HOST orchestrator → orchestration/host_orch.py
+    cg = _codegen_core.DistributedCodegen()
+    orch_code = cg.generate(transformed_program)
+    result_files["orchestration/host_orch.py"] = orch_code
+
+    # 2. Each chip-level Orchestration → next_levels/{name}/...
+    for func in transformed_program.functions.values():
+        if func.func_type == _ir_core.FunctionType.Orchestration:
+            chip_funcs = _collect_chip_task_functions(func, transformed_program)
+            chip_program = _ir_core.Program(chip_funcs, func.name, transformed_program.span)
+            chip_subdir = os.path.join(output_dir, "next_levels", func.name)
+            chip_files = _generate_single_chip(chip_program, chip_subdir, skip_ptoas)
+            for path, content in chip_files.items():
+                result_files[f"next_levels/{func.name}/{path}"] = content
+
+    # 3. SubWorker functions → sub_workers/{name}.py
+    from pypto.language.parser.decorator import (  # noqa: PLC0415
+        get_sub_worker_callables,  # pyright: ignore[reportAttributeAccessIssue]
+    )
+
+    raw_subs = get_sub_worker_callables(transformed_program)
+    for func_name, method in raw_subs.items():
+        source = _generate_sub_worker_source(func_name, method)
+        result_files[f"sub_workers/{func_name}.py"] = source
+
+    return result_files
+
+
+def _generate_sub_worker_source(
+    func_name: str,
+    method: Any,
+) -> str:
+    """Generate a self-contained SubWorker module callable as ``fn(args: TaskArgs)``.
+
+    The generated module imports ``_tensor_from_continuous`` from
+    ``pypto.runtime.distributed_runner`` and wraps the user's function body
+    so that simpler can call it directly with ``fn(args)``.
+    """
+    import inspect  # noqa: PLC0415
+    import textwrap  # noqa: PLC0415
+
+    # Extract param names from the method (skip 'self')
+    code = method.__code__
+    all_params = list(code.co_varnames[: code.co_argcount])
+    param_names = [p for p in all_params if p != "self"]
+
+    # Extract user function body from source
+    user_func_lines = ""
+    try:
+        body_source = inspect.getsource(method)
+        dedented = textwrap.dedent(body_source)
+        lines = dedented.splitlines()
+        # Skip decorator lines and def line, keep body
+        body_start = 0
+        for i, line in enumerate(lines):
+            if line.strip().startswith("def "):
+                body_start = i + 1
+                break
+        body_lines = lines[body_start:]
+        if body_lines:
+            user_func_lines = textwrap.dedent("\n".join(body_lines))
+    except Exception:
+        logger.warning(
+            "Failed to extract source for SubWorker '%s'; generated module will have empty body", func_name
+        )
+
+    params_str = ", ".join(param_names) if param_names else ""
+    unpack_lines = [
+        f"    {name} = _tensor_from_continuous(args.tensor({i}))" for i, name in enumerate(param_names)
+    ]
+    unpack_block = "\n".join(unpack_lines) if unpack_lines else "    pass"
+    user_body = textwrap.indent(user_func_lines, "    ") if user_func_lines else "    pass"
+
+    return (
+        f'"""SubWorker: {func_name} — auto-generated, callable as fn(args: TaskArgs)."""\n'
+        f"\n"
+        f"from pypto.runtime.distributed_runner import _tensor_from_continuous\n"
+        f"\n"
+        f"\n"
+        f"def _user_{func_name}({params_str}):\n"
+        f"{user_body}\n"
+        f"\n"
+        f"\n"
+        f"def {func_name}(args):\n"
+        f"{unpack_block}\n"
+        f"    _user_{func_name}({params_str})\n"
+    )
+
+
+def _collect_chip_task_functions(
+    orch_func: _ir_core.Function,
+    program: _ir_core.Program,
+) -> list[_ir_core.Function]:
+    """Collect an Orchestration function and all its InCore/kernel children."""
+    result = [orch_func]
+    # Find all functions called by this orchestration that are InCore-type
+    for func in program.functions.values():
+        if func is orch_func:
+            continue
+        ft = func.func_type
+        if ft in (
+            _ir_core.FunctionType.InCore,
+            _ir_core.FunctionType.AIC,
+            _ir_core.FunctionType.AIV,
+            _ir_core.FunctionType.Group,
+            _ir_core.FunctionType.Spmd,
+        ):
+            result.append(func)
+    return result
+
+
+def _generate_single_chip(
+    transformed_program: _ir_core.Program,
+    output_dir: str,
+    skip_ptoas: bool = False,
+) -> dict[str, str]:
+    """Generate artifacts for a single-chip (L0-L2) program. Original generate() logic."""
     result_files: dict[str, str] = {}
     errors: list[tuple[str, Exception]] = []
     prof = CompileProfiler.current()

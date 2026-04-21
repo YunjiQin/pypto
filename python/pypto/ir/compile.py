@@ -25,6 +25,7 @@ from .pass_manager import OptimizationStrategy, PassManager
 
 if TYPE_CHECKING:
     from .compiled_program import CompiledProgram
+    from .distributed_compiled_program import DistributedCompiledProgram
 
 
 def _write_files(files: dict[str, str], output_dir: str) -> None:
@@ -50,7 +51,8 @@ def compile(  # noqa: PLR0913
     disabled_diagnostics: _passes.DiagnosticCheckSet | None = None,
     profiling: bool = False,
     platform: str | None = None,
-) -> "CompiledProgram":
+    distributed_config: Any = None,
+) -> "CompiledProgram | DistributedCompiledProgram":
     """Compile a Program through passes and codegen.
 
     This function provides a complete compilation pipeline that:
@@ -81,6 +83,10 @@ def compile(  # noqa: PLR0913
         platform: Target execution platform.  One of ``"a2a3sim"``,
             ``"a2a3"``, ``"a5sim"``, or ``"a5"``.  Defaults to the
             simulator for the given *backend_type*.
+        distributed_config: Optional :class:`DistributedConfig` for L3+
+            distributed programs.  When ``None`` (default), auto-detected
+            from the program: if L3+ functions are found, a default
+            ``DistributedConfig()`` is used.
 
     Returns:
         A :class:`CompiledProgram` that wraps the output directory and can
@@ -174,6 +180,29 @@ def compile(  # noqa: PLR0913
             prof.write_report(report_dir)
 
     from .compiled_program import CompiledProgram  # noqa: PLC0415
+
+    # Detect distributed programs: any function with level >= HOST (Linqu level 3)
+    is_distributed = any(
+        f.level is not None and _ir_core.level_to_linqu_level(f.level) >= 3
+        for f in program.functions.values()
+    )
+
+    if is_distributed:
+        from .distributed_compiled_program import (  # noqa: PLC0415
+            DistributedCompiledProgram,
+            DistributedConfig,
+        )
+
+        if distributed_config is None:
+            distributed_config = DistributedConfig()
+        return DistributedCompiledProgram(
+            program,
+            output_dir,
+            backend_type=backend_type,
+            platform=platform,
+            distributed_config=distributed_config,
+            transformed_program=transformed_program,
+        )
 
     return CompiledProgram(
         program,

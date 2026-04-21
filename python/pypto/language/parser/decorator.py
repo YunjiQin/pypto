@@ -26,6 +26,28 @@ from .comment_extractor import extract_line_comments
 from .diagnostics import ParserError, ParserSyntaxError, concise_error_message
 from .enum_utils import FUNCTION_TYPE_MAP, LEVEL_MAP, ROLE_MAP, SPLIT_MODE_MAP, extract_enum_value
 
+# ---------------------------------------------------------------------------
+# SubWorker callable registry
+# ---------------------------------------------------------------------------
+# ir.Program is a C++ nanobind object and doesn't support arbitrary Python
+# attributes.  We use a module-level dict keyed by program name to store
+# the original Python callables for HOST Worker functions.
+
+_sub_worker_registry: dict[str, dict[str, Callable[..., Any]]] = {}
+
+
+def _register_sub_worker_callables(prog: ir.Program, callables: dict[str, Callable[..., Any]]) -> None:
+    _sub_worker_registry[prog.name] = callables
+
+
+def get_sub_worker_callables(prog: ir.Program) -> dict[str, Callable[..., Any]]:
+    """Return HOST Worker raw Python callables captured from ``@pl.program``.
+
+    Returns:
+        Dict mapping function name to the original Python method.
+    """
+    return _sub_worker_registry.get(prog.name, {})
+
 
 @dataclasses.dataclass
 class InlineFunction:
@@ -819,7 +841,7 @@ def program(cls: type | None = None, *, strict_ssa: bool = False) -> ir.Program 
         with prof.stage("parse"):
             return _parse_program_body(c, strict_ssa, closure_vars)
 
-    def _parse_program_body(
+    def _parse_program_body(  # noqa: PLR0912
         c: type,
         strict_ssa: bool,
         closure_vars: dict[str, Any],
@@ -901,6 +923,14 @@ def program(cls: type | None = None, *, strict_ssa: bool = False) -> ir.Program 
                 func_level, func_role = _extract_function_level_role_from_decorator(func_def)
                 func_attrs = _extract_function_attrs_from_decorator(func_def)
 
+                # HOST Worker functions (SubWorkers) may have pure Python body —
+                # try DSL parsing first, fall back to empty body on failure
+                is_sub_worker = (
+                    func_level is not None
+                    and ir.level_to_linqu_level(func_level) >= 3
+                    and func_role == ir.Role.Worker
+                )
+
                 # Strip 'self' parameter if present (must be done before parsing)
                 func_def_to_parse = _strip_self_parameter(func_def)
 
@@ -931,7 +961,31 @@ def program(cls: type | None = None, *, strict_ssa: bool = False) -> ir.Program 
                         func_attrs=func_attrs or None,
                     )
                 except ParserError:
-                    raise
+                    if is_sub_worker:
+                        # SubWorker body is pure Python — retry without body parsing
+                        parser_retry = ASTParser(
+                            source_file,
+                            source_lines,
+                            line_offset,
+                            col_offset,
+                            global_vars=global_vars,
+                            gvar_to_func=gvar_to_func,
+                            strict_ssa=strict_ssa,
+                            closure_vars=closure_vars,
+                            buffer_name_meta=buffer_name_meta,
+                            dyn_var_cache=dyn_var_cache,
+                            pending_comments=method_comments,
+                        )
+                        ir_func = parser_retry.parse_function(
+                            func_def_to_parse,
+                            func_type=func_type,
+                            func_level=func_level,
+                            func_role=func_role,
+                            func_attrs=func_attrs or None,
+                            parse_body=False,
+                        )
+                    else:
+                        raise
                 except SyntaxError as e:
                     raise ParserSyntaxError(
                         f"Failed to parse function '{func_def_to_parse.name}': {e.msg}",
@@ -969,6 +1023,24 @@ def program(cls: type | None = None, *, strict_ssa: bool = False) -> ir.Program 
             program_span = ir.Span(source_file, starting_line, col_offset)
             prog = ir.Program(all_functions, c.__name__, program_span)
 
+            # Extract HOST Worker Python callables for SubWorker registration.
+            # These are functions with level >= HOST and role=Worker — they run
+            # as pure Python in forked SubWorker processes. We save the original
+            # Python method reference so the distributed runner can register it.
+            sub_workers: dict[str, Callable[..., Any]] = {}
+            for func_def in func_defs:
+                func_level, func_role = _extract_function_level_role_from_decorator(func_def)
+                if (
+                    func_level is not None
+                    and ir.level_to_linqu_level(func_level) >= 3
+                    and func_role == ir.Role.Worker
+                ):
+                    original_method = getattr(c, func_def.name, None)
+                    if original_method is not None:
+                        sub_workers[func_def.name] = original_method
+            if sub_workers:
+                _register_sub_worker_callables(prog, sub_workers)
+
             return prog
 
         except ParserError as e:
@@ -985,4 +1057,4 @@ def program(cls: type | None = None, *, strict_ssa: bool = False) -> ir.Program 
         return _decorator(cls)
 
 
-__all__ = ["function", "inline", "program", "InlineFunction"]
+__all__ = ["function", "get_sub_worker_callables", "inline", "program", "InlineFunction"]
