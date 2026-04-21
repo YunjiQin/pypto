@@ -994,3 +994,184 @@ def scatter_update(
     op_args: list[Expr] = [input, index, src]
     kwargs: dict[str, Any] = {"dim": dim_val}
     return _ir_core.create_op_call("tensor.scatter_update", op_args, kwargs, actual_span)
+
+
+# ============================================================================
+# Sort Operations
+# ============================================================================
+
+
+def sort32(src: Expr, idx: Expr, span: Span | None = None) -> Call:
+    """Sort fixed 32-element blocks with explicit index tensor (tensor-level).
+
+    Tensor-level counterpart of ``tile.sort32``. Sorts 32-element blocks in src
+    and permutes idx accordingly. Output tensor stores sorted value-index pairs
+    with the last dimension doubled.
+
+    Args:
+        src: Input value tensor (TensorType, FP16 or FP32)
+        idx: Input index tensor (TensorType) with sequential offsets
+        span: Optional source span for debugging
+
+    Returns:
+        Call expression returning sorted tensor with doubled last dimension
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tensor.sort32", [src, idx], {}, actual_span)
+
+
+def mrgsort(
+    src0: Expr,
+    src1: Expr | None = None,
+    src2: Expr | None = None,
+    src3: Expr | None = None,
+    tmp: Expr | None = None,
+    executed: Expr | None = None,
+    exhausted: bool = False,
+    *,
+    block_len: int | Expr | None = None,
+    span: Span | None = None,
+) -> Call:
+    """Merge sort — format1 (single-list) or format2 (4-way merge), tensor-level.
+
+    Tensor-level counterpart of ``tile.mrgsort``. Format1 sorts a tensor
+    containing multiple pre-sorted runs of length ``block_len``. Format2 merges
+    4 pre-sorted input tensors into one sorted output.
+
+    Args:
+        src0: For format1: input tensor with pre-sorted runs (FP16 or FP32).
+              For format2: first sorted input tensor.
+        src1: (format2) Second sorted input tensor.
+        src2: (format2) Third sorted input tensor.
+        src3: (format2) Fourth sorted input tensor.
+        tmp: (format2) Temporary workspace tensor.
+        executed: (format2) Exhaustion status tensor (written by hardware).
+        exhausted: (format2) If True, marks inputs as exhausted (default: False).
+        block_len: (format1, keyword-only) Run length, must be multiple of 64.
+        span: Optional source span for debugging.
+
+    Returns:
+        Call expression returning merged sorted tensor.
+    """
+    actual_span = _get_span_or_capture(span)
+    if block_len is not None:
+        if exhausted or any(arg is not None for arg in (src1, src2, src3, tmp, executed)):
+            raise ValueError(
+                "mrgsort() format1 (block_len=...) and format2 (src1, src2, src3, tmp, executed) "
+                "are mutually exclusive; do not pass format2 arguments or exhausted=True with block_len"
+            )
+        if isinstance(block_len, _ir_core.ConstInt):
+            block_len_expr = _ir_core.ConstInt(block_len.value, DataType.INT32, actual_span)
+        elif isinstance(block_len, Expr):
+            block_len_expr = block_len
+        else:
+            block_len_expr = _ir_core.ConstInt(block_len, DataType.INT32, actual_span)
+        return _ir_core.create_op_call("tensor.mrgsort_format1", [src0, block_len_expr], {}, actual_span)
+    if src1 is None or src2 is None or src3 is None or tmp is None or executed is None:
+        raise ValueError(
+            "mrgsort() requires either block_len=<int> for format1, "
+            "or (src0, src1, src2, src3, tmp, executed) for format2"
+        )
+    kwargs: dict[str, Any] = {"exhausted": exhausted}
+    return _ir_core.create_op_call(
+        "tensor.mrgsort_format2", [src0, src1, src2, src3, tmp, executed], kwargs, actual_span
+    )
+
+
+def mrgsort_format1(src0: Expr, block_len: int | Expr, span: Span | None = None) -> Call:
+    """Single-list merge sort (format1). Used by the parser for roundtrip fidelity.
+
+    Prefer ``mrgsort(src, block_len=...)`` in user code.
+    """
+    return mrgsort(src0, block_len=block_len, span=span)
+
+
+def mrgsort_format2(
+    src0: Expr,
+    src1: Expr,
+    src2: Expr,
+    src3: Expr,
+    tmp: Expr,
+    executed: Expr,
+    exhausted: bool = False,
+    span: Span | None = None,
+) -> Call:
+    """4-way merge sort (format2). Used by the parser for roundtrip fidelity.
+
+    Prefer ``mrgsort(src0, src1, src2, src3, tmp, executed)`` in user code.
+    """
+    return mrgsort(src0, src1, src2, src3, tmp, executed, exhausted=exhausted, span=span)
+
+
+# ============================================================================
+# Gather Operation
+# ============================================================================
+
+
+def gather(
+    input: Expr,
+    dim: int | None = None,
+    index: Expr | None = None,
+    *,
+    mask_pattern: int | None = None,
+    output_dtype: int | DataType | None = None,
+    span: Span | None = None,
+) -> Call:
+    """Gather elements of ``input`` (tensor-level) — index form or mask-pattern form.
+
+    Index form (``dim`` + ``index``): output[b, k] = input[b, index[b, k]].
+        MVP limitation: only rank-2 inputs with ``dim == -1`` (or ``rank - 1``).
+        ``index`` must be an INT32 tensor whose shape matches ``input`` on every
+        axis except ``dim``; output shape == ``index.shape``, dtype == ``input.dtype``.
+
+    Mask form (``mask_pattern=<int>``): selects columns of each row by a fixed
+        hardware mask. Last-dim shrinks by 2 (P0101/P1010) or 4 (P0001..P1000),
+        or stays the same for P1111. Optional ``output_dtype`` keyword reinterprets
+        result bits to a same-bit-width dtype (e.g. FP32 → UINT32).
+
+    Args:
+        input: Source tensor (TensorType, FP16/FP32/INT16/INT32).
+        dim: (index form) Axis along which to gather. Only ``-1`` / ``rank - 1`` accepted in MVP.
+        index: (index form) Index tensor (TensorType, INT32) with the same rank as ``input``.
+        mask_pattern: (mask form, keyword-only) Mask pattern selector in [1, 7].
+            1=P0101, 2=P1010, 3=P0001, 4=P0010, 5=P0100, 6=P1000, 7=P1111
+        output_dtype: (mask form, keyword-only) Optional output dtype with the same
+            bit width as ``input.dtype``.
+        span: Optional source span for debugging (auto-captured if not provided).
+
+    Returns:
+        Call expression with the appropriate result type for the chosen form.
+    """
+    actual_span = _get_span_or_capture(span)
+    if mask_pattern is not None:
+        if dim is not None or index is not None:
+            raise ValueError(
+                "gather() mask form (mask_pattern=...) and index form (dim, index) "
+                "are mutually exclusive; do not pass dim or index with mask_pattern"
+            )
+        kwargs: dict[str, Any] = {"mask_pattern": mask_pattern}
+        if output_dtype is not None:
+            kwargs["output_dtype"] = output_dtype
+        return _ir_core.create_op_call("tensor.gather_mask", [input], kwargs, actual_span)
+    if dim is None or index is None:
+        raise ValueError(
+            "gather() requires either (dim, index) for index form, or mask_pattern=<int> for mask form"
+        )
+    if output_dtype is not None:
+        raise ValueError("gather() output_dtype is only valid for the mask form; use mask_pattern=<int>")
+    kwargs = {"dim": dim}
+    return _ir_core.create_op_call("tensor.gather", [input, index], kwargs, actual_span)
+
+
+def gather_mask(
+    input: Expr,
+    mask_pattern: int,
+    output_dtype: int | DataType | None = None,
+    span: Span | None = None,
+) -> Call:
+    """Gather elements of ``input`` (tensor-level) by mask pattern. Used by the parser
+    for roundtrip fidelity.
+
+    Prefer ``gather(input, mask_pattern=...)`` in user code.
+    """
+    return gather(input, mask_pattern=mask_pattern, output_dtype=output_dtype, span=span)
