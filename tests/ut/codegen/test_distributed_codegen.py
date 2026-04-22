@@ -232,7 +232,7 @@ class TestDistributedCodegen:
 
         subs = get_sub_worker_callables(Input)
         assert "verify" in subs
-        assert callable(subs["verify"])
+        assert isinstance(subs["verify"], str)
 
 
 if __name__ == "__main__":

@@ -48,8 +48,8 @@ def test_parse_pl_at_host_worker():
     @pl.function
     def f(x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
         with pl.at(level=pl.Level.HOST, role=pl.Role.Worker):
-            y = pl.add(x, x)
-        return y
+            _ = x
+        return x
 
     scope = _find_scope_stmt(f.body)
     assert scope is not None
@@ -120,8 +120,8 @@ def test_parse_pl_at_nested():
     def f(x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
         with pl.at(level=pl.Level.GLOBAL, role=pl.Role.Orchestrator):
             with pl.at(level=pl.Level.HOST, role=pl.Role.Worker):
-                y = pl.add(x, x)
-        return y
+                _ = x
+        return x
 
     outer = _find_scope_stmt(f.body)
     assert outer is not None
@@ -203,8 +203,8 @@ def test_printer_hierarchy_scope_roundtrip():
     @pl.function
     def f(x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
         with pl.at(level=pl.Level.HOST, role=pl.Role.Worker):
-            y = pl.add(x, x)
-        return y
+            _ = x
+        return x
 
     printed = str(f)
     assert "pl.at(" in printed

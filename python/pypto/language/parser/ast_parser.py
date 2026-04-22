@@ -11,6 +11,7 @@
 
 import ast
 import keyword as _keyword_mod
+import textwrap
 import warnings
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
@@ -325,6 +326,17 @@ class ASTParser:
         # construction time. One instance per parser amortises the sub-analyzer
         # setup across the many subscripts found in a typical function body.
         self._arith_analyzer: _arith.Analyzer | None = None
+
+        # SubWorker body capture: when a `with pl.at(level>=HOST, role=Worker)`
+        # scope is encountered, the body is pure Python (not DSL). We capture
+        # the source text and store it here for the decorator to register.
+        self._sub_worker_bodies: dict[str, str] = {}
+        self._sub_worker_counter: int = 0
+
+    @property
+    def sub_worker_bodies(self) -> dict[str, str]:
+        """SubWorker source bodies captured from ``with pl.at(level>=HOST, role=Worker)``."""
+        return self._sub_worker_bodies
 
     @contextmanager
     def _yield_tracking_scope(self) -> Iterator[None]:
@@ -2793,6 +2805,82 @@ class ASTParser:
                 self._discard_tail_block_comments(stmt.body, upper_line=stmt.end_lineno)
                 self.scope_manager.exit_scope(leak_vars=True)
 
+    def _parse_sub_worker_scope(
+        self,
+        stmt: ast.With,
+        span: ir.Span,
+        level: ir.Level,
+        role: ir.Role,
+        name_hint: str,
+    ) -> None:
+        """Parse a SubWorker scope (level >= HOST, role = Worker).
+
+        The body is pure Python — not parsed as DSL. Instead:
+        1. AST-analyze the body for references to parent-scope variables (inputs)
+        2. AST-analyze annotated assignments for output variables
+        3. Insert EvalStmt(Var) for inputs and AssignStmt for outputs so
+           OutlineHierarchyScopes can determine the outlined function's signature
+        4. Capture the body source text for SubWorker code generation
+        """
+        external_vars: list[ir.Var] = []
+        parent_var_names: set[str] = set()
+        for scope in self.scope_manager.scopes:
+            parent_var_names.update(scope.keys())
+        referenced_names: set[str] = set()
+        for node in ast.walk(ast.Module(body=stmt.body, type_ignores=[])):
+            if isinstance(node, ast.Name) and node.id in parent_var_names and node.id not in referenced_names:
+                referenced_names.add(node.id)
+                var = self.scope_manager.lookup_var(node.id)
+                if var is not None:
+                    external_vars.append(var)
+
+        # Annotated assignments with pl.Tensor type declare output variables
+        output_vars: list[ir.Var] = []
+        for node in stmt.body:
+            if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                var_name = node.target.id
+                try:
+                    var_type, _direction = self.type_resolver.resolve_param_type(node.annotation)
+                except Exception:
+                    continue
+                new_var = ir.Var(var_name, var_type, span)
+                output_vars.append(new_var)
+                self.scope_manager.define_var(var_name, new_var, allow_redef=True)
+
+        # EvalStmt(Var) for inputs, AssignStmt for outputs — signals for OutlineHierarchyScopes
+        with self.builder.scope(ir.ScopeKind.Hierarchy, span, level=level, role=role, name_hint=name_hint):
+            for var in external_vars:
+                self.builder.eval_stmt(var)
+            for out_var in output_vars:
+                rhs = external_vars[0] if external_vars else ir.ConstInt(0, DataType.INT32, span)
+                self.builder.assign(out_var, rhs)
+
+        worker_name = name_hint
+        if not worker_name:
+            worker_name = f"{self._func_name}_host_worker_{self._sub_worker_counter}"
+        self._sub_worker_counter += 1
+
+        body_source = self._extract_with_body_source(stmt)
+        self._sub_worker_bodies[worker_name] = body_source
+
+    def _extract_with_body_source(self, stmt: ast.With) -> str:
+        """Extract the source text of a with-statement's body."""
+        src = self.span_tracker.source_lines
+        if not stmt.body:
+            return ""
+        first_line = stmt.body[0].lineno - 1  # 0-indexed
+        last_line = stmt.end_lineno if stmt.end_lineno else first_line + 1
+        # Adjust for line_offset (dedented source)
+        offset = self.span_tracker.line_offset
+        first_line -= offset
+        last_line -= offset
+        first_line = max(0, first_line)
+        last_line = min(len(src), last_line)
+        body_lines = src[first_line:last_line]
+        if not body_lines:
+            return ""
+        return textwrap.dedent("\n".join(body_lines))
+
     def _parse_at_scope(self, stmt: ast.With, context_expr: ast.Call) -> None:
         """Parse pl.at(...) context manager into a ScopeStmt."""
         level, role, requests_auto_chunk, split_mode, name_hint = self._parse_at_kwargs(context_expr)
@@ -2827,9 +2915,17 @@ class ASTParser:
             )
 
         if not is_core_group:
-            self._parse_scope_body(
-                stmt, ir.ScopeKind.Hierarchy, span, level=level, role=role, name_hint=name_hint
+            # Check if this is a SubWorker scope (level >= HOST, role = Worker)
+            is_sub_worker = (
+                level is not None and ir.level_to_linqu_level(level) >= 3 and role == ir.Role.Worker
             )
+            if is_sub_worker:
+                assert role is not None  # guaranteed by is_sub_worker check
+                self._parse_sub_worker_scope(stmt, span, level, role, name_hint)
+            else:
+                self._parse_scope_body(
+                    stmt, ir.ScopeKind.Hierarchy, span, level=level, role=role, name_hint=name_hint
+                )
         elif requests_auto_chunk:
             self._parse_scope_body(stmt, ir.ScopeKind.AutoInCore, span, split=split_mode, name_hint=name_hint)
         else:

@@ -946,50 +946,46 @@ def _generate_with_distributed(
     )
 
     raw_subs = get_sub_worker_callables(transformed_program)
-    for func_name, method in raw_subs.items():
-        source = _generate_sub_worker_source(func_name, method)
-        result_files[f"sub_workers/{func_name}.py"] = source
+    for func_name, body in raw_subs.items():
+        func = transformed_program.get_function(func_name)
+        if func is not None:
+            param_names = [p.name_hint for p in func.params]
+            source = _generate_sub_worker_source(func_name, body, param_names)
+            result_files[f"sub_workers/{func_name}.py"] = source
 
     return result_files
 
 
 def _generate_sub_worker_source(
     func_name: str,
-    method: Any,
+    body_source: str,
+    param_names: list[str],
 ) -> str:
     """Generate a self-contained SubWorker module callable as ``fn(args: TaskArgs)``.
 
-    The generated module imports ``_tensor_from_continuous`` from
-    ``pypto.runtime.distributed_runner`` and wraps the user's function body
-    so that simpler can call it directly with ``fn(args)``.
+    Args:
+        func_name: SubWorker function name.
+        body_source: Raw source text of the user's function body.
+        param_names: Parameter names from the IR outlined function.
     """
-    import inspect  # noqa: PLC0415
     import textwrap  # noqa: PLC0415
 
-    # Extract param names from the method (skip 'self')
-    code = method.__code__
-    all_params = list(code.co_varnames[: code.co_argcount])
-    param_names = [p for p in all_params if p != "self"]
-
-    # Extract user function body from source
     user_func_lines = ""
-    try:
-        body_source = inspect.getsource(method)
+    if body_source:
         dedented = textwrap.dedent(body_source)
         lines = dedented.splitlines()
-        # Skip decorator lines and def line, keep body
         body_start = 0
         for i, line in enumerate(lines):
-            if line.strip().startswith("def "):
+            stripped = line.strip()
+            if stripped.startswith("def ") or stripped.startswith("@"):
                 body_start = i + 1
+                # If decorator, keep looking for def
+                if stripped.startswith("@"):
+                    continue
                 break
         body_lines = lines[body_start:]
         if body_lines:
             user_func_lines = textwrap.dedent("\n".join(body_lines))
-    except Exception:
-        logger.warning(
-            "Failed to extract source for SubWorker '%s'; generated module will have empty body", func_name
-        )
 
     params_str = ", ".join(param_names) if param_names else ""
     unpack_lines = [
