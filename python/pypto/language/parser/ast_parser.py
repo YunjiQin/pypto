@@ -2870,12 +2870,9 @@ class ASTParser:
         src = self.span_tracker.source_lines
         if not stmt.body:
             return ""
+        # AST line numbers are 1-based within the dedented source_lines
         first_line = stmt.body[0].lineno - 1  # 0-indexed
         last_line = stmt.end_lineno if stmt.end_lineno else first_line + 1
-        # Adjust for line_offset (dedented source)
-        offset = self.span_tracker.line_offset
-        first_line -= offset
-        last_line -= offset
         first_line = max(0, first_line)
         last_line = min(len(src), last_line)
         body_lines = src[first_line:last_line]
