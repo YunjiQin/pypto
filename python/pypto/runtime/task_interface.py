@@ -19,10 +19,10 @@ from simpler.task_interface import (  # pyright: ignore[reportMissingImports]
     ChipCallConfig,
     ChipStorageTaskArgs,
     CoreCallable,
-    make_tensor_arg,
     scalar_to_uint64,
 )
 from simpler.worker import Worker  # pyright: ignore[reportMissingImports]
+from simpler_setup.torch_interop import make_tensor_arg  # pyright: ignore[reportMissingImports]
 
 __all__ = [
     "ChipCallable",
