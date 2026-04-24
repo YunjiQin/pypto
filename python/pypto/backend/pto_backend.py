@@ -213,11 +213,16 @@ _KERNEL_HEADER = """\
 #endif
 
 #ifndef __aicore__
+#if defined(__CPU_SIM)
+#define __aicore__
+#else
 #define __aicore__ [aicore]
+#endif
 #endif
 
 {subblock_override}#include <pto/pto-inst.hpp>
 #include "tensor.h"
+{spmd_override}
 
 using namespace pto;
 
@@ -446,32 +451,40 @@ def _generate_kernel_header(func: _ir_core.Function, *, uses_spmd: bool | None =
 
     # SPMD block ops bridge: redirect ccec built-in get_block_idx()/get_block_num()
     # to runtime intrinsics that read from the dispatch payload (LocalContext).
-    # AICore has no writable static data segment for GM pointers, so we store
-    # the scalar values in [[block_local]] variables (same pattern as subblock bridge).
+    # On NPU, AICore has no writable static data segment for GM pointers, so we
+    # store scalar values in [[block_local]] variables (same pattern as subblock
+    # bridge). On SIM, fall back to thread_local storage.
+    #
+    # IMPORTANT: this bridge is emitted AFTER <pto/pto-inst.hpp> so that the
+    # `inline uint32_t get_block_idx()` declaration in cpu_stub.hpp is parsed
+    # before our function-like macro redefines the identifier.
     if uses_spmd is None:
         uses_spmd = _uses_spmd_block_ops(func)
     spmd_override = ""
     if uses_spmd:
         spmd_override = textwrap.dedent(
             """\
-            #if !defined(__CPU_SIM)
             #include "intrinsic.h"
 
-            // SPMD runtime bridge: ccec get_block_idx()/get_block_num() return physical
-            // core indices; the runtime dispatches logical indices via LocalContext.
-            // Store scalar values in [[block_local]] and redirect via macros.
+            // SPMD runtime bridge: redirect get_block_idx()/get_block_num() to
+            // runtime LocalContext values (written by build_payload per dispatch).
+            #if defined(__CPU_SIM)
+            static thread_local int32_t __pypto_spmd_block_idx;
+            static thread_local int32_t __pypto_spmd_block_num;
+            #else
             [[block_local]] static int32_t __pypto_spmd_block_idx;
             [[block_local]] static int32_t __pypto_spmd_block_num;
+            #endif
             #define get_block_idx() ((int64_t)__pypto_spmd_block_idx)
             #define get_block_num() ((int64_t)__pypto_spmd_block_num)
-            #endif
 
             """
         )
 
     return _KERNEL_HEADER.format(
         func_name=func.name,
-        subblock_override=subblock_override + spmd_override,
+        subblock_override=subblock_override,
+        spmd_override=spmd_override,
     )
 
 
@@ -505,8 +518,9 @@ def _generate_kernel_wrapper(
     if _uses_spmd_block_ops(func):
         # Use undef/redefine dance: temporarily remove our macros so we can call
         # the intrinsic.h functions that take args, then restore the macros.
+        # Runs under both NPU and SIM — in SIM, intrinsic.h::get_block_idx(args)
+        # reads the runtime-dispatched LocalContext so block_idx is correct.
         spmd_args_setup = (
-            "#if !defined(__CPU_SIM)\n"
             "    // Read logical SPMD block identity from runtime dispatch payload\n"
             '    #pragma push_macro("get_block_idx")\n'
             '    #pragma push_macro("get_block_num")\n'
@@ -515,8 +529,7 @@ def _generate_kernel_wrapper(
             "    __pypto_spmd_block_idx = get_block_idx(args);\n"
             "    __pypto_spmd_block_num = get_block_num(args);\n"
             '    #pragma pop_macro("get_block_idx")\n'
-            '    #pragma pop_macro("get_block_num")\n'
-            "#endif\n\n"
+            '    #pragma pop_macro("get_block_num")\n\n'
         )
 
     wrapper_func = (
