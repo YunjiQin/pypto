@@ -89,6 +89,7 @@ class DistributedCodegen : public CodegenBase {
   void EmitCallToWorker(const ir::CallPtr& call, const ir::FunctionPtr& callee);
   void EmitDistIntrinsic(const ir::CallPtr& call);
   void EmitTreeReduce(const ir::CallPtr& call);
+  void EmitTensorCreate(const ir::CallPtr& call);
 
   // Helpers
   [[nodiscard]] std::string ParamDirectionToTensorArgType(ir::ParamDirection dir) const;
@@ -97,6 +98,7 @@ class DistributedCodegen : public CodegenBase {
   [[nodiscard]] std::string SanitizeName(const std::string& name) const;
   std::string FormatArgs(const std::vector<ir::ExprPtr>& args);
   [[nodiscard]] bool IsSubWorker(const ir::FunctionPtr& func) const;
+  [[nodiscard]] static std::string DataTypeToPythonDType(const DataType& dtype);
 
   ir::ProgramPtr program_;
   CodeEmitter emitter_;

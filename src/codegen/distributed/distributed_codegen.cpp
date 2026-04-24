@@ -18,6 +18,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "pypto/core/logging.h"
@@ -139,6 +140,7 @@ std::vector<ir::FunctionPtr> DistributedCodegen::SortFunctionsByRoleAndLevel() c
 // ========================================================================
 
 void DistributedCodegen::EmitImports() {
+  emitter_.EmitLine("import torch");
   emitter_.EmitLine("from simpler.task_interface import TaskArgs, TensorArgType, make_tensor_arg");
 }
 
@@ -365,6 +367,12 @@ void DistributedCodegen::VisitExpr_(const ir::CallPtr& op) {
     return;
   }
 
+  // tensor.create → orch.alloc() for HOST-level orchestrators
+  if (op->op_->name_ == "tensor.create") {
+    EmitTensorCreate(op);
+    return;
+  }
+
   // Regular op call
   current_expr_value_ = op->op_->name_ + "(" + FormatArgs(op->args_) + ")";
 }
@@ -429,8 +437,7 @@ void DistributedCodegen::EmitCallToWorker(const ir::CallPtr& call, const ir::Fun
     }
     if (!has_out_param) {
       emitter_.EmitLine(ta_var + ".add_tensor(make_tensor_arg(tensors[\"" + target +
-                        "\"]), "
-                        "TensorArgType.OUTPUT_EXISTING)");
+                        "\"]), TensorArgType.OUTPUT_EXISTING)");
     }
   }
 
@@ -487,6 +494,44 @@ void DistributedCodegen::EmitTreeReduce(const ir::CallPtr& call) {
   } else {
     emitter_.EmitLine("tree_reduce(" + args.str() + ")");
   }
+}
+
+void DistributedCodegen::EmitTensorCreate(const ir::CallPtr& call) {
+  auto result_type = std::dynamic_pointer_cast<const ir::TensorType>(call->GetType());
+  INTERNAL_CHECK(result_type) << "tensor.create must return TensorType";
+
+  std::string target = current_target_var_;
+  INTERNAL_CHECK(!target.empty()) << "tensor.create must have an assignment target";
+
+  std::string shape = "(";
+  for (size_t i = 0; i < result_type->shape_.size(); ++i) {
+    if (i > 0) shape += ", ";
+    shape += std::to_string(GetConstIntValue(result_type->shape_[i]));
+  }
+  if (result_type->shape_.size() == 1) shape += ",";  // trailing comma for 1-tuple
+  shape += ")";
+
+  std::string torch_dtype = DataTypeToPythonDType(result_type->dtype_);
+
+  // share_memory_() is required for fork-based distributed runtime visibility.
+  emitter_.EmitLine("tensors[\"" + target + "\"] = torch.zeros(" + shape + ", dtype=torch." + torch_dtype +
+                    ").share_memory_()");
+
+  declared_vars_.insert(target);
+  current_expr_value_ = "";
+}
+
+std::string DistributedCodegen::DataTypeToPythonDType(const DataType& dtype) {
+  // Most dtype names match torch directly; only fp16/fp32/fp64 differ.
+  static const std::unordered_map<std::string, std::string> kRenames = {
+      {"fp16", "float16"},
+      {"fp32", "float32"},
+      {"fp64", "float64"},
+  };
+  std::string name = dtype.ToString();
+  auto it = kRenames.find(name);
+  CHECK(name != "unknown") << "Unsupported dtype for distributed tensor create: " << name;
+  return it != kRenames.end() ? it->second : name;
 }
 
 // ========================================================================

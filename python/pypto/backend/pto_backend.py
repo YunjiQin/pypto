@@ -956,6 +956,17 @@ def _generate_with_distributed(
     return result_files
 
 
+def _strip_auto_name_suffix(name: str) -> str:
+    """Strip IR auto-name suffix (e.g. ``__ssa_v0``) to recover the original user-facing name.
+
+    The auto-name system guarantees base names never contain ``__``
+    (see ``auto_name_utils.h:ValidateBaseName``), so splitting on the
+    first ``__`` is reliable.
+    """
+    idx = name.find("__")
+    return name[:idx] if idx > 0 else name
+
+
 def _generate_sub_worker_source(
     func_name: str,
     body_source: str,
@@ -966,7 +977,7 @@ def _generate_sub_worker_source(
     Args:
         func_name: SubWorker function name.
         body_source: Raw source text of the user's function body.
-        param_names: Parameter names from the IR outlined function.
+        param_names: Parameter names from the IR outlined function (SSA-renamed).
     """
     import textwrap  # noqa: PLC0415
 
@@ -977,17 +988,27 @@ def _generate_sub_worker_source(
         body_start = 0
         for i, line in enumerate(lines):
             stripped = line.strip()
-            if stripped.startswith("def ") or stripped.startswith("@"):
+            if stripped.startswith("@"):
                 body_start = i + 1
-                # If decorator, keep looking for def
-                if stripped.startswith("@"):
-                    continue
+                continue
+            if stripped.startswith("def "):
+                # Advance past the full function signature (may span multiple lines).
+                # The signature ends at the first line whose stripped form ends with ':'.
+                for j in range(i, len(lines)):
+                    if lines[j].rstrip().endswith(":"):
+                        body_start = j + 1
+                        break
                 break
         body_lines = lines[body_start:]
         if body_lines:
             user_func_lines = textwrap.dedent("\n".join(body_lines))
 
-    params_str = ", ".join(param_names) if param_names else ""
+    # The body source uses original (pre-SSA) names; IR params carry SSA suffixes.
+    # Use original names for _user_* params so the body references resolve correctly.
+    orig_names = [_strip_auto_name_suffix(n) for n in param_names]
+    orig_params_str = ", ".join(orig_names)
+    ssa_params_str = ", ".join(param_names)
+
     unpack_lines = [
         f"    {name} = _tensor_from_continuous(args.tensor({i}))" for i, name in enumerate(param_names)
     ]
@@ -997,16 +1018,18 @@ def _generate_sub_worker_source(
     return (
         f'"""SubWorker: {func_name} — auto-generated, callable as fn(args: TaskArgs)."""\n'
         f"\n"
+        f"import torch\n"
+        f"\n"
         f"from pypto.runtime.distributed_runner import _tensor_from_continuous\n"
         f"\n"
         f"\n"
-        f"def _user_{func_name}({params_str}):\n"
+        f"def _user_{func_name}({orig_params_str}):\n"
         f"{user_body}\n"
         f"\n"
         f"\n"
         f"def {func_name}(args):\n"
         f"{unpack_block}\n"
-        f"    _user_{func_name}({params_str})\n"
+        f"    _user_{func_name}({ssa_params_str})\n"
     )
 
 
