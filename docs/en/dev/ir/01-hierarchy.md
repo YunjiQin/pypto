@@ -424,11 +424,35 @@ func_orch = ir.Function("orchestrator", params, return_types, body, span, ir.Fun
 | Field | Type | Description |
 | ----- | ---- | ----------- |
 | `name_` | string | Function name |
-| `func_type_` | FunctionType | Function type (Opaque, Orchestration, InCore, AIC, AIV, or Group) |
+| `func_type_` | FunctionType | Function type (Opaque, Orchestration, InCore, AIC, AIV, Group, or Spmd) |
 | `params_` | list[VarPtr] | Parameter variables (DefField) |
 | `param_directions_` | list[ParamDirection] | Parameter directions, same length as params_ |
 | `return_types_` | list[TypePtr] | Return types |
 | `body_` | StmtPtr | Function body |
+| `level_` | optional[Level] | Hierarchy level (auto-derived from `func_type_` for InCore/Group/Orchestration; see below) |
+| `role_` | optional[Role] | Hierarchy role (auto-derived from `func_type_` for InCore/Group/Orchestration; see below) |
+| `attrs_` | map[str, Any] | Free-form metadata (IgnoreField) |
+
+### Auto-derivation of `level_` / `role_`
+
+For `func_type_` in {`InCore`, `AIC`, `AIV`, `Group`, `Orchestration`}, the
+`Function` constructor auto-derives `level_` and `role_` when they are not
+explicitly provided:
+
+| `func_type_` | Derived `level_` | Derived `role_` |
+| ------------ | ---------------- | --------------- |
+| `Orchestration` | `CHIP` | `Orchestrator` |
+| `InCore` | `CHIP_DIE` | `Worker` |
+| `AIC` | `AIC` | `Worker` |
+| `AIV` | `AIV` | `Worker` |
+| `Group` | `CORE_GROUP` | `Worker` |
+
+If `level_` / `role_` are explicitly supplied, they must match the derived
+values — otherwise construction fails with `pypto.ValueError`. For other
+function types (`Opaque`, `Spmd`), no derivation is applied and both fields
+remain `nullopt` unless set by the caller. The Python printer emits the
+`level=` / `role=` keywords on the `@pl.function(...)` decorator whenever they
+are present.
 
 ### ParamDirection Enum
 
@@ -448,6 +472,7 @@ func_orch = ir.Function("orchestrator", params, return_types, body, span, ir.Fun
 | `AIC` | Cube core kernel (specialized InCore) |
 | `AIV` | Vector core kernel (specialized InCore) |
 | `Group` | Co-scheduled group of AIC + AIV kernels |
+| `Spmd` | SPMD data-parallel dispatch wrapper |
 
 `IsInCoreType(type)` / `ir.is_incore_type(type)` returns `True` for `InCore`, `AIC`, and `AIV`.
 

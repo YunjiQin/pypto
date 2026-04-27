@@ -388,11 +388,33 @@ func_orch = ir.Function("orchestrator", params, return_types, body, span, ir.Fun
 | 字段 | 类型 | 说明 |
 | ---- | ---- | ---- |
 | `name_` | string | 函数名称 |
-| `func_type_` | FunctionType | 函数类型（Opaque、Orchestration、InCore、AIC、AIV 或 Group） |
+| `func_type_` | FunctionType | 函数类型（Opaque、Orchestration、InCore、AIC、AIV、Group 或 Spmd） |
 | `params_` | list[VarPtr] | 参数变量 (DefField) |
 | `param_directions_` | list[ParamDirection] | 参数方向，与 params_ 长度相同 |
 | `return_types_` | list[TypePtr] | 返回类型 |
 | `body_` | StmtPtr | 函数体 |
+| `level_` | optional[Level] | 层次级别（对 InCore/Group/Orchestration 自动派生，详见下文） |
+| `role_` | optional[Role] | 层次角色（对 InCore/Group/Orchestration 自动派生，详见下文） |
+| `attrs_` | map[str, Any] | 自由形式元数据（IgnoreField） |
+
+### `level_` / `role_` 自动派生
+
+当 `func_type_` 属于 {`InCore`, `AIC`, `AIV`, `Group`, `Orchestration`} 时，
+`Function` 构造函数会在未显式提供 `level_` / `role_` 时自动派生：
+
+| `func_type_` | 派生的 `level_` | 派生的 `role_` |
+| ------------ | --------------- | -------------- |
+| `Orchestration` | `CHIP` | `Orchestrator` |
+| `InCore` | `CHIP_DIE` | `Worker` |
+| `AIC` | `AIC` | `Worker` |
+| `AIV` | `AIV` | `Worker` |
+| `Group` | `CORE_GROUP` | `Worker` |
+
+如果显式提供 `level_` / `role_`，其值必须与派生值一致，否则构造时抛出
+`pypto.ValueError`。其他函数类型（`Opaque`、`Spmd`）不进行派生，除非
+调用方显式设置，否则两个字段保持 `nullopt`。当 `level_` / `role_` 存在
+时，Python 打印器会在 `@pl.function(...)` 装饰器上输出 `level=` / `role=`
+关键字。
 
 ### ParamDirection 枚举
 
@@ -412,6 +434,7 @@ func_orch = ir.Function("orchestrator", params, return_types, body, span, ir.Fun
 | `AIC` | Cube 核心内核（特化的 InCore） |
 | `AIV` | Vector 核心内核（特化的 InCore） |
 | `Group` | AIC + AIV 内核的协调调度组 |
+| `Spmd` | SPMD 数据并行调度封装 |
 
 `IsInCoreType(type)` / `ir.is_incore_type(type)` 对 `InCore`、`AIC` 和 `AIV` 返回 `True`。
 
