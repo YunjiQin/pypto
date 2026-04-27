@@ -83,8 +83,9 @@ def test_function_backward_compat_type_only():
         return x
 
     assert f.func_type == ir.FunctionType.InCore
-    assert f.level is None
-    assert f.role is None
+    # level/role are now auto-derived from func_type
+    assert f.level == ir.Level.CHIP_DIE
+    assert f.role == ir.Role.Worker
 
 
 # ─── @pl.program integration ──────────────────────────────────────────────

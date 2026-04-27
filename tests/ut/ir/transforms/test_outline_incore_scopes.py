@@ -463,7 +463,7 @@ class TestOutlineIncoreScopes:
         assert "main_incore_0(" in printed
         # The InCore function should have return statement
         assert (
-            "return" in printed.split("@pl.function(type=pl.FunctionType.InCore)")[1].split("@pl.function")[0]
+            "return" in printed.split("@pl.function(type=pl.FunctionType.InCore")[1].split("@pl.function")[0]
         )
 
     def test_outline_scope_with_loop_carried_init_values(self):
@@ -492,14 +492,12 @@ class TestOutlineIncoreScopes:
         After = passes.outline_incore_scopes()(Before)
 
         printed = After.as_python()
-        incore_section = printed.split("@pl.function(type=pl.FunctionType.InCore)")[1].split("@pl.function")[
-            0
-        ]
+        incore_section = printed.split("@pl.function(type=pl.FunctionType.InCore")[1].split("@pl.function")[0]
         # Extract parameters between "def ...(self, ...)" — handle multiline signatures
         param_match = re.search(r"def \w+\((.*?)\)\s*->", incore_section, re.DOTALL)
         assert param_match is not None
         incore_params = param_match.group(1)
-        orch_section = printed.split("@pl.function(type=pl.FunctionType.Orchestration)")[1]
+        orch_section = printed.split("@pl.function(type=pl.FunctionType.Orchestration")[1]
 
         assert "acc" in incore_params, (
             "outer loop-carried variable 'acc' must be a parameter of the outlined function"
@@ -532,9 +530,7 @@ class TestOutlineIncoreScopes:
         After = passes.outline_incore_scopes()(Before)
 
         printed = After.as_python()
-        incore_section = printed.split("@pl.function(type=pl.FunctionType.InCore)")[1].split("@pl.function")[
-            0
-        ]
+        incore_section = printed.split("@pl.function(type=pl.FunctionType.InCore")[1].split("@pl.function")[0]
         # Extract parameters — handle multiline signatures from ruff formatting
         param_match = re.search(r"def \w+\((.*?)\)\s*->", incore_section, re.DOTALL)
         assert param_match is not None

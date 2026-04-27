@@ -84,6 +84,8 @@ enum class Level : uint8_t {
   POD = 6,        ///< Alias for CLUSTER_0
   CLOS1 = 7,      ///< Alias for CLUSTER_1
   CLOS2 = 8,      ///< Alias for CLUSTER_2
+
+  UNDEFINED = 255
 };
 
 /**
@@ -122,6 +124,8 @@ inline std::string LevelToString(Level level) {
       return "CLUSTER_2";
     case Level::GLOBAL:
       return "GLOBAL";
+    case Level::UNDEFINED:
+      break;
   }
   throw pypto::TypeError("Unknown Level");
 }
@@ -179,6 +183,8 @@ inline int LevelToLinquLevel(Level level) {
       return 6;
     case Level::GLOBAL:
       return 7;
+    case Level::UNDEFINED:
+      break;
   }
   throw pypto::TypeError("Unknown Level");
 }
@@ -248,6 +254,28 @@ inline std::string FunctionTypeToString(FunctionType type) {
       return "Spmd";
   }
   throw pypto::TypeError("Unknown FunctionType");
+}
+
+/**
+ * @brief Convert FunctionType to level
+ * @param type The function type
+ * @return Level
+ */
+inline Level FunctionTypeToLevel(FunctionType type) {
+  switch (type) {
+    case FunctionType::Orchestration:
+      return Level::CHIP;
+    case FunctionType::InCore:
+      return Level::CHIP_DIE;
+    case FunctionType::AIC:
+      return Level::AIC;
+    case FunctionType::AIV:
+      return Level::AIV;
+    case FunctionType::Group:
+      return Level::CORE_GROUP;
+    default:
+      return Level::UNDEFINED;
+  }
 }
 
 /**
@@ -359,6 +387,27 @@ class Function : public IRNode {
     CHECK(params_.size() == param_directions_.size())
         << "params and param_directions must have same size, got " << params_.size() << " vs "
         << param_directions_.size();
+    if (IsInCoreType(func_type_) || func_type_ == FunctionType::Group ||
+        func_type_ == FunctionType::Orchestration) {
+      Level derived_level = FunctionTypeToLevel(func_type_);
+      Role derived_role = (func_type_ == FunctionType::Orchestration) ? Role::Orchestrator : Role::Worker;
+      if (level_.has_value()) {
+        CHECK(*level_ == derived_level)
+            << "Function '" << name_ << "' has func_type=" << FunctionTypeToString(func_type_)
+            << " which implies level=" << LevelToString(derived_level)
+            << ", but explicit level=" << LevelToString(*level_) << " was provided";
+      } else {
+        level_ = derived_level;
+      }
+      if (role_.has_value()) {
+        CHECK(*role_ == derived_role)
+            << "Function '" << name_ << "' has func_type=" << FunctionTypeToString(func_type_)
+            << " which implies role=" << RoleToString(derived_role)
+            << ", but explicit role=" << RoleToString(*role_) << " was provided";
+      } else {
+        role_ = derived_role;
+      }
+    }
   }
 
   [[nodiscard]] ObjectKind GetKind() const override { return ObjectKind::Function; }

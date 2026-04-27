@@ -171,13 +171,13 @@ class TestOutlineHierarchyScopes:
         @pl.program
         class Expected:
             @pl.function(level=pl.Level.HOST, role=pl.Role.Worker)
-            def main_global_orch_0_host_worker_0(self, y: pl.Tensor[[64], pl.FP32]):
+            def main_host_worker_0(self, y: pl.Tensor[[64], pl.FP32]):
                 y
 
             @pl.function(level=pl.Level.GLOBAL, role=pl.Role.Orchestrator)
             def main_global_orch_0(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
                 y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
-                self.main_global_orch_0_host_worker_0(y)
+                self.main_host_worker_0(y)
                 return y
 
             @pl.function
@@ -420,7 +420,7 @@ class TestOutlineHierarchyScopes:
         assert func_0.level == ir.Level.CHIP
         assert func_0.role == ir.Role.Orchestrator
 
-        func_1 = After.get_function("main_cluster0_worker_1")
+        func_1 = After.get_function("main_cluster0_worker_0")
         assert func_1 is not None
         assert func_1.level == ir.Level.CLUSTER_0
         assert func_1.role == ir.Role.Worker

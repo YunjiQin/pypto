@@ -215,6 +215,37 @@ def _normalize_inferred_type_for_annotation(
     )
 
 
+_HIERARCHY_LEVEL_SUFFIX: dict["ir.Level", str] = {}
+
+
+def _generate_hierarchy_suffix(level: "ir.Level", role: "ir.Role | None") -> str:
+    """Mirror of ``GenerateHierarchySuffix`` in ``scope_outline_utils.h``.
+
+    Produces lowercase suffixes like ``_host_worker_`` / ``_global_orch_`` so
+    Python-side scope names match the names the C++ outliner would synthesize
+    for the same (level, role) pair.
+    """
+    if not _HIERARCHY_LEVEL_SUFFIX:
+        _HIERARCHY_LEVEL_SUFFIX.update(
+            {
+                ir.Level.AIV: "aiv",
+                ir.Level.AIC: "aic",
+                ir.Level.CORE_GROUP: "core_group",
+                ir.Level.CHIP_DIE: "chip_die",
+                ir.Level.CHIP: "chip",
+                ir.Level.HOST: "host",
+                ir.Level.CLUSTER_0: "cluster0",
+                ir.Level.CLUSTER_1: "cluster1",
+                ir.Level.CLUSTER_2: "cluster2",
+                ir.Level.GLOBAL: "global",
+            }
+        )
+    name = "_" + _HIERARCHY_LEVEL_SUFFIX[level]
+    if role is not None:
+        name += "_orch" if role == ir.Role.Orchestrator else "_worker"
+    return name + "_"
+
+
 @dataclass
 class _AtKwargState:
     """Mutable accumulator used while parsing pl.at() keyword arguments."""
@@ -2849,9 +2880,12 @@ class ASTParser:
 
         # Generate a stable worker name used as both the scope name_hint
         # (so OutlineHierarchyScopes preserves it) and the SubWorker registry key.
+        # Mirrors OutlineScope/GenerateHierarchySuffix in scope_outline_utils.h
+        # so unnamed scopes get the same name the C++ outliner would synthesize.
         worker_name = name_hint
         if not worker_name:
-            worker_name = f"{self._func_name}_host_worker_{self._sub_worker_counter}"
+            suffix = _generate_hierarchy_suffix(level, role)
+            worker_name = f"{self._func_name}{suffix}{self._sub_worker_counter}"
         self._sub_worker_counter += 1
 
         # EvalStmt(Var) for inputs, AssignStmt for outputs — signals for OutlineHierarchyScopes

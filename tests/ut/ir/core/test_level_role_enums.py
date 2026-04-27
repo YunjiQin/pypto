@@ -97,8 +97,10 @@ def test_function_default_level_role():
 
 def test_function_with_level():
     """Function can carry a hierarchy level."""
-    f = _make_empty_func("orch", type=ir.FunctionType.Orchestration, level=ir.Level.HOST)
-    assert f.level == ir.Level.HOST
+    f = _make_empty_func("orch", type=ir.FunctionType.Orchestration)
+    # Orchestration auto-derives level=CHIP, role=Orchestrator
+    assert f.level == ir.Level.CHIP
+    assert f.role == ir.Role.Orchestrator
     assert f.func_type == ir.FunctionType.Orchestration
 
 
@@ -119,8 +121,9 @@ def test_function_backward_compat():
     """Existing code creating Function(type=InCore) still works."""
     f = _make_empty_func("kernel", type=ir.FunctionType.InCore)
     assert f.func_type == ir.FunctionType.InCore
-    assert f.level is None
-    assert f.role is None
+    # InCore auto-derives level=CHIP_DIE, role=Worker
+    assert f.level == ir.Level.CHIP_DIE
+    assert f.role == ir.Role.Worker
 
 
 def test_structural_equal_with_level():
@@ -145,7 +148,6 @@ def test_function_printer_shows_level_role():
     """Python printer includes level/role in decorator."""
     f = _make_empty_func(
         "worker",
-        type=ir.FunctionType.Orchestration,
         level=ir.Level.HOST,
         role=ir.Role.Worker,
     )

@@ -376,7 +376,7 @@ class test_program:
                 return x
 
         printed = Before.as_python()
-        assert "@pl.function(type=pl.FunctionType.AIC)" in printed
+        assert "@pl.function(type=pl.FunctionType.AIC" in printed
         reparsed = pl.parse_program(printed)
         ir.assert_structural_equal(Before, reparsed)
 
@@ -390,7 +390,7 @@ class test_program:
                 return x
 
         printed = Before.as_python()
-        assert "@pl.function(type=pl.FunctionType.AIV)" in printed
+        assert "@pl.function(type=pl.FunctionType.AIV" in printed
         reparsed = pl.parse_program(printed)
         ir.assert_structural_equal(Before, reparsed)
 
@@ -404,7 +404,7 @@ class test_program:
                 return x
 
         printed = Before.as_python()
-        assert "@pl.function(type=pl.FunctionType.Group)" in printed
+        assert "@pl.function(type=pl.FunctionType.Group" in printed
         reparsed = pl.parse_program(printed)
         ir.assert_structural_equal(Before, reparsed)
 

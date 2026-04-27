@@ -141,12 +141,14 @@ std::vector<ir::FunctionPtr> DistributedCodegen::SortFunctionsByRoleAndLevel() c
 
 void DistributedCodegen::EmitImports() {
   emitter_.EmitLine("import torch");
-  emitter_.EmitLine("from simpler.task_interface import TaskArgs, TensorArgType, make_tensor_arg");
+  emitter_.EmitLine("from simpler.task_interface import TaskArgs, TensorArgType");
+  emitter_.EmitLine("from simpler_setup.torch_interop import make_tensor_arg");
 }
 
 void DistributedCodegen::EmitFunction(const ir::FunctionPtr& func) {
   declared_vars_.clear();
   task_args_counter_ = 0;
+  current_func_ = func;
 
   bool is_worker = func->role_.has_value() && *func->role_ == ir::Role::Worker;
   is_worker_context_ = is_worker;
@@ -184,6 +186,7 @@ void DistributedCodegen::EmitEntryFunction() {
 
   declared_vars_.clear();
   task_args_counter_ = 0;
+  current_func_ = entry_func_;
 
   // Entry function signature
   emitter_.EmitLine("def entry(orch, _args, config, *, tensors, callables, sub_ids, _keep):");
@@ -207,6 +210,35 @@ void DistributedCodegen::EmitEntryFunction() {
 // Statement visitors
 // ========================================================================
 
+bool DistributedCodegen::TryEmitHierarchyCall(const ir::ExprPtr& expr) {
+  auto call = std::dynamic_pointer_cast<const ir::Call>(expr);
+  if (!call) return false;
+  auto gv = std::dynamic_pointer_cast<const ir::GlobalVar>(call->op_);
+  if (!gv) return false;
+  auto callee = program_->GetFunction(gv->name_);
+  if (!callee) return false;
+
+  INTERNAL_CHECK(callee->level_.has_value() && callee->role_.has_value() &&
+                 current_func_->level_.has_value() && current_func_->role_.has_value());
+
+  const bool same_level_worker =
+      *callee->role_ == ir::Role::Worker && *callee->level_ == *current_func_->level_;
+  const bool next_level_orch =
+      *callee->role_ == ir::Role::Orchestrator &&
+      static_cast<int>(*callee->level_) == static_cast<int>(*current_func_->level_) - 1;
+
+  if (same_level_worker || next_level_orch) {
+    EmitCallToWorker(call, callee);
+    return true;
+  }
+
+  UNREACHABLE << ir::LevelToString(*current_func_->level_) << "Level Orch func '" << current_func_->name_
+              << "' can only call same level worker or next level Orch, but call to func '" << gv->name_
+              << "' has level = '" << ir::LevelToString(*callee->level_) << "', role = '"
+              << ir::RoleToString(*callee->role_) << "'.";
+  return false;  // unreachable
+}
+
 void DistributedCodegen::VisitStmt_(const ir::AssignStmtPtr& op) {
   INTERNAL_CHECK(op != nullptr) << "Internal error: null AssignStmt";
 
@@ -216,27 +248,10 @@ void DistributedCodegen::VisitStmt_(const ir::AssignStmtPtr& op) {
   current_expr_value_ = "";
 
   // Check if the value is a Call to a hierarchy function or chip function
-  if (auto call = std::dynamic_pointer_cast<const ir::Call>(op->value_)) {
-    auto gv = std::dynamic_pointer_cast<const ir::GlobalVar>(call->op_);
-    if (gv) {
-      auto callee = program_->GetFunction(gv->name_);
-      if (callee) {
-        if (callee->role_.has_value() && *callee->role_ == ir::Role::Worker) {
-          EmitCallToWorker(call, callee);
-          declared_vars_.insert(var_name);
-          current_target_var_ = "";
-          return;
-        }
-        // Chip-level function called from HOST orchestrator → submit_next_level
-        if (callee->func_type_ == ir::FunctionType::Orchestration ||
-            callee->func_type_ == ir::FunctionType::InCore) {
-          EmitCallToWorker(call, callee);
-          declared_vars_.insert(var_name);
-          current_target_var_ = "";
-          return;
-        }
-      }
-    }
+  if (TryEmitHierarchyCall(op->value_)) {
+    declared_vars_.insert(var_name);
+    current_target_var_ = "";
+    return;
   }
 
   // Standard expression
@@ -256,6 +271,13 @@ void DistributedCodegen::VisitStmt_(const ir::EvalStmtPtr& op) {
 
   current_target_var_ = "";
   current_expr_value_ = "";
+
+  // Check if the value is a Call to a hierarchy function or chip function
+  if (TryEmitHierarchyCall(op->expr_)) {
+    return;
+  }
+
+  // Standard expression
   VisitExpr(op->expr_);
 
   if (!current_expr_value_.empty()) {

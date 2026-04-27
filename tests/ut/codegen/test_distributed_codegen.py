@@ -18,7 +18,7 @@ class TestDistributedCodegen:
     """Test distributed Python codegen on outlined hierarchy programs."""
 
     def test_chip_worker_and_orchestrator(self):
-        """HOST orchestrator calling CHIP worker produces submit_next_level."""
+        """HOST orchestrator calling CHIP orchestrator → CHIP worker produces submit_next_level."""
 
         @pl.program
         class Input:
@@ -27,9 +27,14 @@ class TestDistributedCodegen:
                 y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
                 return y
 
+            @pl.function(level=pl.Level.CHIP, role=pl.Role.Orchestrator)
+            def chip_orch(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                y: pl.Tensor[[64], pl.FP32] = self.chip_worker(x)
+                return y
+
             @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
             def host_orch(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
-                y: pl.Tensor[[64], pl.FP32] = self.chip_worker(x)
+                y: pl.Tensor[[64], pl.FP32] = self.chip_orch(x)
                 return y
 
         program = passes.convert_to_ssa()(Input)
@@ -37,15 +42,16 @@ class TestDistributedCodegen:
         code = cg.generate(program)
 
         # Verify imports
-        assert "from simpler.task_interface import TaskArgs, TensorArgType, make_tensor_arg" in code
+        assert "from simpler.task_interface import TaskArgs, TensorArgType" in code
+        assert "from simpler_setup.torch_interop import make_tensor_arg" in code
 
         # Verify function definition
         assert "def host_orch" in code
         assert "orch, _args, config" in code
 
-        # Verify call-site lowering: CHIP worker → submit_next_level
+        # Verify call-site lowering: CHIP orchestrator → submit_next_level
         assert "submit_next_level" in code
-        assert 'callables["chip_worker"]' in code
+        assert 'callables["chip_orch"]' in code
         assert "TaskArgs()" in code
 
     def test_sub_worker_submit_sub(self):
@@ -71,7 +77,7 @@ class TestDistributedCodegen:
         assert 'sub_ids["verify"]' in code
 
     def test_chip_and_sub_worker_combined(self):
-        """Program with both CHIP worker and SubWorker."""
+        """Program with both CHIP orchestrator (→ chip worker) and HOST SubWorker."""
 
         @pl.program
         class Input:
@@ -84,6 +90,15 @@ class TestDistributedCodegen:
                 y: pl.Tensor[[64], pl.FP32] = pl.add(a, b)
                 return y
 
+            @pl.function(level=pl.Level.CHIP, role=pl.Role.Orchestrator)
+            def chip_orch(
+                self,
+                a: pl.Tensor[[64], pl.FP32],
+                b: pl.Tensor[[64], pl.FP32],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                y: pl.Tensor[[64], pl.FP32] = self.chip_worker(a, b)
+                return y
+
             @pl.function(level=pl.Level.HOST, role=pl.Role.Worker)
             def verify(self, f: pl.Tensor[[64], pl.FP32]):
                 pass
@@ -94,7 +109,7 @@ class TestDistributedCodegen:
                 a: pl.Tensor[[64], pl.FP32],
                 b: pl.Tensor[[64], pl.FP32],
             ) -> pl.Tensor[[64], pl.FP32]:
-                f: pl.Tensor[[64], pl.FP32] = self.chip_worker(a, b)
+                f: pl.Tensor[[64], pl.FP32] = self.chip_orch(a, b)
                 self.verify(f)
                 return f
 
@@ -138,7 +153,8 @@ class TestDistributedCodegen:
         cg = codegen.DistributedCodegen()
         code = cg.generate(program)
 
-        assert "from simpler.task_interface import TaskArgs, TensorArgType, make_tensor_arg" in code
+        assert "from simpler.task_interface import TaskArgs, TensorArgType" in code
+        assert "from simpler_setup.torch_interop import make_tensor_arg" in code
 
     def test_tensor_arg_type_tags(self):
         """Parameter directions map to correct TensorArgType tags."""
@@ -155,6 +171,16 @@ class TestDistributedCodegen:
                 y: pl.Tensor[[64], pl.FP32] = pl.add(a, b)
                 return y
 
+            @pl.function(level=pl.Level.CHIP, role=pl.Role.Orchestrator)
+            def chip_orch(
+                self,
+                a: pl.Tensor[[64], pl.FP32],
+                b: pl.Tensor[[64], pl.FP32],
+                f: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                out: pl.Tensor[[64], pl.FP32] = self.chip_worker(a, b, f)
+                return out
+
             @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
             def host_orch(
                 self,
@@ -162,7 +188,7 @@ class TestDistributedCodegen:
                 b: pl.Tensor[[64], pl.FP32],
                 f: pl.Out[pl.Tensor[[64], pl.FP32]],
             ) -> pl.Tensor[[64], pl.FP32]:
-                out: pl.Tensor[[64], pl.FP32] = self.chip_worker(a, b, f)
+                out: pl.Tensor[[64], pl.FP32] = self.chip_orch(a, b, f)
                 return out
 
         program = passes.convert_to_ssa()(Input)
@@ -248,13 +274,22 @@ class TestDistributedCodegen:
                 y: pl.Tensor[[64], pl.FP32] = pl.add(a, a)
                 return y
 
+            @pl.function(level=pl.Level.CHIP, role=pl.Role.Orchestrator)
+            def chip_orch(
+                self,
+                a: pl.Tensor[[64], pl.FP32],
+                buf: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                result: pl.Tensor[[64], pl.FP32] = self.chip_worker(a, buf)
+                return result
+
             @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
             def host_orch(
                 self,
                 a: pl.Tensor[[64], pl.FP32],
             ) -> pl.Tensor[[64], pl.FP32]:
                 buf: pl.Tensor[[64], pl.FP32] = pl.create_tensor([64], dtype=pl.FP32)
-                result: pl.Tensor[[64], pl.FP32] = self.chip_worker(a, buf)
+                result: pl.Tensor[[64], pl.FP32] = self.chip_orch(a, buf)
                 return result
 
         program = passes.convert_to_ssa()(Input)
@@ -292,6 +327,26 @@ class TestDistributedCodegen:
                 y: pl.Tensor[[64], pl.FP32] = pl.sub(a, b)
                 return y
 
+            @pl.function(level=pl.Level.CHIP, role=pl.Role.Orchestrator)
+            def chip_orch_add(
+                self,
+                a: pl.Tensor[[64], pl.FP32],
+                b: pl.Tensor[[64], pl.FP32],
+                f: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                out: pl.Tensor[[64], pl.FP32] = self.chip_add(a, b, f)
+                return out
+
+            @pl.function(level=pl.Level.CHIP, role=pl.Role.Orchestrator)
+            def chip_orch_sub(
+                self,
+                a: pl.Tensor[[64], pl.FP32],
+                b: pl.Tensor[[64], pl.FP32],
+                f: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                out: pl.Tensor[[64], pl.FP32] = self.chip_sub(a, b, f)
+                return out
+
             @pl.function(level=pl.Level.HOST, role=pl.Role.Worker)
             def reduce_sum(
                 self,
@@ -310,8 +365,8 @@ class TestDistributedCodegen:
             ) -> pl.Tensor[[64], pl.FP32]:
                 sum_ab: pl.Tensor[[64], pl.FP32] = pl.create_tensor([64], dtype=pl.FP32)
                 diff_ab: pl.Tensor[[64], pl.FP32] = pl.create_tensor([64], dtype=pl.FP32)
-                out_sum: pl.Tensor[[64], pl.FP32] = self.chip_add(a, b, sum_ab)
-                out_diff: pl.Tensor[[64], pl.FP32] = self.chip_sub(a, b, diff_ab)
+                out_sum: pl.Tensor[[64], pl.FP32] = self.chip_orch_add(a, b, sum_ab)
+                out_diff: pl.Tensor[[64], pl.FP32] = self.chip_orch_sub(a, b, diff_ab)
                 out_f: pl.Tensor[[64], pl.FP32] = self.reduce_sum(out_sum, out_diff, f)
                 return out_f
 

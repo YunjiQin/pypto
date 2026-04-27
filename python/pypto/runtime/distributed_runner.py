@@ -90,7 +90,6 @@ def execute_distributed(  # noqa: PLR0912
         ChipCallConfig,
     )
     from simpler.worker import (  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
-        Task,
         Worker,
     )
 
@@ -177,7 +176,7 @@ def execute_distributed(  # noqa: PLR0912
     # 7. Build the orchestration closure and execute
     _keep: list[Any] = []
 
-    def orch_fn(orch, _unused_args):
+    def orch_fn(orch, _unused_args, _unused_cfg):
         entry_fn(
             orch,
             _unused_args,
@@ -193,6 +192,6 @@ def execute_distributed(  # noqa: PLR0912
     chip_config.aicpu_thread_num = dc.aicpu_thread_num
 
     try:
-        w.run(Task(orch=orch_fn))
+        w.run(orch_fn)
     finally:
         w.close()

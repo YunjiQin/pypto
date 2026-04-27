@@ -119,7 +119,7 @@ def test_function_type_python_print():
 
     func_orch = f.get_result()
     printed_orch = func_orch.as_python("pl")
-    assert "@pl.function(type=pl.FunctionType.Orchestration)" in printed_orch
+    assert "@pl.function(type=pl.FunctionType.Orchestration" in printed_orch
 
     # InCore function should print type parameter
     with ib.function("kernel", span=span, type=ir.FunctionType.InCore) as f:
@@ -129,7 +129,7 @@ def test_function_type_python_print():
 
     func_incore = f.get_result()
     printed_incore = func_incore.as_python("pl")
-    assert "@pl.function(type=pl.FunctionType.InCore)" in printed_incore
+    assert "@pl.function(type=pl.FunctionType.InCore" in printed_incore
 
     # AIC function should print type parameter
     with ib.function("aic_kernel", span=span, type=ir.FunctionType.AIC) as f:
@@ -139,7 +139,7 @@ def test_function_type_python_print():
 
     func_aic = f.get_result()
     printed_aic = func_aic.as_python("pl")
-    assert "@pl.function(type=pl.FunctionType.AIC)" in printed_aic
+    assert "@pl.function(type=pl.FunctionType.AIC" in printed_aic
 
     # AIV function should print type parameter
     with ib.function("aiv_kernel", span=span, type=ir.FunctionType.AIV) as f:
@@ -149,7 +149,7 @@ def test_function_type_python_print():
 
     func_aiv = f.get_result()
     printed_aiv = func_aiv.as_python("pl")
-    assert "@pl.function(type=pl.FunctionType.AIV)" in printed_aiv
+    assert "@pl.function(type=pl.FunctionType.AIV" in printed_aiv
 
     # Group function should print type parameter
     with ib.function("group_func", span=span, type=ir.FunctionType.Group) as f:
@@ -159,7 +159,7 @@ def test_function_type_python_print():
 
     func_group = f.get_result()
     printed_group = func_group.as_python("pl")
-    assert "@pl.function(type=pl.FunctionType.Group)" in printed_group
+    assert "@pl.function(type=pl.FunctionType.Group" in printed_group
 
     # Spmd function should print type parameter
     with ib.function("spmd_func", span=span, type=ir.FunctionType.Spmd) as f:
@@ -169,7 +169,7 @@ def test_function_type_python_print():
 
     func_spmd = f.get_result()
     printed_spmd = func_spmd.as_python("pl")
-    assert "@pl.function(type=pl.FunctionType.Spmd)" in printed_spmd
+    assert "@pl.function(type=pl.FunctionType.Spmd" in printed_spmd
 
 
 def test_function_type_decorator_parsing():

@@ -86,20 +86,25 @@ class L3DependencyInlineProgram:
         self,
         a: pl.Tensor[[128, 128], pl.FP32],
         b: pl.Tensor[[128, 128], pl.FP32],
-        f: pl.Out[pl.Tensor[[128, 128], pl.FP32]],
+        sum_buf: pl.Out[pl.Tensor[[128, 128], pl.FP32]],
+        sub_buf: pl.Out[pl.Tensor[[128, 128], pl.FP32]],
     ) -> pl.Tensor[[128, 128], pl.FP32]:
         with pl.at(level=pl.Level.CHIP, role=pl.Role.Orchestrator):
             with pl.at(level=pl.Level.CORE_GROUP):
                 out = pl.add(a, b)
-                out_f = pl.assemble(f, out, [0, 0])
+                out_sum = pl.assemble(sum_buf, out, [0, 0])
+        with pl.at(level=pl.Level.CHIP, role=pl.Role.Orchestrator):
+            with pl.at(level=pl.Level.CORE_GROUP):
+                out = pl.sub(a, b)
+                pl.assemble(sub_buf, out, [0, 0])
         with pl.at(level=pl.Level.HOST, role=pl.Role.Worker):
             expected = torch.full((128, 128), 5.0, dtype=torch.float32)
-            if not torch.allclose(out_f, expected, rtol=1e-5, atol=1e-5):
+            if not torch.allclose(out_sum, expected, rtol=1e-5, atol=1e-5):
                 raise AssertionError(
                     f"SubWorker verify failed: expected 5.0, "
-                    f"got max={out_f.max().item()}, min={out_f.min().item()}"
+                    f"got max={out_sum.max().item()}, min={out_sum.min().item()}"
                 )
-        return out_f
+        return out_sum
 
 
 class TestL3Dependency:
@@ -111,7 +116,7 @@ class TestL3Dependency:
             L3DependencyProgram,
             platform=test_config.platform,
             distributed_config=DistributedConfig(
-                device_ids=[7],
+                device_ids=[9],
                 num_sub_workers=1,
                 block_dim=3,
                 aicpu_thread_num=4,
@@ -131,12 +136,12 @@ class TestL3Dependency:
         )
 
     def test_execute_inline(self, test_config):
-        """End-to-end: all levels inlined via pl.at(), verify f = a + b."""
+        """End-to-end: all levels inlined via pl.at(), verify sum = a + b."""
         compiled = ir.compile(
             L3DependencyInlineProgram,
             platform=test_config.platform,
             distributed_config=DistributedConfig(
-                device_ids=[7],
+                device_ids=[9, 10],
                 num_sub_workers=1,
                 block_dim=3,
                 aicpu_thread_num=4,
@@ -145,14 +150,20 @@ class TestL3Dependency:
 
         a = torch.full((128, 128), 2.0, dtype=torch.float32)
         b = torch.full((128, 128), 3.0, dtype=torch.float32)
-        f = torch.zeros((128, 128), dtype=torch.float32)
+        sum_buf = torch.zeros((128, 128), dtype=torch.float32)
+        sub_buf = torch.zeros((128, 128), dtype=torch.float32)
 
-        compiled(a, b, f)
+        compiled(a, b, sum_buf, sub_buf)
 
-        expected = torch.full((128, 128), 5.0, dtype=torch.float32)
-        assert torch.allclose(f, expected, rtol=1e-5, atol=1e-5), (
-            f"L3 inline dependency test failed: expected f = a + b = 5.0, "
-            f"got max diff = {(f - expected).abs().max().item()}"
+        expected_sum = torch.full((128, 128), 5.0, dtype=torch.float32)
+        expected_sub = torch.full((128, 128), -1.0, dtype=torch.float32)
+        assert torch.allclose(sum_buf, expected_sum, rtol=1e-5, atol=1e-5), (
+            f"L3 inline dependency test failed: expected sum = a + b = 5.0, "
+            f"got max diff = {(sum_buf - expected_sum).abs().max().item()}"
+        )
+        assert torch.allclose(sub_buf, expected_sub, rtol=1e-5, atol=1e-5), (
+            f"L3 inline dependency test failed: expected sub = a - b = -1.0, "
+            f"got max diff = {(sub_buf - expected_sub).abs().max().item()}"
         )
 
 

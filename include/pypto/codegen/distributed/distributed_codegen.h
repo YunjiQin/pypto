@@ -87,6 +87,13 @@ class DistributedCodegen : public CodegenBase {
 
   // Call-site lowering
   void EmitCallToWorker(const ir::CallPtr& call, const ir::FunctionPtr& callee);
+  /**
+   * @brief Emit a same-level worker / next-level orchestrator call if @p expr
+   *        is one. Returns true if it emitted; false if @p expr is not a
+   *        hierarchy call (caller should fall back to standard lowering).
+   *        Triggers UNREACHABLE if the call targets an invalid level/role.
+   */
+  bool TryEmitHierarchyCall(const ir::ExprPtr& expr);
   void EmitDistIntrinsic(const ir::CallPtr& call);
   void EmitTreeReduce(const ir::CallPtr& call);
   void EmitTensorCreate(const ir::CallPtr& call);
@@ -111,6 +118,7 @@ class DistributedCodegen : public CodegenBase {
   std::set<int> used_levels_;
 
   // Per-function state
+  ir::FunctionPtr current_func_;
   std::string current_target_var_;
   std::string current_expr_value_;
   std::set<std::string> declared_vars_;
