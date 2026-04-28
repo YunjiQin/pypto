@@ -646,7 +646,7 @@ def function(
         func: Python function decorated with @pl.function
         type: Function type (Opaque, Orchestration, or InCore)
         level: Hierarchy level (e.g. pl.Level.HOST)
-        role: Function role (e.g. pl.Role.Worker)
+        role: Function role (e.g. pl.Role.SubWorker)
         attrs: Function-level attributes dict (e.g. {"split": pl.SplitMode.UP_DOWN})
         strict_ssa: If True, enforce SSA (single assignment per variable).
                    If False (default), allow variable reassignment (non-SSA mode).
@@ -659,8 +659,8 @@ def function(
         ... def my_func(x: pl.Tensor[[64, 128], pl.FP16]) -> pl.Tensor[[64, 128], pl.FP32]:
         ...     result = pl.create_tensor([64, 128], dtype=pl.FP32)
         ...     return result
-        >>> @pl.function(level=pl.Level.HOST, role=pl.Role.Worker)
-        ... def worker(x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+        >>> @pl.function(level=pl.Level.HOST, role=pl.Role.SubWorker)
+        ... def sub_worker(x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
         ...     return x
     """
 
@@ -934,12 +934,12 @@ def program(cls: type | None = None, *, strict_ssa: bool = False) -> ir.Program 
                 func_level, func_role = _extract_function_level_role_from_decorator(func_def)
                 func_attrs = _extract_function_attrs_from_decorator(func_def)
 
-                # HOST Worker functions (SubWorkers) may have pure Python body —
+                # HOST SubWorker functions may have pure Python body —
                 # try DSL parsing first, fall back to empty body on failure
                 is_sub_worker = (
                     func_level is not None
                     and ir.level_to_linqu_level(func_level) >= 3
-                    and func_role == ir.Role.Worker
+                    and func_role == ir.Role.SubWorker
                 )
 
                 # Strip 'self' parameter if present (must be done before parsing)
@@ -1043,14 +1043,14 @@ def program(cls: type | None = None, *, strict_ssa: bool = False) -> ir.Program 
             #    (re-uses linecache / `python -c` fallbacks). Raise on failure
             #    instead of registering an empty body — empty source becomes a
             #    much harder-to-diagnose codegen failure later.
-            # 2. with pl.at(level>=HOST, role=Worker) — captured by parser
+            # 2. with pl.at(level>=HOST, role=SubWorker) — captured by parser
             sub_workers: dict[str, str] = {}
             for func_def in func_defs:
                 func_level, func_role = _extract_function_level_role_from_decorator(func_def)
                 if (
                     func_level is not None
                     and ir.level_to_linqu_level(func_level) >= 3
-                    and func_role == ir.Role.Worker
+                    and func_role == ir.Role.SubWorker
                 ):
                     original_method = getattr(c, func_def.name, None)
                     if original_method is not None:

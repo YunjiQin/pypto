@@ -1155,7 +1155,8 @@ void BindIR(nb::module_& m) {
   // Role enum — function role at L3-L7 hierarchy levels
   nb::enum_<Role>(ir, "Role", "Function role at L3-L7 hierarchy levels")
       .value("Orchestrator", Role::Orchestrator, "Builds DAG, submits tasks")
-      .value("Worker", Role::Worker, "Executes compute/data tasks")
+      .value("SubWorker", Role::SubWorker,
+             "Executes compute/data tasks dispatched by the orchestrator at the same level")
       .export_values();
 
   // ParamDirection enum

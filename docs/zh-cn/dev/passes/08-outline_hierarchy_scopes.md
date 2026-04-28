@@ -93,7 +93,7 @@ program_outlined = outline_pass(program)
 
 示例：
 
-- `pl.at(level=pl.Level.HOST, role=pl.Role.Worker)` → `main_host_worker_0`
+- `pl.at(level=pl.Level.HOST, role=pl.Role.SubWorker)` → `main_host_sub_worker_0`
 - `pl.at(level=pl.Level.GLOBAL, role=pl.Role.Orchestrator)` → `main_global_orch_0`
 - `pl.at(level=pl.Level.CHIP)` → `main_chip_0`
 
@@ -109,7 +109,7 @@ program_outlined = outline_pass(program)
 class Before:
     @pl.function  # Opaque function
     def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
-        with pl.at(level=pl.Level.HOST, role=pl.Role.Worker):
+        with pl.at(level=pl.Level.HOST, role=pl.Role.SubWorker):
             y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
         return y
 ```
@@ -119,21 +119,21 @@ class Before:
 ```python
 @pl.program
 class After:
-    @pl.function(level=pl.Level.HOST, role=pl.Role.Worker)
-    def main_host_worker_0(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+    @pl.function(level=pl.Level.HOST, role=pl.Role.SubWorker)
+    def main_host_sub_worker_0(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
         y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
         return y
 
     @pl.function  # Opaque（保持不变 —— 父函数类型不被提升）
     def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
-        y: pl.Tensor[[64], pl.FP32] = self.main_host_worker_0(x)
+        y: pl.Tensor[[64], pl.FP32] = self.main_host_sub_worker_0(x)
         return y
 ```
 
 ## 嵌套层级示例
 
 嵌套的 Hierarchy 作用域会被递归提取。内层作用域先被提取并替换为对应的 Call，
-然后才处理外层，从而生成形如 `main_global_orch_0_host_worker_0` 的链式名称。
+然后才处理外层，从而生成形如 `main_global_orch_0_host_sub_worker_0` 的链式名称。
 
 **之前**：
 
@@ -144,7 +144,7 @@ class Before:
     def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
         with pl.at(level=pl.Level.GLOBAL, role=pl.Role.Orchestrator):
             y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
-            with pl.at(level=pl.Level.HOST, role=pl.Role.Worker):
+            with pl.at(level=pl.Level.HOST, role=pl.Role.SubWorker):
                 z: pl.Tensor[[64], pl.FP32] = pl.mul(y, y)
         return z
 ```
@@ -154,8 +154,8 @@ class Before:
 ```python
 @pl.program
 class After:
-    @pl.function(level=pl.Level.HOST, role=pl.Role.Worker)
-    def main_global_orch_0_host_worker_0(
+    @pl.function(level=pl.Level.HOST, role=pl.Role.SubWorker)
+    def main_global_orch_0_host_sub_worker_0(
         self, y: pl.Tensor[[64], pl.FP32]
     ) -> pl.Tensor[[64], pl.FP32]:
         z: pl.Tensor[[64], pl.FP32] = pl.mul(y, y)
@@ -164,7 +164,7 @@ class After:
     @pl.function(level=pl.Level.GLOBAL, role=pl.Role.Orchestrator)
     def main_global_orch_0(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
         y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
-        z: pl.Tensor[[64], pl.FP32] = self.main_global_orch_0_host_worker_0(y)
+        z: pl.Tensor[[64], pl.FP32] = self.main_global_orch_0_host_sub_worker_0(y)
         return z
 
     @pl.function

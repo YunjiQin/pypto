@@ -1734,10 +1734,20 @@ Pass ConvertTensorToTileOps() {
       }
     }
 
-    // Phase 3: Propagate Out/InOut param directions from callees to callers.
-    // After Phase 1 marks InCore params as Out/InOut, callers that pass their
-    // own parameters through must inherit the direction.  Fixed-point iteration
-    // handles multi-level call chains (host_orch → chip_orch → incore).
+    // Phase 3: Propagate Function::param_directions_ along the call chain.
+    //
+    // When the user writes inline `pl.at(...)` blocks, OutlineHierarchyScopes
+    // extracts them into a host_orch → chip_orch → incore chain. The outlined
+    // chip_orch has no direction info on its own parameters yet. Phase 1 has
+    // already marked the InCore's tile-written params as Out/InOut; if
+    // chip_orch(a, b, f) forwards its own `f` to that InCore, chip_orch's
+    // own `f` must be upgraded to Out so the signature matches the data flow.
+    //
+    // This phase mutates Function::param_directions_ (function signature)
+    // only. Per-call-site arg directions (Call::attrs_["arg_directions"]) are
+    // owned by the later DeriveCallDirections pass and are not touched here.
+    //
+    // Fixed-point iteration handles multi-level chains.
     {
       std::unordered_map<std::string, FunctionPtr> func_map;
       for (const auto& func : functions_phase2b) {

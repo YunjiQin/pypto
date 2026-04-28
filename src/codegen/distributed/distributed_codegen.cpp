@@ -122,9 +122,9 @@ std::vector<ir::FunctionPtr> DistributedCodegen::SortFunctionsByRoleAndLevel() c
   }
 
   std::sort(funcs.begin(), funcs.end(), [](const ir::FunctionPtr& a, const ir::FunctionPtr& b) {
-    bool a_worker = a->role_.has_value() && *a->role_ == ir::Role::Worker;
-    bool b_worker = b->role_.has_value() && *b->role_ == ir::Role::Worker;
-    if (a_worker != b_worker) return a_worker;
+    bool a_sub_worker = a->role_.has_value() && *a->role_ == ir::Role::SubWorker;
+    bool b_sub_worker = b->role_.has_value() && *b->role_ == ir::Role::SubWorker;
+    if (a_sub_worker != b_sub_worker) return a_sub_worker;
 
     int a_level = a->level_.has_value() ? ir::LevelToLinquLevel(*a->level_) : 0;
     int b_level = b->level_.has_value() ? ir::LevelToLinquLevel(*b->level_) : 0;
@@ -151,13 +151,13 @@ void DistributedCodegen::EmitFunction(const ir::FunctionPtr& func) {
   task_args_counter_ = 0;
   current_func_ = func;
 
-  bool is_worker = func->role_.has_value() && *func->role_ == ir::Role::Worker;
-  is_worker_context_ = is_worker;
+  bool is_sub_worker = func->role_.has_value() && *func->role_ == ir::Role::SubWorker;
+  is_worker_context_ = is_sub_worker;
 
   // Build function signature
   // Orchestrators: def func(orch, _args, config, *, tensors, callables, sub_ids, _keep):
-  // Workers are not emitted as Python functions (they run on device or as registered callables)
-  if (is_worker) {
+  // SubWorkers are not emitted as Python functions (they run on device or as registered callables)
+  if (is_sub_worker) {
     is_worker_context_ = false;
     return;
   }
@@ -229,17 +229,17 @@ bool DistributedCodegen::TryEmitHierarchyCall(const ir::ExprPtr& expr) {
   const ir::Level current_level =
       current_func_->level_.value();  // NOLINT(bugprone-unchecked-optional-access)
 
-  const bool same_level_worker = callee_role == ir::Role::Worker && callee_level == current_level;
+  const bool same_level_sub_worker = callee_role == ir::Role::SubWorker && callee_level == current_level;
   const bool next_level_orch = callee_role == ir::Role::Orchestrator &&
                                static_cast<int>(callee_level) == static_cast<int>(current_level) - 1;
 
-  if (same_level_worker || next_level_orch) {
+  if (same_level_sub_worker || next_level_orch) {
     EmitCallToWorker(call, callee);
     return true;
   }
 
   UNREACHABLE << ir::LevelToString(current_level) << "Level Orch func '" << current_func_->name_
-              << "' can only call same level worker or next level Orch, but call to func '" << gv->name_
+              << "' can only call same level sub-worker or next level Orch, but call to func '" << gv->name_
               << "' has level = '" << ir::LevelToString(callee_level) << "', role = '"
               << ir::RoleToString(callee_role) << "'.";
   return false;  // unreachable
@@ -365,7 +365,7 @@ void DistributedCodegen::VisitExpr_(const ir::CallPtr& op) {
   if (auto gv = std::dynamic_pointer_cast<const ir::GlobalVar>(op->op_)) {
     auto callee = program_->GetFunction(gv->name_);
     if (callee) {
-      if (callee->role_.has_value() && *callee->role_ == ir::Role::Worker) {
+      if (callee->role_.has_value() && *callee->role_ == ir::Role::SubWorker) {
         EmitCallToWorker(op, callee);
         return;
       }
@@ -602,13 +602,14 @@ std::string DistributedCodegen::DataTypeToPythonDType(const DataType& dtype) {
 // ========================================================================
 
 bool DistributedCodegen::IsSubWorker(const ir::FunctionPtr& func) const {
-  // A SubWorker is specifically a HOST-or-above Worker (runs as Python
-  // callable in fork). HOST-or-above Orchestrators are dispatched via
-  // ``callables[...]`` not ``sub_ids[...]``, so they must NOT be classified
-  // as SubWorker. CHIP-level functions and functions without level metadata
-  // run via ChipCallable → submit_next_level.
+  // A SubWorker callable is specifically a HOST-or-above SubWorker role
+  // (runs as Python callable in fork). HOST-or-above Orchestrators are
+  // dispatched via ``callables[...]`` not ``sub_ids[...]``, so they must
+  // NOT be classified as SubWorker callables. CHIP-level functions and
+  // functions without level metadata run via ChipCallable →
+  // submit_next_level.
   if (!func->level_.has_value() || !func->role_.has_value()) return false;
-  if (*func->role_ != ir::Role::Worker) return false;
+  if (*func->role_ != ir::Role::SubWorker) return false;
   return ir::LevelToLinquLevel(*func->level_) >= 3;
 }
 

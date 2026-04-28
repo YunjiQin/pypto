@@ -47,7 +47,7 @@ def test_parse_pl_at_host_worker():
 
     @pl.function
     def f(x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
-        with pl.at(level=pl.Level.HOST, role=pl.Role.Worker):
+        with pl.at(level=pl.Level.HOST, role=pl.Role.SubWorker):
             _ = x
         return x
 
@@ -56,7 +56,7 @@ def test_parse_pl_at_host_worker():
     assert scope.scope_kind == ir.ScopeKind.Hierarchy
     hierarchy_scope = cast(_HasLevelRole, scope)
     assert hierarchy_scope.level == ir.Level.HOST
-    assert hierarchy_scope.role == ir.Role.Worker
+    assert hierarchy_scope.role == ir.Role.SubWorker
 
 
 def test_parse_pl_at_global_orchestrator():
@@ -119,7 +119,7 @@ def test_parse_pl_at_nested():
     @pl.function
     def f(x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
         with pl.at(level=pl.Level.GLOBAL, role=pl.Role.Orchestrator):
-            with pl.at(level=pl.Level.HOST, role=pl.Role.Worker):
+            with pl.at(level=pl.Level.HOST, role=pl.Role.SubWorker):
                 _ = x
         return x
 
@@ -134,7 +134,7 @@ def test_parse_pl_at_nested():
     assert inner.scope_kind == ir.ScopeKind.Hierarchy
     inner_scope = cast(_HasLevelRole, inner)
     assert inner_scope.level == ir.Level.HOST
-    assert inner_scope.role == ir.Role.Worker
+    assert inner_scope.role == ir.Role.SubWorker
 
 
 # ─── Error cases ──────────────────────────────────────────────────────────
@@ -146,7 +146,7 @@ def test_parse_pl_at_missing_level():
 
         @pl.function
         def f(x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
-            with pl.at(role=pl.Role.Worker):
+            with pl.at(role=pl.Role.SubWorker):
                 y = pl.add(x, x)
             return y
 
@@ -202,14 +202,14 @@ def test_printer_hierarchy_scope_roundtrip():
 
     @pl.function
     def f(x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
-        with pl.at(level=pl.Level.HOST, role=pl.Role.Worker):
+        with pl.at(level=pl.Level.HOST, role=pl.Role.SubWorker):
             _ = x
         return x
 
     printed = str(f)
     assert "pl.at(" in printed
     assert "Level.HOST" in printed
-    assert "Role.Worker" in printed
+    assert "Role.SubWorker" in printed
 
 
 # ─── New pl.at() InCore / AutoInCore forms ───────────────────────────────────
@@ -345,7 +345,7 @@ def test_parse_pl_at_role_with_core_group_errors():
 
         @pl.function
         def f(x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
-            with pl.at(level=pl.Level.CORE_GROUP, role=pl.Role.Worker):
+            with pl.at(level=pl.Level.CORE_GROUP, role=pl.Role.SubWorker):
                 y = pl.add(x, x)
             return y
 

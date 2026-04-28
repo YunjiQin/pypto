@@ -721,7 +721,7 @@ using WhileStmtPtr = std::shared_ptr<const WhileStmt>;
  *     body
  * with pl.cluster():   # Cluster scope -> ClusterScopeStmt
  *     body
- * with pl.at(level=pl.Level.HOST, role=pl.Role.Worker):  # -> HierarchyScopeStmt
+ * with pl.at(level=pl.Level.HOST, role=pl.Role.SubWorker):  # -> HierarchyScopeStmt
  *     body
  * with pl.spmd(8):           # -> SpmdScopeStmt
  *     body

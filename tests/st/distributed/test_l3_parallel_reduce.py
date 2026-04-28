@@ -80,7 +80,7 @@ class L3ParallelReduceProgram:
         out_f = self.tile_sub(a, b, f)
         return out_f
 
-    @pl.function(level=pl.Level.HOST, role=pl.Role.Worker)
+    @pl.function(level=pl.Level.HOST, role=pl.Role.SubWorker)
     def reduce_sum(
         self,
         sum_ab: pl.Tensor[[128, 128], pl.FP32],

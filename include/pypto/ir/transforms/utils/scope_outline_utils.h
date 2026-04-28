@@ -803,7 +803,7 @@ class ScopeOutliner : public IRMutator {
   /**
    * @brief Generate a naming suffix from hierarchy level and optional role.
    *
-   * Produces lowercase suffixes like "_host_worker_", "_global_orch_", "_chip_".
+   * Produces lowercase suffixes like "_host_sub_worker_", "_global_orch_", "_chip_".
    */
   static std::string GenerateHierarchySuffix(Level level, const std::optional<Role>& role) {
     std::string name = "_";
@@ -843,7 +843,7 @@ class ScopeOutliner : public IRMutator {
         break;
     }
     if (role.has_value()) {
-      name += (role.value() == Role::Orchestrator) ? "_orch" : "_worker";
+      name += (role.value() == Role::Orchestrator) ? "_orch" : "_sub_worker";
     }
     return name + "_";
   }

@@ -19,12 +19,12 @@ from pypto.pypto_core import ir
 def test_function_with_level_and_role():
     """@pl.function(level=HOST, role=Worker) sets both."""
 
-    @pl.function(level=pl.Level.HOST, role=pl.Role.Worker)
+    @pl.function(level=pl.Level.HOST, role=pl.Role.SubWorker)
     def worker(x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
         return x
 
     assert worker.level == ir.Level.HOST
-    assert worker.role == ir.Role.Worker
+    assert worker.role == ir.Role.SubWorker
 
 
 def test_function_with_level_only():
@@ -41,12 +41,12 @@ def test_function_with_level_only():
 def test_function_with_role_only():
     """@pl.function(role=Worker) sets role without level."""
 
-    @pl.function(role=pl.Role.Worker)
+    @pl.function(role=pl.Role.SubWorker)
     def worker(x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
         return x
 
     assert worker.level is None
-    assert worker.role == ir.Role.Worker
+    assert worker.role == ir.Role.SubWorker
 
 
 def test_function_with_type_and_level():
@@ -85,7 +85,7 @@ def test_function_backward_compat_type_only():
     assert f.func_type == ir.FunctionType.InCore
     # level/role are now auto-derived from func_type
     assert f.level == ir.Level.CHIP_DIE
-    assert f.role == ir.Role.Worker
+    assert f.role == ir.Role.SubWorker
 
 
 # ─── @pl.program integration ──────────────────────────────────────────────
@@ -96,7 +96,7 @@ def test_program_with_level_role():
 
     @pl.program
     class P:
-        @pl.function(level=pl.Level.HOST, role=pl.Role.Worker)
+        @pl.function(level=pl.Level.HOST, role=pl.Role.SubWorker)
         def worker(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
             return x
 
@@ -107,7 +107,7 @@ def test_program_with_level_role():
     worker_fn = P.get_function("worker")
     assert worker_fn is not None
     assert worker_fn.level == ir.Level.HOST
-    assert worker_fn.role == ir.Role.Worker
+    assert worker_fn.role == ir.Role.SubWorker
 
     orch_fn = P.get_function("orch")
     assert orch_fn is not None
@@ -126,7 +126,7 @@ def test_program_mixed_with_and_without_level():
         def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
             return x
 
-        @pl.function(level=pl.Level.HOST, role=pl.Role.Worker)
+        @pl.function(level=pl.Level.HOST, role=pl.Role.SubWorker)
         def worker(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
             return x
 
@@ -138,7 +138,7 @@ def test_program_mixed_with_and_without_level():
     worker_fn = P.get_function("worker")
     assert worker_fn is not None
     assert worker_fn.level == ir.Level.HOST
-    assert worker_fn.role == ir.Role.Worker
+    assert worker_fn.role == ir.Role.SubWorker
 
 
 # ─── Printer output ──────────────────────────────────────────────────────
@@ -147,13 +147,13 @@ def test_program_mixed_with_and_without_level():
 def test_function_level_role_in_printer():
     """Function with level/role prints correctly."""
 
-    @pl.function(level=pl.Level.HOST, role=pl.Role.Worker)
+    @pl.function(level=pl.Level.HOST, role=pl.Role.SubWorker)
     def worker(x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
         return x
 
     printed = str(worker)
     assert "Level.HOST" in printed
-    assert "Role.Worker" in printed
+    assert "Role.SubWorker" in printed
 
 
 if __name__ == "__main__":

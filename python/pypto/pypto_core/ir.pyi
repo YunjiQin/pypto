@@ -748,14 +748,15 @@ class Role(enum.Enum):
     """Function role at L3-L7 hierarchy levels.
 
     Distinguishes orchestrators (which build task DAGs and submit work)
-    from workers (which execute concrete compute or data tasks).
+    from sub-workers (which execute concrete compute or data tasks
+    dispatched by an orchestrator at the same level).
     """
 
     Orchestrator = ...
     """Builds DAG, submits tasks, never computes directly."""
 
-    Worker = ...
-    """Executes compute/data tasks, never submits further tasks."""
+    SubWorker = ...
+    """Executes compute/data tasks dispatched by the orchestrator at the same level."""
 
 class ParamDirection(enum.Enum):
     """Parameter direction classification.

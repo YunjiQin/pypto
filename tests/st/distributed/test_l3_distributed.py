@@ -57,7 +57,7 @@ class L3DependencyProgram:
         out_f = self.tile_add(a, b, f)
         return out_f
 
-    @pl.function(level=pl.Level.HOST, role=pl.Role.Worker)
+    @pl.function(level=pl.Level.HOST, role=pl.Role.SubWorker)
     def verify(self, f: pl.Tensor[[128, 128], pl.FP32]):
         expected = torch.full((128, 128), 5.0, dtype=torch.float32)
         if not torch.allclose(f, expected, rtol=1e-5, atol=1e-5):
@@ -97,7 +97,7 @@ class L3DependencyInlineProgram:
             with pl.at(level=pl.Level.CORE_GROUP):
                 out = pl.sub(a, b)
                 pl.assemble(sub_buf, out, [0, 0])
-        with pl.at(level=pl.Level.HOST, role=pl.Role.Worker):
+        with pl.at(level=pl.Level.HOST, role=pl.Role.SubWorker):
             expected = torch.full((128, 128), 5.0, dtype=torch.float32)
             if not torch.allclose(out_sum, expected, rtol=1e-5, atol=1e-5):
                 raise AssertionError(

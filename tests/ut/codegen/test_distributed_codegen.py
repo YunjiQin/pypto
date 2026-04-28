@@ -17,12 +17,12 @@ from pypto import codegen, passes
 class TestDistributedCodegen:
     """Test distributed Python codegen on outlined hierarchy programs."""
 
-    def test_chip_worker_and_orchestrator(self):
+    def test_chip_sub_worker_and_orchestrator(self):
         """HOST orchestrator calling CHIP orchestrator → CHIP worker produces submit_next_level."""
 
         @pl.program
         class Input:
-            @pl.function(level=pl.Level.CHIP, role=pl.Role.Worker)
+            @pl.function(level=pl.Level.CHIP, role=pl.Role.SubWorker)
             def chip_worker(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
                 y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
                 return y
@@ -59,7 +59,7 @@ class TestDistributedCodegen:
 
         @pl.program
         class Input:
-            @pl.function(level=pl.Level.HOST, role=pl.Role.Worker)
+            @pl.function(level=pl.Level.HOST, role=pl.Role.SubWorker)
             def verify(self, f: pl.Tensor[[64], pl.FP32]):
                 pass
 
@@ -81,7 +81,7 @@ class TestDistributedCodegen:
 
         @pl.program
         class Input:
-            @pl.function(level=pl.Level.CHIP, role=pl.Role.Worker)
+            @pl.function(level=pl.Level.CHIP, role=pl.Role.SubWorker)
             def chip_worker(
                 self,
                 a: pl.Tensor[[64], pl.FP32],
@@ -99,7 +99,7 @@ class TestDistributedCodegen:
                 y: pl.Tensor[[64], pl.FP32] = self.chip_worker(a, b)
                 return y
 
-            @pl.function(level=pl.Level.HOST, role=pl.Role.Worker)
+            @pl.function(level=pl.Level.HOST, role=pl.Role.SubWorker)
             def verify(self, f: pl.Tensor[[64], pl.FP32]):
                 pass
 
@@ -145,7 +145,7 @@ class TestDistributedCodegen:
 
         @pl.program
         class Input:
-            @pl.function(level=pl.Level.HOST, role=pl.Role.Worker)
+            @pl.function(level=pl.Level.HOST, role=pl.Role.SubWorker)
             def simple_worker(self, x: pl.Tensor[[64], pl.FP32]):
                 pass
 
@@ -161,7 +161,7 @@ class TestDistributedCodegen:
 
         @pl.program
         class Input:
-            @pl.function(level=pl.Level.CHIP, role=pl.Role.Worker)
+            @pl.function(level=pl.Level.CHIP, role=pl.Role.SubWorker)
             def chip_worker(
                 self,
                 a: pl.Tensor[[64], pl.FP32],
@@ -203,7 +203,7 @@ class TestDistributedCodegen:
 
         @pl.program
         class Input:
-            @pl.function(level=pl.Level.HOST, role=pl.Role.Worker)
+            @pl.function(level=pl.Level.HOST, role=pl.Role.SubWorker)
             def worker(self, x: pl.Tensor[[64], pl.FP32]):
                 pass
 
@@ -219,7 +219,7 @@ class TestDistributedCodegen:
 
         @pl.program
         class Input:
-            @pl.function(level=pl.Level.HOST, role=pl.Role.Worker)
+            @pl.function(level=pl.Level.HOST, role=pl.Role.SubWorker)
             def verify(self, f: pl.Tensor[[128, 128], pl.FP32]):
                 import torch  # noqa: PLC0415
 
@@ -247,7 +247,7 @@ class TestDistributedCodegen:
 
         @pl.program
         class Input:
-            @pl.function(level=pl.Level.HOST, role=pl.Role.Worker)
+            @pl.function(level=pl.Level.HOST, role=pl.Role.SubWorker)
             def verify(self, f: pl.Tensor[[64], pl.FP32]):
                 pass
 
@@ -265,7 +265,7 @@ class TestDistributedCodegen:
 
         @pl.program
         class Input:
-            @pl.function(level=pl.Level.CHIP, role=pl.Role.Worker)
+            @pl.function(level=pl.Level.CHIP, role=pl.Role.SubWorker)
             def chip_worker(
                 self,
                 a: pl.Tensor[[64], pl.FP32],
@@ -307,7 +307,7 @@ class TestDistributedCodegen:
 
         @pl.program
         class Input:
-            @pl.function(level=pl.Level.CHIP, role=pl.Role.Worker)
+            @pl.function(level=pl.Level.CHIP, role=pl.Role.SubWorker)
             def chip_add(
                 self,
                 a: pl.Tensor[[64], pl.FP32],
@@ -317,7 +317,7 @@ class TestDistributedCodegen:
                 y: pl.Tensor[[64], pl.FP32] = pl.add(a, b)
                 return y
 
-            @pl.function(level=pl.Level.CHIP, role=pl.Role.Worker)
+            @pl.function(level=pl.Level.CHIP, role=pl.Role.SubWorker)
             def chip_sub(
                 self,
                 a: pl.Tensor[[64], pl.FP32],
@@ -347,7 +347,7 @@ class TestDistributedCodegen:
                 out: pl.Tensor[[64], pl.FP32] = self.chip_sub(a, b, f)
                 return out
 
-            @pl.function(level=pl.Level.HOST, role=pl.Role.Worker)
+            @pl.function(level=pl.Level.HOST, role=pl.Role.SubWorker)
             def reduce_sum(
                 self,
                 sum_ab: pl.Tensor[[64], pl.FP32],

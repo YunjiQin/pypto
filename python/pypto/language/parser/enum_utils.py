@@ -39,7 +39,7 @@ LEVEL_MAP: dict[str, ir.Level] = {
 
 ROLE_MAP: dict[str, ir.Role] = {
     "Orchestrator": ir.Role.Orchestrator,
-    "Worker": ir.Role.Worker,
+    "SubWorker": ir.Role.SubWorker,
 }
 
 SPLIT_MODE_MAP: dict[str, ir.SplitMode] = {

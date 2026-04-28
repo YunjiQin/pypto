@@ -221,7 +221,7 @@ _HIERARCHY_LEVEL_SUFFIX: dict["ir.Level", str] = {}
 def _generate_hierarchy_suffix(level: "ir.Level", role: "ir.Role | None") -> str:
     """Mirror of ``GenerateHierarchySuffix`` in ``scope_outline_utils.h``.
 
-    Produces lowercase suffixes like ``_host_worker_`` / ``_global_orch_`` so
+    Produces lowercase suffixes like ``_host_sub_worker_`` / ``_global_orch_`` so
     Python-side scope names match the names the C++ outliner would synthesize
     for the same (level, role) pair.
     """
@@ -242,7 +242,7 @@ def _generate_hierarchy_suffix(level: "ir.Level", role: "ir.Role | None") -> str
         )
     name = "_" + _HIERARCHY_LEVEL_SUFFIX[level]
     if role is not None:
-        name += "_orch" if role == ir.Role.Orchestrator else "_worker"
+        name += "_orch" if role == ir.Role.Orchestrator else "_sub_worker"
     return name + "_"
 
 
@@ -2243,7 +2243,7 @@ class ASTParser:
             raise ParserSyntaxError(
                 "Unsupported **kwargs in pl.at()",
                 span=self.span_tracker.get_span(kw),
-                hint="Use pl.at(level=pl.Level.HOST, role=pl.Role.Worker)",
+                hint="Use pl.at(level=pl.Level.HOST, role=pl.Role.SubWorker)",
             )
         else:
             raise ParserSyntaxError(
@@ -2948,9 +2948,9 @@ class ASTParser:
             )
 
         if not is_core_group:
-            # Check if this is a SubWorker scope (level >= HOST, role = Worker)
+            # Check if this is a SubWorker scope (level >= HOST, role = SubWorker)
             is_sub_worker = (
-                level is not None and ir.level_to_linqu_level(level) >= 3 and role == ir.Role.Worker
+                level is not None and ir.level_to_linqu_level(level) >= 3 and role == ir.Role.SubWorker
             )
             if is_sub_worker:
                 assert role is not None  # guaranteed by is_sub_worker check

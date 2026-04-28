@@ -59,10 +59,10 @@ def test_cluster_scope_construction():
 
 def test_scope_stmt_hierarchy_with_level_and_role():
     """HierarchyScopeStmt carries level and role."""
-    s = ir.HierarchyScopeStmt(level=ir.Level.HOST, role=ir.Role.Worker, body=_empty_body(), span=_span())
+    s = ir.HierarchyScopeStmt(level=ir.Level.HOST, role=ir.Role.SubWorker, body=_empty_body(), span=_span())
     assert s.scope_kind == ir.ScopeKind.Hierarchy
     assert s.level == ir.Level.HOST
-    assert s.role == ir.Role.Worker
+    assert s.role == ir.Role.SubWorker
 
 
 def test_scope_stmt_hierarchy_orchestrator():
@@ -92,20 +92,22 @@ def test_scope_stmt_hierarchy_global():
 
 
 def test_structural_equal_hierarchy_scope():
-    s1 = ir.HierarchyScopeStmt(level=ir.Level.HOST, role=ir.Role.Worker, body=_empty_body(), span=_span())
-    s2 = ir.HierarchyScopeStmt(level=ir.Level.HOST, role=ir.Role.Worker, body=_empty_body(), span=_span())
+    s1 = ir.HierarchyScopeStmt(level=ir.Level.HOST, role=ir.Role.SubWorker, body=_empty_body(), span=_span())
+    s2 = ir.HierarchyScopeStmt(level=ir.Level.HOST, role=ir.Role.SubWorker, body=_empty_body(), span=_span())
     ir.assert_structural_equal(s1, s2)
 
 
 def test_structural_equal_different_level():
-    s1 = ir.HierarchyScopeStmt(level=ir.Level.HOST, role=ir.Role.Worker, body=_empty_body(), span=_span())
-    s2 = ir.HierarchyScopeStmt(level=ir.Level.GLOBAL, role=ir.Role.Worker, body=_empty_body(), span=_span())
+    s1 = ir.HierarchyScopeStmt(level=ir.Level.HOST, role=ir.Role.SubWorker, body=_empty_body(), span=_span())
+    s2 = ir.HierarchyScopeStmt(
+        level=ir.Level.GLOBAL, role=ir.Role.SubWorker, body=_empty_body(), span=_span()
+    )
     with pytest.raises(ValueError):
         ir.assert_structural_equal(s1, s2)
 
 
 def test_structural_equal_different_role():
-    s1 = ir.HierarchyScopeStmt(level=ir.Level.HOST, role=ir.Role.Worker, body=_empty_body(), span=_span())
+    s1 = ir.HierarchyScopeStmt(level=ir.Level.HOST, role=ir.Role.SubWorker, body=_empty_body(), span=_span())
     s2 = ir.HierarchyScopeStmt(
         level=ir.Level.HOST, role=ir.Role.Orchestrator, body=_empty_body(), span=_span()
     )
@@ -126,12 +128,12 @@ def test_structural_equal_different_kinds():
 
 def test_printer_hierarchy_scope():
     body = _empty_body()
-    scope = ir.HierarchyScopeStmt(level=ir.Level.HOST, role=ir.Role.Worker, body=body, span=_span())
+    scope = ir.HierarchyScopeStmt(level=ir.Level.HOST, role=ir.Role.SubWorker, body=body, span=_span())
     func = ir.Function("test_fn", [], [], scope, _span())
     printed = str(func)
     assert "pl.at(" in printed
     assert "Level.HOST" in printed
-    assert "Role.Worker" in printed
+    assert "Role.SubWorker" in printed
 
 
 def test_printer_incore_scope_unchanged():

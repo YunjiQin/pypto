@@ -259,8 +259,8 @@ auto = ir.AutoInCoreScopeStmt(name_hint="", body=body, span=span)
 # with pl.cluster():
 cluster = ir.ClusterScopeStmt(name_hint="", body=body, span=span)
 
-# with pl.at(level=Level.HOST, role=Role.Worker):
-hier = ir.HierarchyScopeStmt(level=ir.Level.HOST, role=ir.Role.Worker,
+# with pl.at(level=Level.HOST, role=Role.SubWorker):
+hier = ir.HierarchyScopeStmt(level=ir.Level.HOST, role=ir.Role.SubWorker,
                              name_hint="", body=body, span=span)
 
 # with pl.spmd(8):
