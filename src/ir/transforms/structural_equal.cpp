@@ -342,8 +342,8 @@ class StructuralEqualImpl {
     if (lhs != rhs) {
       if constexpr (AssertMode) {
         std::ostringstream msg;
-        msg << "InlineLanguage mismatch (" << static_cast<uint8_t>(lhs) << " != " << static_cast<uint8_t>(rhs)
-            << ")";
+        msg << "InlineLanguage mismatch (" << static_cast<unsigned int>(lhs)
+            << " != " << static_cast<unsigned int>(rhs) << ")";
         ThrowMismatch(msg.str(), IRNodePtr(), IRNodePtr(), "", "");
       }
       return false;
