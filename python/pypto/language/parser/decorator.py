@@ -27,6 +27,26 @@ from .diagnostics import ParserError, ParserSyntaxError, concise_error_message
 from .enum_utils import FUNCTION_TYPE_MAP, LEVEL_MAP, ROLE_MAP, SPLIT_MODE_MAP, extract_enum_value
 
 
+def _capture_subworker_source(func_def: ast.FunctionDef) -> str:
+    """Return the SubWorker function *body* as plain Python source text.
+
+    Body statements are unparsed (no ``def`` header, no decorators) so the IR
+    ``Function`` keeps the signature and the attached ``InlineStmt`` carries
+    only the body.
+
+    Raises:
+        ParserSyntaxError: if the SubWorker declares a ``self`` parameter —
+            SubWorkers must be self-contained inside ``@pl.program``.
+    """
+    if func_def.args.args and func_def.args.args[0].arg == "self":
+        raise ParserSyntaxError(
+            f"SubWorker function '{func_def.name}' must not declare 'self'; "
+            "declare it as a self-contained function inside @pl.program.",
+            hint="Remove the 'self' parameter from the SubWorker definition.",
+        )
+    return "\n".join(ast.unparse(stmt) for stmt in func_def.body)
+
+
 @dataclasses.dataclass
 class InlineFunction:
     """Stores AST and metadata for a function to be inlined at call sites."""
@@ -384,29 +404,26 @@ def _prescan_reserve_buffers(
 def _is_class_method(func: Callable) -> bool:
     """Check if a function is a method inside a class (not a standalone function).
 
-    This performs strict validation to determine if a function with 'self' as the first
-    parameter is actually defined inside a class, rather than a standalone function that
-    just happens to have 'self' as a parameter name.
+    Recognizes both classic methods (first parameter ``self``) and self-contained
+    functions defined inside a class (no ``self`` parameter, e.g. SubWorker
+    functions declared inside ``@pl.program``). The check uses ``__qualname__``
+    plus indentation so it does not misclassify standalone functions whose first
+    parameter happens to be named ``self``.
 
     Args:
         func: Function to check
 
     Returns:
-        True if the function is a method inside a class
+        True if the function is defined inside a class
     """
-    # Check if first parameter is 'self'
-    try:
-        sig = inspect.signature(func)
-        params = list(sig.parameters.keys())
-        if not (params and params[0] == "self"):
-            return False
-    except (ValueError, TypeError):
+    qualname = getattr(func, "__qualname__", "")
+    if "." not in qualname:
         return False
 
-    # Check if __qualname__ indicates this is a method (contains a dot)
-    qualname = func.__qualname__
-    if "." not in qualname:
-        # No dot in qualname means it's a standalone function, not a method
+    # Nested-function qualnames look like "outer.<locals>.inner" — those are not
+    # class methods.
+    parent = qualname.rsplit(".", 1)[0]
+    if parent.endswith("<locals>"):
         return False
 
     # Verify it has indentation (defined inside a class, not at module level)
@@ -414,11 +431,9 @@ def _is_class_method(func: Callable) -> bool:
         source_lines_raw, _ = inspect.getsourcelines(func)
         col_offset = _calculate_col_offset(source_lines_raw)
         if col_offset > 0:
-            # This is an indented method inside a class
             return True
     except (OSError, TypeError):
-        # If we can't get source lines, assume it's a method based on qualname
-        # (This can happen with dynamically generated code)
+        # If we can't get source lines, trust qualname.
         return True
 
     return False
@@ -615,7 +630,7 @@ def function(
         func: Python function decorated with @pl.function
         type: Function type (Opaque, Orchestration, or InCore)
         level: Hierarchy level (e.g. pl.Level.HOST)
-        role: Function role (e.g. pl.Role.Worker)
+        role: Function role (e.g. pl.Role.SubWorker)
         attrs: Function-level attributes dict (e.g. {"split": pl.SplitMode.UP_DOWN})
         strict_ssa: If True, enforce SSA (single assignment per variable).
                    If False (default), allow variable reassignment (non-SSA mode).
@@ -628,8 +643,8 @@ def function(
         ... def my_func(x: pl.Tensor[[64, 128], pl.FP16]) -> pl.Tensor[[64, 128], pl.FP32]:
         ...     result = pl.create_tensor([64, 128], dtype=pl.FP32)
         ...     return result
-        >>> @pl.function(level=pl.Level.HOST, role=pl.Role.Worker)
-        ... def worker(x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+        >>> @pl.function(level=pl.Level.HOST, role=pl.Role.SubWorker)
+        ... def sub_worker(x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
         ...     return x
     """
 
@@ -819,7 +834,7 @@ def program(cls: type | None = None, *, strict_ssa: bool = False) -> ir.Program 
         with prof.stage("parse"):
             return _parse_program_body(c, strict_ssa, closure_vars)
 
-    def _parse_program_body(
+    def _parse_program_body(  # noqa: PLR0912
         c: type,
         strict_ssa: bool,
         closure_vars: dict[str, Any],
@@ -901,8 +916,21 @@ def program(cls: type | None = None, *, strict_ssa: bool = False) -> ir.Program 
                 func_level, func_role = _extract_function_level_role_from_decorator(func_def)
                 func_attrs = _extract_function_attrs_from_decorator(func_def)
 
-                # Strip 'self' parameter if present (must be done before parsing)
-                func_def_to_parse = _strip_self_parameter(func_def)
+                # HOST SubWorkers carry their pure-Python body inline in the IR
+                # via an InlineStmt — no DSL parsing, no implicit `self` stripping
+                # (`_capture_subworker_source` rejects `self` with a clear error).
+                is_sub_worker = (
+                    func_level is not None
+                    and ir.level_to_linqu_level(func_level) >= 3
+                    and func_role == ir.Role.SubWorker
+                )
+
+                if is_sub_worker:
+                    inline_body = _capture_subworker_source(func_def)
+                    func_def_to_parse = func_def
+                else:
+                    inline_body = None
+                    func_def_to_parse = _strip_self_parameter(func_def)
 
                 method_start, method_end = method_boundaries[id(func_def)]
                 method_comments = {
@@ -929,15 +957,16 @@ def program(cls: type | None = None, *, strict_ssa: bool = False) -> ir.Program 
                         func_level=func_level,
                         func_role=func_role,
                         func_attrs=func_attrs or None,
+                        inline_body=inline_body,
                     )
-                except ParserError:
-                    raise
                 except SyntaxError as e:
                     raise ParserSyntaxError(
                         f"Failed to parse function '{func_def_to_parse.name}': {e.msg}",
                         span=parser.span_tracker.get_span(func_def_to_parse),
                         hint="Check for Python syntax errors in your function definition",
                     ) from e
+                except ParserError:
+                    raise
                 except Exception as e:
                     raise ParserSyntaxError(
                         f"Failed to parse function '{func_def_to_parse.name}': {concise_error_message(e)}",

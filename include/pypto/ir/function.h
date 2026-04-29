@@ -84,17 +84,20 @@ enum class Level : uint8_t {
   POD = 6,        ///< Alias for CLUSTER_0
   CLOS1 = 7,      ///< Alias for CLUSTER_1
   CLOS2 = 8,      ///< Alias for CLUSTER_2
+
+  UNDEFINED = 255
 };
 
 /**
  * @brief Function role at L3-L7 hierarchy levels
  *
- * Distinguishes orchestrators (which build task DAGs and submit work)
- * from workers (which execute concrete compute or data tasks).
+ * Distinguishes orchestrators (which build task DAGs and submit work) from
+ * sub-workers (which execute concrete compute or data tasks dispatched by an
+ * orchestrator at the same level).
  */
 enum class Role : uint8_t {
   Orchestrator = 0,  ///< Builds DAG, submits tasks, never computes directly
-  Worker = 1,        ///< Executes compute/data tasks, never submits further tasks
+  SubWorker = 1,     ///< Executes compute/data tasks dispatched by the orchestrator at the same level
 };
 
 /**
@@ -122,6 +125,8 @@ inline std::string LevelToString(Level level) {
       return "CLUSTER_2";
     case Level::GLOBAL:
       return "GLOBAL";
+    case Level::UNDEFINED:
+      break;
   }
   throw pypto::TypeError("Unknown Level");
 }
@@ -179,6 +184,8 @@ inline int LevelToLinquLevel(Level level) {
       return 6;
     case Level::GLOBAL:
       return 7;
+    case Level::UNDEFINED:
+      break;
   }
   throw pypto::TypeError("Unknown Level");
 }
@@ -190,8 +197,8 @@ inline std::string RoleToString(Role role) {
   switch (role) {
     case Role::Orchestrator:
       return "Orchestrator";
-    case Role::Worker:
-      return "Worker";
+    case Role::SubWorker:
+      return "SubWorker";
   }
   throw pypto::TypeError("Unknown Role");
 }
@@ -203,8 +210,8 @@ inline Role StringToRole(const std::string& str) {
   static const std::unordered_map<std::string, Role> kMap = {
       {"Orchestrator", Role::Orchestrator},
       {"ORCHESTRATOR", Role::Orchestrator},
-      {"Worker", Role::Worker},
-      {"WORKER", Role::Worker},
+      {"SubWorker", Role::SubWorker},
+      {"SUBWORKER", Role::SubWorker},
   };
   auto it = kMap.find(str);
   if (it != kMap.end()) return it->second;
@@ -248,6 +255,28 @@ inline std::string FunctionTypeToString(FunctionType type) {
       return "Spmd";
   }
   throw pypto::TypeError("Unknown FunctionType");
+}
+
+/**
+ * @brief Convert FunctionType to level
+ * @param type The function type
+ * @return Level
+ */
+inline Level FunctionTypeToLevel(FunctionType type) {
+  switch (type) {
+    case FunctionType::Orchestration:
+      return Level::CHIP;
+    case FunctionType::InCore:
+      return Level::CHIP_DIE;
+    case FunctionType::AIC:
+      return Level::AIC;
+    case FunctionType::AIV:
+      return Level::AIV;
+    case FunctionType::Group:
+      return Level::CORE_GROUP;
+    default:
+      return Level::UNDEFINED;
+  }
 }
 
 /**
@@ -359,6 +388,27 @@ class Function : public IRNode {
     CHECK(params_.size() == param_directions_.size())
         << "params and param_directions must have same size, got " << params_.size() << " vs "
         << param_directions_.size();
+    if (IsInCoreType(func_type_) || func_type_ == FunctionType::Group ||
+        func_type_ == FunctionType::Orchestration) {
+      Level derived_level = FunctionTypeToLevel(func_type_);
+      Role derived_role = (func_type_ == FunctionType::Orchestration) ? Role::Orchestrator : Role::SubWorker;
+      if (level_.has_value()) {
+        CHECK(*level_ == derived_level)
+            << "Function '" << name_ << "' has func_type=" << FunctionTypeToString(func_type_)
+            << " which implies level=" << LevelToString(derived_level)
+            << ", but explicit level=" << LevelToString(*level_) << " was provided";
+      } else {
+        level_ = derived_level;
+      }
+      if (role_.has_value()) {
+        CHECK(*role_ == derived_role)
+            << "Function '" << name_ << "' has func_type=" << FunctionTypeToString(func_type_)
+            << " which implies role=" << RoleToString(derived_role)
+            << ", but explicit role=" << RoleToString(*role_) << " was provided";
+      } else {
+        role_ = derived_role;
+      }
+    }
   }
 
   [[nodiscard]] ObjectKind GetKind() const override { return ObjectKind::Function; }

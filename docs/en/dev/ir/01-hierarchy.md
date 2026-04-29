@@ -183,6 +183,7 @@ field from the `Stmt` base class. See [Leading comments on statements](#leading-
 | **SeqStmts** | `stmts_` | General statement sequence |
 | **BreakStmt** | *(none)* | Exit loop |
 | **ContinueStmt** | *(none)* | Skip to next loop iteration |
+| **InlineStmt** | `body_`, `language_` (`InlineLanguage`) | Verbatim source body in a target language (e.g. Python). Treated as a leaf by passes; used for HOST SubWorker bodies |
 
 ### Leading comments on statements
 
@@ -294,8 +295,8 @@ auto = ir.AutoInCoreScopeStmt(name_hint="", body=body, span=span)
 # with pl.cluster():
 cluster = ir.ClusterScopeStmt(name_hint="", body=body, span=span)
 
-# with pl.at(level=Level.HOST, role=Role.Worker):
-hier = ir.HierarchyScopeStmt(level=ir.Level.HOST, role=ir.Role.Worker,
+# with pl.at(level=Level.HOST, role=Role.SubWorker):
+hier = ir.HierarchyScopeStmt(level=ir.Level.HOST, role=ir.Role.SubWorker,
                              name_hint="", body=body, span=span)
 
 # with pl.spmd(8):
@@ -424,11 +425,35 @@ func_orch = ir.Function("orchestrator", params, return_types, body, span, ir.Fun
 | Field | Type | Description |
 | ----- | ---- | ----------- |
 | `name_` | string | Function name |
-| `func_type_` | FunctionType | Function type (Opaque, Orchestration, InCore, AIC, AIV, or Group) |
+| `func_type_` | FunctionType | Function type (Opaque, Orchestration, InCore, AIC, AIV, Group, or Spmd) |
 | `params_` | list[VarPtr] | Parameter variables (DefField) |
 | `param_directions_` | list[ParamDirection] | Parameter directions, same length as params_ |
 | `return_types_` | list[TypePtr] | Return types |
 | `body_` | StmtPtr | Function body |
+| `level_` | optional[Level] | Hierarchy level (auto-derived from `func_type_` for InCore/AIC/AIV/Group/Orchestration; see below) |
+| `role_` | optional[Role] | Hierarchy role (auto-derived from `func_type_` for InCore/AIC/AIV/Group/Orchestration; see below) |
+| `attrs_` | list[(str, Any)] | Ordered free-form metadata, exposed as `UsualField` (participates in structural traversal) |
+
+### Auto-derivation of `level_` / `role_`
+
+For `func_type_` in {`InCore`, `AIC`, `AIV`, `Group`, `Orchestration`}, the
+`Function` constructor auto-derives `level_` and `role_` when they are not
+explicitly provided:
+
+| `func_type_` | Derived `level_` | Derived `role_` |
+| ------------ | ---------------- | --------------- |
+| `Orchestration` | `CHIP` | `Orchestrator` |
+| `InCore` | `CHIP_DIE` | `Worker` |
+| `AIC` | `AIC` | `Worker` |
+| `AIV` | `AIV` | `Worker` |
+| `Group` | `CORE_GROUP` | `Worker` |
+
+If `level_` / `role_` are explicitly supplied, they must match the derived
+values — otherwise construction fails with `pypto.ValueError`. For other
+function types (`Opaque`, `Spmd`), no derivation is applied and both fields
+remain `nullopt` unless set by the caller. The Python printer emits the
+`level=` / `role=` keywords on the `@pl.function(...)` decorator whenever they
+are present.
 
 ### ParamDirection Enum
 
@@ -448,6 +473,7 @@ func_orch = ir.Function("orchestrator", params, return_types, body, span, ir.Fun
 | `AIC` | Cube core kernel (specialized InCore) |
 | `AIV` | Vector core kernel (specialized InCore) |
 | `Group` | Co-scheduled group of AIC + AIV kernels |
+| `Spmd` | SPMD data-parallel dispatch wrapper |
 
 `IsInCoreType(type)` / `ir.is_incore_type(type)` returns `True` for `InCore`, `AIC`, and `AIV`.
 
@@ -478,7 +504,7 @@ Functions stored in sorted map for deterministic ordering. GlobalVar names must 
 | **Unary Ops** | 5 | Abs, Neg, Not, BitNot, Cast |
 | **Call/Access** | 2 | Call, TupleGetItemExpr |
 | **Operations** | 2 | Op, GlobalVar |
-| **Statements** | 15 | AssignStmt, IfStmt, ForStmt, WhileStmt, ReturnStmt, InCoreScopeStmt, AutoInCoreScopeStmt, ClusterScopeStmt, HierarchyScopeStmt, SpmdScopeStmt, YieldStmt, EvalStmt, SeqStmts, BreakStmt, ContinueStmt |
+| **Statements** | 16 | AssignStmt, IfStmt, ForStmt, WhileStmt, ReturnStmt, InCoreScopeStmt, AutoInCoreScopeStmt, ClusterScopeStmt, HierarchyScopeStmt, SpmdScopeStmt, YieldStmt, EvalStmt, SeqStmts, BreakStmt, ContinueStmt, InlineStmt |
 | **Types** | 6 | ScalarType, TensorType, TileType, TupleType, PipeType, UnknownType |
 | **Functions** | 2 | Function, Program |
 

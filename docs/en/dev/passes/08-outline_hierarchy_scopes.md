@@ -100,7 +100,7 @@ component is lowercase; the role suffix is omitted when the scope has no role.
 
 Examples:
 
-- `pl.at(level=pl.Level.HOST, role=pl.Role.Worker)` → `main_host_worker_0`
+- `pl.at(level=pl.Level.HOST, role=pl.Role.Orchestrator)` → `main_host_orch_0`
 - `pl.at(level=pl.Level.GLOBAL, role=pl.Role.Orchestrator)` → `main_global_orch_0`
 - `pl.at(level=pl.Level.CHIP)` → `main_chip_0`
 
@@ -117,7 +117,7 @@ resolve to the canonical underlying name. For example,
 class Before:
     @pl.function  # Opaque function
     def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
-        with pl.at(level=pl.Level.HOST, role=pl.Role.Worker):
+        with pl.at(level=pl.Level.HOST, role=pl.Role.Orchestrator):
             y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
         return y
 ```
@@ -127,22 +127,28 @@ class Before:
 ```python
 @pl.program
 class After:
-    @pl.function(level=pl.Level.HOST, role=pl.Role.Worker)
-    def main_host_worker_0(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+    @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+    def main_host_orch_0(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
         y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
         return y
 
     @pl.function  # Opaque (unchanged — parent type is preserved)
     def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
-        y: pl.Tensor[[64], pl.FP32] = self.main_host_worker_0(x)
+        y: pl.Tensor[[64], pl.FP32] = self.main_host_orch_0(x)
         return y
 ```
+
+> **Note:** SubWorker scopes (``role=pl.Role.SubWorker``) are not supported as
+> inline ``with pl.at(...)`` blocks. Declare a SubWorker via
+> ``@pl.function(level=..., role=pl.Role.SubWorker)`` as a self-contained
+> function (no ``self`` parameter) inside ``@pl.program``; its body is captured
+> as an :class:`InlineStmt` and embedded directly in the IR.
 
 ## Nested Hierarchy Example
 
 Nested Hierarchy scopes are outlined recursively. Inner scopes are extracted
 first and replaced with calls inside the outer outlined function, producing
-chained names like `main_global_orch_0_host_worker_0`.
+chained names like `main_global_orch_0_host_orch_0`.
 
 **Before**:
 
@@ -153,7 +159,7 @@ class Before:
     def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
         with pl.at(level=pl.Level.GLOBAL, role=pl.Role.Orchestrator):
             y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
-            with pl.at(level=pl.Level.HOST, role=pl.Role.Worker):
+            with pl.at(level=pl.Level.HOST, role=pl.Role.Orchestrator):
                 z: pl.Tensor[[64], pl.FP32] = pl.mul(y, y)
         return z
 ```
@@ -163,8 +169,8 @@ class Before:
 ```python
 @pl.program
 class After:
-    @pl.function(level=pl.Level.HOST, role=pl.Role.Worker)
-    def main_global_orch_0_host_worker_0(
+    @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+    def main_global_orch_0_host_orch_0(
         self, y: pl.Tensor[[64], pl.FP32]
     ) -> pl.Tensor[[64], pl.FP32]:
         z: pl.Tensor[[64], pl.FP32] = pl.mul(y, y)
@@ -173,7 +179,7 @@ class After:
     @pl.function(level=pl.Level.GLOBAL, role=pl.Role.Orchestrator)
     def main_global_orch_0(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
         y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
-        z: pl.Tensor[[64], pl.FP32] = self.main_global_orch_0_host_worker_0(y)
+        z: pl.Tensor[[64], pl.FP32] = self.main_global_orch_0_host_orch_0(y)
         return z
 
     @pl.function

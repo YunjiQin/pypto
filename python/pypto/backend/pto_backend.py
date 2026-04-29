@@ -882,6 +882,10 @@ def generate(
     when ``skip_ptoas=True``, the raw MLIR (.pto) content is returned directly
     without invoking ptoas.
 
+    For programs containing L3+ distributed functions (level=HOST or above),
+    the distributed codegen path generates Python orchestration code alongside
+    the standard PTO kernel artifacts.
+
     Args:
         transformed_program: Program after pass pipeline
         output_dir: Base output directory (used for ptoas intermediates when skip_ptoas=False)
@@ -891,6 +895,163 @@ def generate(
     Returns:
         Dict mapping relative file paths to their content.
     """
+    # Check for distributed functions (level >= HOST = Linqu level 3)
+    has_distributed = any(
+        f.level is not None and _ir_core.level_to_linqu_level(f.level) >= 3
+        for f in transformed_program.functions.values()
+    )
+
+    if has_distributed:
+        return _generate_with_distributed(transformed_program, output_dir, skip_ptoas)
+
+    return _generate_single_chip(transformed_program, output_dir, skip_ptoas)
+
+
+def _generate_with_distributed(
+    transformed_program: _ir_core.Program,
+    output_dir: str,
+    skip_ptoas: bool,
+) -> dict[str, str]:
+    """Generate artifacts for a distributed (L3+) program.
+
+    Output directory layout mirrors the distributed execution hierarchy::
+
+      orchestration/host_orch.py        — L3 HOST orchestrator (Python)
+      next_levels/{chip_task_name}/     — each L2 chip task (complete sub-dir)
+          orchestration/{name}.cpp
+          kernels/{core_type}/{kernel}.pto
+          kernel_config.py
+      sub_workers/{name}.py             — each SubWorker callable
+    """
+    result_files: dict[str, str] = {}
+
+    # 1. L3 HOST orchestrator → orchestration/host_orch.py
+    cg = _codegen_core.DistributedCodegen()
+    orch_code = cg.generate(transformed_program)
+    result_files["orchestration/host_orch.py"] = orch_code
+
+    # 2. Each chip-level Orchestration → next_levels/{name}/...
+    for func in transformed_program.functions.values():
+        if func.func_type == _ir_core.FunctionType.Orchestration:
+            chip_funcs = _collect_chip_task_functions(func, transformed_program)
+            chip_program = _ir_core.Program(chip_funcs, func.name, transformed_program.span)
+            chip_subdir = os.path.join(output_dir, "next_levels", func.name)
+            chip_files = _generate_single_chip(chip_program, chip_subdir, skip_ptoas)
+            for path, content in chip_files.items():
+                result_files[f"next_levels/{func.name}/{path}"] = content
+
+    # 3. HOST SubWorker functions → sub_workers/{name}.py
+    # Only HOST-level (Linqu level >= 3) SubWorkers carry an InlineStmt body
+    # captured by the decorator. Lower-level role=SubWorker kernels (e.g. CHIP
+    # InCore promoted by auto-derive) keep their DSL body and are emitted by
+    # chip-level codegen above.
+    for func in transformed_program.functions.values():
+        if (
+            func.role == _ir_core.Role.SubWorker
+            and func.level is not None
+            and _ir_core.level_to_linqu_level(func.level) >= 3
+        ):
+            result_files[f"sub_workers/{func.name}.py"] = _emit_sub_worker_module(func)
+
+    return result_files
+
+
+def _emit_sub_worker_module(func: _ir_core.Function) -> str:
+    """Emit a self-contained SubWorker module callable as ``fn(args: TaskArgs)``.
+
+    The user's function body lives on ``func.body`` as an :class:`InlineStmt`
+    captured by the decorator. The emitted module wraps the body in
+    ``def _user_{name}(<params>)`` plus a dispatcher ``{name}(args)`` that
+    unpacks tensors from ``TaskArgs``.
+    """
+    import textwrap  # noqa: PLC0415
+
+    body = func.body
+    if not isinstance(body, _ir_core.InlineStmt):
+        raise RuntimeError(f"SubWorker '{func.name}' must have an InlineStmt body, got {type(body).__name__}")
+
+    param_names = [p.name_hint for p in func.params]
+    params_str = ", ".join(param_names)
+    indented_body = textwrap.indent(body.body, "    ") if body.body else "    pass"
+    unpack_block = (
+        "\n".join(
+            f"    {name} = _tensor_from_continuous(args.tensor({i}))" for i, name in enumerate(param_names)
+        )
+        or "    pass"
+    )
+
+    return (
+        f'"""SubWorker: {func.name} — auto-generated, callable as fn(args: TaskArgs)."""\n'
+        f"\n"
+        f"import torch\n"
+        f"\n"
+        f"from pypto.runtime.distributed_runner import _tensor_from_continuous\n"
+        f"\n"
+        f"\n"
+        f"def _user_{func.name}({params_str}):\n"
+        f"{indented_body}\n"
+        f"\n"
+        f"\n"
+        f"def {func.name}(args):\n"
+        f"{unpack_block}\n"
+        f"    _user_{func.name}({params_str})\n"
+    )
+
+
+def _collect_chip_task_functions(
+    orch_func: _ir_core.Function,
+    program: _ir_core.Program,
+) -> list[_ir_core.Function]:
+    """Collect ``orch_func`` and all chip-level callees reachable from its body.
+
+    Walks the call graph starting from ``orch_func`` and returns any
+    InCore/AIC/AIV/Group/Spmd function transitively called. This filters out
+    chip kernels belonging to *other* orchestrations in multi-orchestration
+    programs (e.g., L3 programs with multiple ``with pl.at(level=CHIP)``
+    scopes), preventing redundant compilation and cross-orchestration name
+    collisions in ``next_levels/{orch}/`` artifacts.
+    """
+    chip_func_types = (
+        _ir_core.FunctionType.InCore,
+        _ir_core.FunctionType.AIC,
+        _ir_core.FunctionType.AIV,
+        _ir_core.FunctionType.Group,
+        _ir_core.FunctionType.Spmd,
+    )
+
+    result: list[_ir_core.Function] = [orch_func]
+    visited: set[str] = {orch_func.name}
+    work: list[_ir_core.Function] = [orch_func]
+
+    while work:
+        func = work.pop()
+        for stmt in _ir_core.flatten_to_stmts(func.body):
+            call = None
+            if isinstance(stmt, _ir_core.EvalStmt):
+                call = stmt.expr
+            elif isinstance(stmt, _ir_core.AssignStmt):
+                call = stmt.value
+            if not (isinstance(call, _ir_core.Call) and isinstance(call.op, _ir_core.GlobalVar)):
+                continue
+            callee_name = call.op.name
+            if callee_name in visited:
+                continue
+            callee = program.get_function(callee_name)
+            if callee is None or callee.func_type not in chip_func_types:
+                continue
+            visited.add(callee_name)
+            result.append(callee)
+            work.append(callee)
+
+    return result
+
+
+def _generate_single_chip(
+    transformed_program: _ir_core.Program,
+    output_dir: str,
+    skip_ptoas: bool = False,
+) -> dict[str, str]:
+    """Generate artifacts for a single-chip (L0-L2) program. Original generate() logic."""
     result_files: dict[str, str] = {}
     errors: list[tuple[str, Exception]] = []
     prof = CompileProfiler.current()

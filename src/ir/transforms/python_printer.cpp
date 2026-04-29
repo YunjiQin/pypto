@@ -250,6 +250,7 @@ class IRPythonPrinter : public IRVisitor {
   void VisitStmt_(const EvalStmtPtr& op) override;
   void VisitStmt_(const BreakStmtPtr& op) override;
   void VisitStmt_(const ContinueStmtPtr& op) override;
+  void VisitStmt_(const InlineStmtPtr& op) override;
   void VisitStmt_(const StmtPtr& op) override;
 
   // Function and program visitors
@@ -1234,6 +1235,24 @@ void IRPythonPrinter::VisitStmt_(const BreakStmtPtr& op) { stream_ << "break"; }
 
 void IRPythonPrinter::VisitStmt_(const ContinueStmtPtr& op) { stream_ << "continue"; }
 
+void IRPythonPrinter::VisitStmt_(const InlineStmtPtr& op) {
+  // Emit the verbatim body. The caller already emitted the leading indent for
+  // the first line; subsequent non-empty lines are re-indented to match.
+  const std::string& body = op->body_;
+  const std::string indent = GetIndent();
+  for (std::string::size_type pos = 0; pos <= body.size();) {
+    auto eol = body.find('\n', pos);
+    std::string line = body.substr(pos, eol == std::string::npos ? std::string::npos : eol - pos);
+    if (pos > 0) {
+      stream_ << "\n";
+      if (!line.empty()) stream_ << indent;
+    }
+    stream_ << line;
+    if (eol == std::string::npos) break;
+    pos = eol + 1;
+  }
+}
+
 void IRPythonPrinter::VisitStmt_(const StmtPtr& op) { stream_ << op->TypeName(); }
 
 void IRPythonPrinter::PrintYieldAssignmentVars(const std::vector<VarPtr>& return_vars) {
@@ -1402,14 +1421,17 @@ void IRPythonPrinter::VisitFunction(const FunctionPtr& func) {
   // Print function signature
   stream_ << GetIndent() << "def " << func->name_ << "(";
 
-  // Add 'self' as first parameter when inside @pl.program
-  if (current_program_) {
+  // Add 'self' as first parameter when inside @pl.program — except for
+  // SubWorker functions, which are declared self-contained.
+  bool is_sub_worker = func->role_.has_value() && *func->role_ == Role::SubWorker;
+  bool emit_self = current_program_ && !is_sub_worker;
+  if (emit_self) {
     stream_ << "self";
   }
 
   // Print parameters with type annotations and direction wrappers
   for (size_t i = 0; i < func->params_.size(); ++i) {
-    if (i > 0 || current_program_) stream_ << ", ";
+    if (i > 0 || emit_self) stream_ << ", ";
     const auto& var = func->params_[i];
     const auto& dir = func->param_directions_[i];
     stream_ << GetVarName(var.get()) << ": ";

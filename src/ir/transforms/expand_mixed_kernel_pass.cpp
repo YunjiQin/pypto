@@ -901,8 +901,8 @@ Pass ExpandMixedKernel() {
             attrs.end());
         auto converted = MutableCopy(func);
         converted->func_type_ = new_type;
-        converted->level_ = std::nullopt;
-        converted->role_ = std::nullopt;
+        converted->level_ = FunctionTypeToLevel(new_type);
+        converted->role_ = Role::SubWorker;
         converted->attrs_ = attrs;
         new_functions.push_back(converted);
         continue;

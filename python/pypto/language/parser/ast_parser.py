@@ -381,6 +381,7 @@ class ASTParser:
         func_level: ir.Level | None = None,
         func_role: ir.Role | None = None,
         func_attrs: dict[str, Any] | None = None,
+        inline_body: str | None = None,
     ) -> ir.Function:
         """Parse function definition and build IR.
 
@@ -390,6 +391,9 @@ class ASTParser:
             func_level: Hierarchy level (default: None)
             func_role: Function role (default: None)
             func_attrs: Function-level attributes dict (default: None)
+            inline_body: If provided, the function body is replaced by a single
+                ``InlineStmt`` carrying this verbatim Python source instead of
+                parsing the AST body as DSL.
 
         Returns:
             IR Function object
@@ -439,13 +443,13 @@ class ASTParser:
                 else:
                     f.return_type(return_type)
 
-            # Parse function body. Docstrings (bare-string expressions anywhere
-            # in the body) are rerouted as leading_comments on the next stmt by
-            # parse_statement — no separate skip is needed here.
-            self._parse_body_siblings(func_def.body)
-            # Function body is the outermost scope — sweep all remaining
-            # pending comments (including any beyond end_lineno) as tails.
-            self._discard_tail_block_comments(func_def.body, upper_line=None)
+            # Parse function body. HOST SubWorkers carry pure-Python source
+            # via ``inline_body`` and are not parsed as DSL.
+            if inline_body is not None:
+                self.builder.inline_stmt(inline_body, ir.InlineLanguage.Python, func_span)
+            else:
+                self._parse_body_siblings(func_def.body)
+                self._discard_tail_block_comments(func_def.body, upper_line=None)
 
         # Exit function scope
         self.scope_manager.exit_scope()
@@ -2199,7 +2203,7 @@ class ASTParser:
             raise ParserSyntaxError(
                 "Unsupported **kwargs in pl.at()",
                 span=self.span_tracker.get_span(kw),
-                hint="Use pl.at(level=pl.Level.HOST, role=pl.Role.Worker)",
+                hint="Use pl.at(level=pl.Level.HOST, role=pl.Role.SubWorker)",
             )
         else:
             raise ParserSyntaxError(
@@ -2826,6 +2830,15 @@ class ASTParser:
             )
 
         if not is_core_group:
+            # SubWorker scopes are no longer supported as inline `with pl.at(...)`
+            # blocks. Declare a SubWorker via @pl.function(level=..., role=Worker).
+            if level is not None and ir.level_to_linqu_level(level) >= 3 and role == ir.Role.SubWorker:
+                raise ParserSyntaxError(
+                    "Inline 'with pl.at(level>=HOST, role=pl.Role.SubWorker)' is not supported.",
+                    span=span,
+                    hint="Declare a SubWorker via @pl.function(level=..., role=pl.Role.SubWorker) "
+                    "as a self-contained function (no 'self' parameter) inside @pl.program.",
+                )
             self._parse_scope_body(
                 stmt, ir.ScopeKind.Hierarchy, span, level=level, role=role, name_hint=name_hint
             )

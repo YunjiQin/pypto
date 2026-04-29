@@ -1119,6 +1119,18 @@ void BindIR(nb::module_& m) {
   continue_stmt_class.def(nb::init<const Span&>(), nb::arg("span"), "Create a continue statement");
   BindFields<ContinueStmt>(continue_stmt_class);
 
+  // InlineLanguage enum — language tag for InlineStmt bodies.
+  nb::enum_<InlineLanguage>(ir, "InlineLanguage", "Source language carried by an InlineStmt body")
+      .value("Python", InlineLanguage::Python, "Python source")
+      .export_values();
+
+  // InlineStmt - const shared_ptr
+  auto inline_stmt_class = nb::class_<InlineStmt, Stmt>(
+      ir, "InlineStmt", "Inline statement: opaque source body in a target language");
+  inline_stmt_class.def(nb::init<std::string, InlineLanguage, const Span&>(), nb::arg("body"),
+                        nb::arg("language"), nb::arg("span"), "Create an inline statement");
+  BindFields<InlineStmt>(inline_stmt_class);
+
   // FunctionType enum
   nb::enum_<FunctionType>(ir, "FunctionType", "Function type classification")
       .value("Opaque", FunctionType::Opaque, "Unspecified function type (default)")
@@ -1155,7 +1167,8 @@ void BindIR(nb::module_& m) {
   // Role enum — function role at L3-L7 hierarchy levels
   nb::enum_<Role>(ir, "Role", "Function role at L3-L7 hierarchy levels")
       .value("Orchestrator", Role::Orchestrator, "Builds DAG, submits tasks")
-      .value("Worker", Role::Worker, "Executes compute/data tasks")
+      .value("SubWorker", Role::SubWorker,
+             "Executes compute/data tasks dispatched by the orchestrator at the same level")
       .export_values();
 
   // ParamDirection enum

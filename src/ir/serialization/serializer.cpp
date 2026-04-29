@@ -88,6 +88,7 @@ class FieldSerializerVisitor {
   result_type VisitLeafField(const DataType& field);
   result_type VisitLeafField(const FunctionType& field);
   result_type VisitLeafField(const ForKind& field);
+  result_type VisitLeafField(const InlineLanguage& field);
   result_type VisitLeafField(const ChunkPolicy& field);
   result_type VisitLeafField(const std::optional<ChunkConfig>& field);
 
@@ -230,6 +231,7 @@ class IRSerializer::Impl {
     SERIALIZE_FIELDS(EvalStmt);
     SERIALIZE_FIELDS(BreakStmt);
     SERIALIZE_FIELDS(ContinueStmt);
+    SERIALIZE_FIELDS(InlineStmt);
     SERIALIZE_FIELDS(Function);
     SERIALIZE_FIELDS(Program);
 
@@ -560,6 +562,10 @@ msgpack::object FieldSerializerVisitor::VisitLeafField(const FunctionType& field
 }
 
 msgpack::object FieldSerializerVisitor::VisitLeafField(const ForKind& field) {
+  return msgpack::object(static_cast<uint8_t>(field), zone_);
+}
+
+msgpack::object FieldSerializerVisitor::VisitLeafField(const InlineLanguage& field) {
   return msgpack::object(static_cast<uint8_t>(field), zone_);
 }
 

@@ -91,6 +91,10 @@ Pass OutlineIncoreScopes() {
       auto new_func = MutableCopy(func);
       new_func->body_ = new_body;
       new_func->func_type_ = new_func_type;
+      if (new_func_type == FunctionType::Orchestration) {
+        new_func->level_ = FunctionTypeToLevel(new_func_type);
+        new_func->role_ = Role::Orchestrator;
+      }
       new_functions.push_back(new_func);
 
       // Collect outlined functions (prepend before parent so inner functions come first)

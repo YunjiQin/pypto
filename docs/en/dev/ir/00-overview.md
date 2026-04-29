@@ -82,7 +82,7 @@ All IR node types are represented in a unified enumeration:
 | **Expressions** | Var, IterArg, Call, TupleGetItemExpr, ConstInt, ConstFloat, ConstBool |
 | **Binary Ops** | Add, Sub, Mul, FloorDiv, FloorMod, FloatDiv, Min, Max, Pow, Eq, Ne, Lt, Le, Gt, Ge, And, Or, Xor, BitAnd, BitOr, BitXor, BitShiftLeft, BitShiftRight |
 | **Unary Ops** | Abs, Neg, Not, BitNot, Cast |
-| **Statements** | AssignStmt, IfStmt, YieldStmt, ReturnStmt, ForStmt, SeqStmts, EvalStmt |
+| **Statements** | AssignStmt, IfStmt, YieldStmt, ReturnStmt, ForStmt, SeqStmts, EvalStmt, InlineStmt |
 | **Types** | UnknownType, ScalarType, ShapedType, TensorType, TileType, TupleType, PipeType |
 | **Other** | Function, Program, Op, GlobalVar |
 

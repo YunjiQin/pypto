@@ -64,7 +64,7 @@ def test_level_to_linqu_level():
 
 def test_role_values():
     """Role enum has exactly two distinct values."""
-    assert ir.Role.Orchestrator != ir.Role.Worker
+    assert ir.Role.Orchestrator != ir.Role.SubWorker
 
 
 # ─── Step 01: DSL exports ────────────────────────────────────────────────────
@@ -74,7 +74,7 @@ def test_level_accessible_from_pl():
     """Level and Role are accessible via pl namespace."""
     assert pl.Level.HOST == ir.Level.HOST
     assert ir.level_to_linqu_level(pl.Level.POD) == ir.level_to_linqu_level(ir.Level.CLUSTER_0)
-    assert pl.Role.Worker == ir.Role.Worker
+    assert pl.Role.SubWorker == ir.Role.SubWorker
     assert pl.Role.Orchestrator == ir.Role.Orchestrator
 
 
@@ -97,16 +97,18 @@ def test_function_default_level_role():
 
 def test_function_with_level():
     """Function can carry a hierarchy level."""
-    f = _make_empty_func("orch", type=ir.FunctionType.Orchestration, level=ir.Level.HOST)
-    assert f.level == ir.Level.HOST
+    f = _make_empty_func("orch", type=ir.FunctionType.Orchestration)
+    # Orchestration auto-derives level=CHIP, role=Orchestrator
+    assert f.level == ir.Level.CHIP
+    assert f.role == ir.Role.Orchestrator
     assert f.func_type == ir.FunctionType.Orchestration
 
 
 def test_function_with_level_and_role():
     """Function can carry both level and role."""
-    f = _make_empty_func("worker", level=ir.Level.HOST, role=ir.Role.Worker)
+    f = _make_empty_func("worker", level=ir.Level.HOST, role=ir.Role.SubWorker)
     assert f.level == ir.Level.HOST
-    assert f.role == ir.Role.Worker
+    assert f.role == ir.Role.SubWorker
 
 
 def test_function_with_level_alias():
@@ -119,15 +121,16 @@ def test_function_backward_compat():
     """Existing code creating Function(type=InCore) still works."""
     f = _make_empty_func("kernel", type=ir.FunctionType.InCore)
     assert f.func_type == ir.FunctionType.InCore
-    assert f.level is None
-    assert f.role is None
+    # InCore auto-derives level=CHIP_DIE, role=Worker
+    assert f.level == ir.Level.CHIP_DIE
+    assert f.role == ir.Role.SubWorker
 
 
 def test_structural_equal_with_level():
     """structural_equal considers level and role fields."""
-    f1 = _make_empty_func("a", level=ir.Level.HOST, role=ir.Role.Worker)
-    f2 = _make_empty_func("a", level=ir.Level.HOST, role=ir.Role.Worker)
-    f3 = _make_empty_func("a", level=ir.Level.POD, role=ir.Role.Worker)
+    f1 = _make_empty_func("a", level=ir.Level.HOST, role=ir.Role.SubWorker)
+    f2 = _make_empty_func("a", level=ir.Level.HOST, role=ir.Role.SubWorker)
+    f3 = _make_empty_func("a", level=ir.Level.POD, role=ir.Role.SubWorker)
     ir.assert_structural_equal(f1, f2)
     with pytest.raises(Exception):
         ir.assert_structural_equal(f1, f3)
@@ -145,13 +148,12 @@ def test_function_printer_shows_level_role():
     """Python printer includes level/role in decorator."""
     f = _make_empty_func(
         "worker",
-        type=ir.FunctionType.Orchestration,
         level=ir.Level.HOST,
-        role=ir.Role.Worker,
+        role=ir.Role.SubWorker,
     )
     printed = str(f)
     assert "Level.HOST" in printed
-    assert "Role.Worker" in printed
+    assert "Role.SubWorker" in printed
 
 
 if __name__ == "__main__":

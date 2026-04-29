@@ -952,6 +952,15 @@ class SSAConverter {
 };
 
 FunctionPtr TransformConvertToSSA(const FunctionPtr& func) {
+  // HOST-level (Linqu >= 3) SubWorker functions carry their pure-Python body
+  // as an opaque InlineStmt. Their parameters are not used by IR statements,
+  // and SubWorker code generation references the user's original parameter
+  // names verbatim from the captured source — so SSA renaming would only
+  // desync the params from the body. Skip them.
+  if (func->role_.has_value() && *func->role_ == Role::SubWorker && func->level_.has_value() &&
+      LevelToLinquLevel(*func->level_) >= 3) {
+    return func;
+  }
   SSAConverter converter;
   return converter.ConvertFunction(func);
 }

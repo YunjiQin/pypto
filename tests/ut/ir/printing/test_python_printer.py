@@ -926,11 +926,11 @@ def test_python_print_program_preserves_function_type():
     result = program.as_python()
 
     # The program printer must include the type parameter on the decorator
-    assert "@pl.function(type=pl.FunctionType.InCore)" in result
+    assert "@pl.function(type=pl.FunctionType.InCore" in result
 
     # Also verify standalone function printing still works
     standalone_result = func.as_python()
-    assert "@pl.function(type=pl.FunctionType.InCore)" in standalone_result
+    assert "@pl.function(type=pl.FunctionType.InCore" in standalone_result
 
 
 def test_python_print_program_opaque_function_type():

@@ -702,7 +702,7 @@ class TestConvertTensorToTileOps:
             def main(
                 self,
                 src: pl.Tensor[[1, 4, 8], pl.FP16],
-                target: pl.Tensor[[2, 4, 8], pl.FP16],
+                target: pl.Out[pl.Tensor[[2, 4, 8], pl.FP16]],
             ) -> pl.Tensor[[2, 4, 8], pl.FP16]:
                 y: pl.Tensor[[2, 4, 8], pl.FP16] = self.main_incore_0(src, target)
                 return y
@@ -760,7 +760,7 @@ class TestConvertTensorToTileOps:
             def main(
                 self,
                 src: pl.Tensor[[2, 1, 8], pl.FP16],
-                target: pl.Tensor[[2, 4, 8], pl.FP16],
+                target: pl.Out[pl.Tensor[[2, 4, 8], pl.FP16]],
             ) -> pl.Tensor[[2, 4, 8], pl.FP16]:
                 y: pl.Tensor[[2, 4, 8], pl.FP16] = self.main_incore_0(src, target)
                 return y
@@ -811,7 +811,7 @@ class TestConvertTensorToTileOps:
             def main(
                 self,
                 src: pl.Tensor[[2, 4, 1], pl.FP16],
-                target: pl.Tensor[[2, 4, 8], pl.FP16],
+                target: pl.Out[pl.Tensor[[2, 4, 8], pl.FP16]],
             ) -> pl.Tensor[[2, 4, 8], pl.FP16]:
                 y: pl.Tensor[[2, 4, 8], pl.FP16] = self.main_incore_0(src, target)
                 return y
@@ -1402,7 +1402,7 @@ class TestGmLocalTensorConversion:
             @pl.function
             def main(
                 self,
-                dst: pl.Tensor[[4], pl.FP32],
+                dst: pl.Out[pl.Tensor[[4], pl.FP32]],
                 val: pl.Scalar[pl.FP32],
             ) -> pl.Scalar[pl.FP32]:
                 result: pl.Scalar[pl.FP32] = self.main_incore_0(dst, val)

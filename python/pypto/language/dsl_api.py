@@ -1032,7 +1032,7 @@ def at(
         ...         x = pl.add(x, x)
 
         >>> # Hierarchy scope (unchanged behavior):
-        >>> with pl.at(level=pl.Level.HOST, role=pl.Role.Worker):
+        >>> with pl.at(level=pl.Level.HOST, role=pl.Role.SubWorker):
         ...     y = pl.add(x, x)
     """
     return AtContext(

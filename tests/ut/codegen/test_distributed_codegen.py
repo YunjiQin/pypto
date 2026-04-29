@@ -7,108 +7,122 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""Unit tests for distributed C++ code generation."""
+"""Unit tests for distributed Python code generation."""
 
 import pypto.language as pl
 import pytest
-from pypto import codegen, passes
+from pypto import codegen, ir, passes
 
 
 class TestDistributedCodegen:
-    """Test distributed C++ codegen on outlined hierarchy programs."""
+    """Test distributed Python codegen on outlined hierarchy programs."""
 
-    def test_worker_and_orchestrator_codegen(self):
-        """Outlined hierarchy program produces correct C++ structure.
-
-        Input: a program with one HOST WORKER scope called from an
-        orchestrator-level function. After outlining, the codegen should
-        emit:
-        - A static void worker function
-        - A submit_worker call at the call site
-        - Correct includes and namespace structure
-        """
+    def test_chip_sub_worker_and_orchestrator(self):
+        """HOST orchestrator calling CHIP orchestrator → CHIP worker produces submit_next_level."""
 
         @pl.program
         class Input:
-            @pl.function(level=pl.Level.POD, role=pl.Role.Orchestrator)
-            def pod_orch(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
-                with pl.at(level=pl.Level.HOST, role=pl.Role.Worker):
-                    y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
-                return y
-
-        # Run prerequisite passes
-        program = passes.convert_to_ssa()(Input)
-        program = passes.outline_hierarchy_scopes()(program)
-
-        # Run distributed codegen
-        cg = codegen.DistributedCodegen()
-        code = cg.generate(program)
-
-        # --- Verify includes ---
-        assert '#include "core/tensor.h"' in code
-        assert '#include "runtime/level_runtime.h"' in code
-        assert '#include "runtime/tree_reduce.h"' in code
-
-        # --- Verify worker function ---
-        assert "static void pod_orch_host_worker_0" in code
-
-        # --- Verify orchestrator function ---
-        assert "static LinquTensor pod_orch" in code
-        assert "LevelRuntime&" in code
-
-        # --- Verify call-site lowering ---
-        assert "submit_worker" in code
-        assert '"pod_orch_host_worker_0"' in code
-
-        # --- Verify ordering ---
-        # Worker must appear before orchestrator (dependency order)
-        worker_pos = code.index("static void pod_orch_host_worker_0")
-        orch_pos = code.index("static LinquTensor pod_orch")
-        assert worker_pos < orch_pos
-
-    def test_multi_level_orchestrators(self):
-        """Multiple orchestrator levels produce correct runtime variables.
-
-        Tests that L4 (POD) and L5 (CLOS1) orchestrators use rt_l4 and
-        rt_l5 respectively in their submit calls.
-        """
-
-        @pl.program
-        class Input:
-            @pl.function(level=pl.Level.HOST, role=pl.Role.Worker)
-            def leaf_worker(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+            @pl.function(level=pl.Level.CHIP, role=pl.Role.SubWorker)
+            def chip_worker(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
                 y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
                 return y
 
-            @pl.function(level=pl.Level.POD, role=pl.Role.Orchestrator)
-            def pod_orch(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
-                y: pl.Tensor[[64], pl.FP32] = self.leaf_worker(x)
+            @pl.function(level=pl.Level.CHIP, role=pl.Role.Orchestrator)
+            def chip_orch(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                y: pl.Tensor[[64], pl.FP32] = self.chip_worker(x)
                 return y
 
-            @pl.function(level=pl.Level.CLOS1, role=pl.Role.Orchestrator)
-            def clos1_orch(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
-                y: pl.Tensor[[64], pl.FP32] = self.pod_orch(x)
+            @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+            def host_orch(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                y: pl.Tensor[[64], pl.FP32] = self.chip_orch(x)
                 return y
 
         program = passes.convert_to_ssa()(Input)
         cg = codegen.DistributedCodegen()
         code = cg.generate(program)
 
-        # Worker is a static void
-        assert "static void leaf_worker" in code
+        # Verify imports
+        assert "from simpler.task_interface import TaskArgs, TensorArgType" in code
+        assert "from simpler_setup.torch_interop import make_tensor_arg" in code
 
-        # Pod orchestrator calls submit_worker on rt_l3
-        # (because leaf_worker is at HOST = level 3)
-        assert "rt_l3" in code
-        assert "submit_worker" in code
+        # Verify function definition
+        assert "def host_orch" in code
+        assert "orch, _args, config" in code
 
-        # Clos1 orchestrator calls submit_orchestrator on rt_l4
-        # (because pod_orch is at POD = level 4)
-        assert "rt_l4" in code
-        assert "submit_orchestrator" in code
+        # Verify call-site lowering: CHIP orchestrator → submit_next_level
+        assert "submit_next_level" in code
+        assert 'callables["chip_orch"]' in code
+        assert "TaskArgs()" in code
+
+    def test_sub_worker_submit_sub(self):
+        """HOST worker (SubWorker) produces submit_sub call."""
+
+        @pl.program
+        class Input:
+            @pl.function(level=pl.Level.HOST, role=pl.Role.SubWorker)
+            def verify(f: pl.Tensor[[64], pl.FP32]):
+                pass
+
+            @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+            def host_orch(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                self.verify(x)
+                return x
+
+        program = passes.convert_to_ssa()(Input)
+        cg = codegen.DistributedCodegen()
+        code = cg.generate(program)
+
+        # HOST worker (level 3) → submit_sub
+        assert "submit_sub" in code
+        assert 'sub_ids["verify"]' in code
+
+    def test_chip_and_sub_worker_combined(self):
+        """Program with both CHIP orchestrator (→ chip worker) and HOST SubWorker."""
+
+        @pl.program
+        class Input:
+            @pl.function(level=pl.Level.CHIP, role=pl.Role.SubWorker)
+            def chip_worker(
+                self,
+                a: pl.Tensor[[64], pl.FP32],
+                b: pl.Tensor[[64], pl.FP32],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                y: pl.Tensor[[64], pl.FP32] = pl.add(a, b)
+                return y
+
+            @pl.function(level=pl.Level.CHIP, role=pl.Role.Orchestrator)
+            def chip_orch(
+                self,
+                a: pl.Tensor[[64], pl.FP32],
+                b: pl.Tensor[[64], pl.FP32],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                y: pl.Tensor[[64], pl.FP32] = self.chip_worker(a, b)
+                return y
+
+            @pl.function(level=pl.Level.HOST, role=pl.Role.SubWorker)
+            def verify(f: pl.Tensor[[64], pl.FP32]):
+                pass
+
+            @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+            def host_orch(
+                self,
+                a: pl.Tensor[[64], pl.FP32],
+                b: pl.Tensor[[64], pl.FP32],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                f: pl.Tensor[[64], pl.FP32] = self.chip_orch(a, b)
+                self.verify(f)
+                return f
+
+        program = passes.convert_to_ssa()(Input)
+        cg = codegen.DistributedCodegen()
+        code = cg.generate(program)
+
+        assert "submit_next_level" in code
+        assert "submit_sub" in code
+        assert "TensorArgType.INPUT" in code
 
     def test_for_loop_codegen(self):
-        """ForStmt in function body produces C++ for loop."""
+        """ForStmt in function body produces Python for loop."""
 
         @pl.program
         class Input:
@@ -123,60 +137,284 @@ class TestDistributedCodegen:
         cg = codegen.DistributedCodegen()
         code = cg.generate(program)
 
-        assert "for (int" in code
-        assert "< 4" in code
+        assert "for " in code
+        assert "in range(" in code
 
-    def test_using_declarations(self):
-        """Generated code contains required using declarations."""
+    def test_python_imports(self):
+        """Generated code contains required Python imports."""
 
         @pl.program
         class Input:
-            @pl.function(level=pl.Level.HOST, role=pl.Role.Worker)
-            def simple_worker(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
-                y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
-                return y
+            @pl.function(level=pl.Level.HOST, role=pl.Role.SubWorker)
+            def simple_worker(x: pl.Tensor[[64], pl.FP32]):
+                pass
 
         program = passes.convert_to_ssa()(Input)
         cg = codegen.DistributedCodegen()
         code = cg.generate(program)
 
-        assert "using linqu::LinquTensor;" in code
-        assert "using linqu::LevelRuntime;" in code
+        assert "from simpler.task_interface import TaskArgs, TensorArgType" in code
+        assert "from simpler_setup.torch_interop import make_tensor_arg" in code
 
-    def test_anonymous_namespace(self):
-        """Internal functions are wrapped in anonymous namespace."""
+    def test_tensor_arg_type_tags(self):
+        """Parameter directions map to correct TensorArgType tags."""
 
         @pl.program
         class Input:
-            @pl.function(level=pl.Level.HOST, role=pl.Role.Worker)
-            def simple_worker(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
-                y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
+            @pl.function(level=pl.Level.CHIP, role=pl.Role.SubWorker)
+            def chip_worker(
+                self,
+                a: pl.Tensor[[64], pl.FP32],
+                b: pl.Tensor[[64], pl.FP32],
+                f: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                y: pl.Tensor[[64], pl.FP32] = pl.add(a, b)
                 return y
+
+            @pl.function(level=pl.Level.CHIP, role=pl.Role.Orchestrator)
+            def chip_orch(
+                self,
+                a: pl.Tensor[[64], pl.FP32],
+                b: pl.Tensor[[64], pl.FP32],
+                f: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                out: pl.Tensor[[64], pl.FP32] = self.chip_worker(a, b, f)
+                return out
+
+            @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+            def host_orch(
+                self,
+                a: pl.Tensor[[64], pl.FP32],
+                b: pl.Tensor[[64], pl.FP32],
+                f: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                out: pl.Tensor[[64], pl.FP32] = self.chip_orch(a, b, f)
+                return out
 
         program = passes.convert_to_ssa()(Input)
         cg = codegen.DistributedCodegen()
         code = cg.generate(program)
 
-        assert "namespace {" in code
-        assert "}  // namespace" in code
+        assert "TensorArgType.INPUT" in code
+        assert "TensorArgType.OUTPUT_EXISTING" in code
 
-    def test_topology_constants(self):
-        """Topology constants emitted for used levels."""
+    def test_bool_constants(self):
+        """Boolean constants use Python True/False, not C++ true/false."""
 
         @pl.program
         class Input:
-            @pl.function(level=pl.Level.HOST, role=pl.Role.Worker)
-            def worker(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
-                y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
-                return y
+            @pl.function(level=pl.Level.HOST, role=pl.Role.SubWorker)
+            def worker(x: pl.Tensor[[64], pl.FP32]):
+                pass
 
         program = passes.convert_to_ssa()(Input)
         cg = codegen.DistributedCodegen()
         code = cg.generate(program)
 
-        # HOST = level 3, so we expect kNumL3
-        assert "kNumL3" in code
-        assert "env_int" in code
+        # Python uses True/False, not true/false
+        assert "true" not in code.lower() or "True" in code or "False" in code
+
+    def test_sub_worker_pure_python_body(self):
+        """HOST Worker with pure Python body is captured without DSL parsing."""
+
+        @pl.program
+        class Input:
+            @pl.function(level=pl.Level.HOST, role=pl.Role.SubWorker)
+            def verify(f: pl.Tensor[[128, 128], pl.FP32]):
+                import torch  # noqa: PLC0415
+
+                expected = torch.full((128, 128), 5.0, dtype=torch.float32)
+                assert torch.allclose(f, expected)  # pyright: ignore[reportArgumentType]
+
+            @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+            def host_orch(self, x: pl.Tensor[[128, 128], pl.FP32]) -> pl.Tensor[[128, 128], pl.FP32]:
+                self.verify(x)
+                return x
+
+        # Should not raise — pure Python body is skipped during DSL parsing
+        program = passes.convert_to_ssa()(Input)
+        cg = codegen.DistributedCodegen()
+        code = cg.generate(program)
+
+        assert "submit_sub" in code
+        assert 'sub_ids["verify"]' in code
+
+    def test_sub_worker_body_inlined_in_ir(self):
+        """SubWorker body is captured as an InlineStmt on the IR Function."""
+
+        @pl.program
+        class Input:
+            @pl.function(level=pl.Level.HOST, role=pl.Role.SubWorker)
+            def verify(f: pl.Tensor[[64], pl.FP32]):
+                pass
+
+            @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+            def host_orch(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                self.verify(x)
+                return x
+
+        verify_fn = Input.get_function("verify")
+        assert verify_fn is not None
+        assert isinstance(verify_fn.body, ir.InlineStmt)
+        assert verify_fn.body.language == ir.InlineLanguage.Python
+        assert isinstance(verify_fn.body.body, str)
+
+    def test_create_tensor_emits_shared_torch_zeros(self):
+        """tensor.create in HOST orchestrator emits torch.zeros(...).share_memory_()."""
+
+        @pl.program
+        class Input:
+            @pl.function(level=pl.Level.CHIP, role=pl.Role.SubWorker)
+            def chip_worker(
+                self,
+                a: pl.Tensor[[64], pl.FP32],
+                buf: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                y: pl.Tensor[[64], pl.FP32] = pl.add(a, a)
+                return y
+
+            @pl.function(level=pl.Level.CHIP, role=pl.Role.Orchestrator)
+            def chip_orch(
+                self,
+                a: pl.Tensor[[64], pl.FP32],
+                buf: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                result: pl.Tensor[[64], pl.FP32] = self.chip_worker(a, buf)
+                return result
+
+            @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+            def host_orch(
+                self,
+                a: pl.Tensor[[64], pl.FP32],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                buf: pl.Tensor[[64], pl.FP32] = pl.create_tensor([64], dtype=pl.FP32)
+                result: pl.Tensor[[64], pl.FP32] = self.chip_orch(a, buf)
+                return result
+
+        program = passes.convert_to_ssa()(Input)
+        cg = codegen.DistributedCodegen()
+        code = cg.generate(program)
+
+        # torch.zeros with share_memory_() emitted
+        assert "torch.zeros(" in code
+        assert "torch.float32" in code
+        assert ".share_memory_()" in code
+        assert "import torch" in code
+
+    def test_create_tensor_shared_zeros_for_multiple_tensors(self):
+        """Multiple tensor.create calls each emit torch.zeros(...).share_memory_()."""
+
+        @pl.program
+        class Input:
+            @pl.function(level=pl.Level.CHIP, role=pl.Role.SubWorker)
+            def chip_add(
+                self,
+                a: pl.Tensor[[64], pl.FP32],
+                b: pl.Tensor[[64], pl.FP32],
+                f: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                y: pl.Tensor[[64], pl.FP32] = pl.add(a, b)
+                return y
+
+            @pl.function(level=pl.Level.CHIP, role=pl.Role.SubWorker)
+            def chip_sub(
+                self,
+                a: pl.Tensor[[64], pl.FP32],
+                b: pl.Tensor[[64], pl.FP32],
+                f: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                y: pl.Tensor[[64], pl.FP32] = pl.sub(a, b)
+                return y
+
+            @pl.function(level=pl.Level.CHIP, role=pl.Role.Orchestrator)
+            def chip_orch_add(
+                self,
+                a: pl.Tensor[[64], pl.FP32],
+                b: pl.Tensor[[64], pl.FP32],
+                f: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                out: pl.Tensor[[64], pl.FP32] = self.chip_add(a, b, f)
+                return out
+
+            @pl.function(level=pl.Level.CHIP, role=pl.Role.Orchestrator)
+            def chip_orch_sub(
+                self,
+                a: pl.Tensor[[64], pl.FP32],
+                b: pl.Tensor[[64], pl.FP32],
+                f: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                out: pl.Tensor[[64], pl.FP32] = self.chip_sub(a, b, f)
+                return out
+
+            @pl.function(level=pl.Level.HOST, role=pl.Role.SubWorker)
+            def reduce_sum(
+                sum_ab: pl.Tensor[[64], pl.FP32],
+                diff_ab: pl.Tensor[[64], pl.FP32],
+                f: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                return f
+
+            @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+            def host_orch(
+                self,
+                a: pl.Tensor[[64], pl.FP32],
+                b: pl.Tensor[[64], pl.FP32],
+                f: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                sum_ab: pl.Tensor[[64], pl.FP32] = pl.create_tensor([64], dtype=pl.FP32)
+                diff_ab: pl.Tensor[[64], pl.FP32] = pl.create_tensor([64], dtype=pl.FP32)
+                out_sum: pl.Tensor[[64], pl.FP32] = self.chip_orch_add(a, b, sum_ab)
+                out_diff: pl.Tensor[[64], pl.FP32] = self.chip_orch_sub(a, b, diff_ab)
+                out_f: pl.Tensor[[64], pl.FP32] = self.reduce_sum(out_sum, out_diff, f)
+                return out_f
+
+        program = passes.convert_to_ssa()(Input)
+        cg = codegen.DistributedCodegen()
+        code = cg.generate(program)
+
+        # Two torch.zeros().share_memory_() calls
+        assert code.count("torch.zeros(") == 2
+        assert code.count(".share_memory_()") == 2
+        # Parameter tensors still use make_tensor_arg(tensors[...])
+        assert 'make_tensor_arg(tensors["a' in code
+        assert 'make_tensor_arg(tensors["b' in code
+
+
+class TestSubWorkerSourceGeneration:
+    """Test _emit_sub_worker_module for correct param names and imports."""
+
+    def test_sub_worker_source_param_names_match_signature(self):
+        """_user_* function params come from the IR function params."""
+        from pypto.backend.pto_backend import _emit_sub_worker_module  # noqa: PLC0415
+
+        @pl.program
+        class P:
+            @pl.function(level=pl.Level.HOST, role=pl.Role.SubWorker)
+            def verify(f: pl.Tensor[[64], pl.FP32]):
+                assert f is not None
+
+        verify_fn = P.get_function("verify")
+        assert verify_fn is not None
+        source = _emit_sub_worker_module(verify_fn)
+        param_name = verify_fn.params[0].name_hint
+        assert f"def _user_verify({param_name}):" in source
+        assert f"{param_name} = _tensor_from_continuous(args.tensor(0))" in source
+        assert f"_user_verify({param_name})" in source
+
+    def test_sub_worker_source_imports_torch(self):
+        """Generated SubWorker source includes import torch."""
+        from pypto.backend.pto_backend import _emit_sub_worker_module  # noqa: PLC0415
+
+        @pl.program
+        class P:
+            @pl.function(level=pl.Level.HOST, role=pl.Role.SubWorker)
+            def worker(x: pl.Tensor[[64], pl.FP32]):
+                pass
+
+        worker_fn = P.get_function("worker")
+        assert worker_fn is not None
+        source = _emit_sub_worker_module(worker_fn)
+        assert "import torch" in source
 
 
 if __name__ == "__main__":

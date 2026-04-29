@@ -110,9 +110,9 @@ class TestScopeStmt:
         var_y = ir.Var("y", ir.TensorType([64], DataType.FP32), span)
         body = ir.AssignStmt(var_y, var_x, span)
 
-        scope = ir.HierarchyScopeStmt(level=ir.Level.HOST, role=ir.Role.Worker, body=body, span=span)
+        scope = ir.HierarchyScopeStmt(level=ir.Level.HOST, role=ir.Role.SubWorker, body=body, span=span)
         assert scope.level == ir.Level.HOST
-        assert scope.role == ir.Role.Worker
+        assert scope.role == ir.Role.SubWorker
         assert scope.scope_kind == ir.ScopeKind.Hierarchy
 
 
