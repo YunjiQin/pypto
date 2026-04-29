@@ -256,6 +256,8 @@ void IRVisitor::VisitStmt_(const BreakStmtPtr& op) {}
 
 void IRVisitor::VisitStmt_(const ContinueStmtPtr& op) {}
 
+void IRVisitor::VisitStmt_(const InlineStmtPtr& op) {}
+
 void IRVisitor::VisitStmt_(const StmtPtr& op) {}
 
 }  // namespace ir

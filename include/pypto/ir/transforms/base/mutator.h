@@ -104,6 +104,7 @@ class IRMutator : public ExprFunctor<ExprPtr>, public StmtFunctor<StmtPtr> {
   StmtPtr VisitStmt_(const EvalStmtPtr& op) override;
   StmtPtr VisitStmt_(const BreakStmtPtr& op) override;
   StmtPtr VisitStmt_(const ContinueStmtPtr& op) override;
+  StmtPtr VisitStmt_(const InlineStmtPtr& op) override;
   StmtPtr VisitStmt_(const StmtPtr& op) override;
 
   /// Override to handle ALL binary expressions (Add, Sub, Mul, ...) in one method.

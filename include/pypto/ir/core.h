@@ -99,6 +99,7 @@ enum class ObjectKind {
   EvalStmt,
   BreakStmt,
   ContinueStmt,
+  InlineStmt,
 
   // Type kinds
   UnknownType,

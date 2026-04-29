@@ -786,6 +786,16 @@ static IRNodePtr DeserializeContinueStmt(const msgpack::object& fields_obj, msgp
   return std::make_shared<ContinueStmt>(span, DeserializeLeadingComments(fields_obj));
 }
 
+// Deserialize InlineStmt
+static IRNodePtr DeserializeInlineStmt(const msgpack::object& fields_obj, msgpack::zone& /*zone*/,
+                                       DeserializerContext& ctx) {
+  auto span = ctx.DeserializeSpan(GET_FIELD_OBJ("span"));
+  std::string body = GET_FIELD_OBJ("body").as<std::string>();
+  auto language = static_cast<InlineLanguage>(GET_FIELD_OBJ("language").as<uint64_t>());
+  return std::make_shared<InlineStmt>(std::move(body), language, span,
+                                      DeserializeLeadingComments(fields_obj));
+}
+
 // Deserialize Function
 static IRNodePtr DeserializeFunction(const msgpack::object& fields_obj, msgpack::zone& zone,
                                      DeserializerContext& ctx) {
@@ -993,6 +1003,7 @@ static TypeRegistrar _seq_stmts_registrar("SeqStmts", DeserializeSeqStmts);
 static TypeRegistrar _eval_stmt_registrar("EvalStmt", DeserializeEvalStmt);
 static TypeRegistrar _break_stmt_registrar("BreakStmt", DeserializeBreakStmt);
 static TypeRegistrar _continue_stmt_registrar("ContinueStmt", DeserializeContinueStmt);
+static TypeRegistrar _inline_stmt_registrar("InlineStmt", DeserializeInlineStmt);
 
 static TypeRegistrar _function_registrar("Function", DeserializeFunction);
 static TypeRegistrar _program_registrar("Program", DeserializeProgram);

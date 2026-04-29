@@ -198,12 +198,11 @@ def compile(  # noqa: PLR0913
         if distributed_config is None:
             distributed_config = DistributedConfig()
         return DistributedCompiledProgram(
-            program,
+            transformed_program,
             output_dir,
             backend_type=backend_type,
             platform=platform,
             distributed_config=distributed_config,
-            transformed_program=transformed_program,
         )
 
     return CompiledProgram(

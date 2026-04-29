@@ -109,7 +109,7 @@ def execute_distributed(  # noqa: PLR0912
         config: Optional run configuration (unused for now).
     """
     from simpler.task_interface import (  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
-        ChipCallConfig,
+        CallConfig,
     )
     from simpler.worker import (  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
         Worker,
@@ -126,7 +126,7 @@ def execute_distributed(  # noqa: PLR0912
     chip_callables: dict[str, Any] = {}
     runtime_name = "tensormap_and_ringbuffer"
     next_levels_dir = output_dir / "next_levels"
-    for func in compiled._transformed_program.functions.values():
+    for func in compiled._program.functions.values():
         if func.func_type == FunctionType.Orchestration:
             chip_dir = next_levels_dir / func.name
             if chip_dir.exists():
@@ -202,16 +202,16 @@ def execute_distributed(  # noqa: PLR0912
         entry_fn(
             orch,
             _unused_args,
-            chip_config,
+            call_config,
             tensors=tensors,
             callables=chip_callables,
             sub_ids=sub_ids,
             _keep=_keep,
         )
 
-    chip_config = ChipCallConfig()
-    chip_config.block_dim = dc.block_dim
-    chip_config.aicpu_thread_num = dc.aicpu_thread_num
+    call_config = CallConfig()
+    call_config.block_dim = dc.block_dim
+    call_config.aicpu_thread_num = dc.aicpu_thread_num
 
     try:
         w.run(orch_fn)

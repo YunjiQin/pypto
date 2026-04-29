@@ -338,6 +338,19 @@ class StructuralEqualImpl {
     return true;
   }
 
+  result_type VisitLeafField(const InlineLanguage& lhs, const InlineLanguage& rhs) {
+    if (lhs != rhs) {
+      if constexpr (AssertMode) {
+        std::ostringstream msg;
+        msg << "InlineLanguage mismatch (" << static_cast<uint8_t>(lhs) << " != " << static_cast<uint8_t>(rhs)
+            << ")";
+        ThrowMismatch(msg.str(), IRNodePtr(), IRNodePtr(), "", "");
+      }
+      return false;
+    }
+    return true;
+  }
+
   result_type VisitLeafField(const ChunkPolicy& lhs, const ChunkPolicy& rhs) {
     if (lhs != rhs) {
       if constexpr (AssertMode) {
@@ -925,6 +938,7 @@ bool StructuralEqualImpl<AssertMode>::Equal(const IRNodePtr& lhs, const IRNodePt
   EQUAL_DISPATCH(EvalStmt)
   EQUAL_DISPATCH(BreakStmt)
   EQUAL_DISPATCH(ContinueStmt)
+  EQUAL_DISPATCH(InlineStmt)
   EQUAL_DISPATCH(Function)
   EQUAL_DISPATCH_TRANSPARENT(Program)
 

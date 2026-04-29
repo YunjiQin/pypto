@@ -695,6 +695,8 @@ StmtPtr IRMutator::VisitStmt_(const BreakStmtPtr& op) { return op; }
 
 StmtPtr IRMutator::VisitStmt_(const ContinueStmtPtr& op) { return op; }
 
+StmtPtr IRMutator::VisitStmt_(const InlineStmtPtr& op) { return op; }
+
 StmtPtr IRMutator::VisitStmt_(const StmtPtr& op) { return op; }
 
 }  // namespace ir

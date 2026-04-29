@@ -599,6 +599,27 @@ class IRBuilder:
         self._builder.emit(stmt)
         return stmt
 
+    def inline_stmt(
+        self,
+        body: str,
+        language: ir.InlineLanguage = ir.InlineLanguage.Python,
+        span: ir.Span | None = None,
+    ) -> ir.InlineStmt:
+        """Create an inline statement carrying a verbatim source body and emit it.
+
+        Args:
+            body: Verbatim source text (e.g. a SubWorker's Python body).
+            language: Language of ``body``. Defaults to Python.
+            span: Optional explicit span. If None, captured from call site.
+
+        Returns:
+            The created inline statement.
+        """
+        actual_span = span if span is not None else self._capture_call_span()
+        stmt = ir.InlineStmt(body, language, actual_span)
+        self._builder.emit(stmt)
+        return stmt
+
     # ========== Context State Queries ==========
 
     def in_function(self) -> bool:

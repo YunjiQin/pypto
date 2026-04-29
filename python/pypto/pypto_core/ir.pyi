@@ -2056,6 +2056,34 @@ class ContinueStmt(Stmt):
             span: Source location
         """
 
+class InlineLanguage(enum.Enum):
+    """Source language carried by an InlineStmt body."""
+
+    Python = 0
+    """Python source."""
+
+class InlineStmt(Stmt):
+    """Inline statement: opaque source body in a target language.
+
+    Used to embed verbatim source text (e.g. a SubWorker's Python body) directly
+    in the IR. Treated as a leaf by passes — no children to traverse.
+    """
+
+    body: Final[str]
+    """Verbatim source text."""
+
+    language: Final[InlineLanguage]
+    """Language of the body string."""
+
+    def __init__(self, body: str, language: InlineLanguage, span: Span) -> None:
+        """Create an inline statement.
+
+        Args:
+            body: Verbatim source text
+            language: Language of the body
+            span: Source location
+        """
+
 class Function(IRNode):
     """Function definition with name, parameters, return types, and body."""
 
@@ -3304,6 +3332,7 @@ class IRVisitor:
     def visit_eval_stmt(self, op: EvalStmt) -> None: ...
     def visit_break_stmt(self, op: BreakStmt) -> None: ...
     def visit_continue_stmt(self, op: ContinueStmt) -> None: ...
+    def visit_inline_stmt(self, op: InlineStmt) -> None: ...
 
 class IRMutator:
     """IR mutator with copy-on-write semantics.
@@ -3381,3 +3410,4 @@ class IRMutator:
     def visit_eval_stmt(self, op: EvalStmt) -> Stmt: ...
     def visit_break_stmt(self, op: BreakStmt) -> Stmt: ...
     def visit_continue_stmt(self, op: ContinueStmt) -> Stmt: ...
+    def visit_inline_stmt(self, op: InlineStmt) -> Stmt: ...

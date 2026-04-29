@@ -94,10 +94,12 @@ class DistributedCompiledProgram:
         backend_type: BackendType = BackendType.Ascend910B,
         platform: str | None = None,
         distributed_config: DistributedConfig | None = None,
-        transformed_program: Program | None = None,
     ) -> None:
+        # ``program`` is the post-pass IR. The runtime needs post-pass IR for
+        # orchestrator metadata (post-SSA names that match the generated
+        # host_orch.py) and to iterate Orchestration functions synthesized by
+        # passes such as OutlineHierarchyScopes.
         self._program = program
-        self._transformed_program = transformed_program or program
         self._output_dir = Path(output_dir).resolve()
         self._backend_type = backend_type
         self._platform = platform or _default_platform(backend_type)
@@ -129,10 +131,10 @@ class DistributedCompiledProgram:
 
     def _get_metadata(self) -> tuple[list[_ParamInfo], list[int], list[Any]]:
         if self._param_infos is None:
-            # Find the HOST orchestrator function in the transformed program
-            # (uses post-SSA names that match the generated Python code)
+            # Find the HOST orchestrator function (post-SSA names match the
+            # generated Python code).
             host_orch = None
-            for func in self._transformed_program.functions.values():
+            for func in self._program.functions.values():
                 if (
                     func.level is not None
                     and level_to_linqu_level(func.level) >= 3
@@ -148,7 +150,7 @@ class DistributedCompiledProgram:
                 )
             else:
                 self._param_infos, self._output_indices, self._return_types = _extract_param_infos(
-                    self._transformed_program
+                    self._program
                 )
         assert self._output_indices is not None and self._return_types is not None
         return self._param_infos, self._output_indices, self._return_types

@@ -97,6 +97,7 @@ DEFINE_KIND_TRAIT(SeqStmts, ObjectKind::SeqStmts)
 DEFINE_KIND_TRAIT(EvalStmt, ObjectKind::EvalStmt)
 DEFINE_KIND_TRAIT(BreakStmt, ObjectKind::BreakStmt)
 DEFINE_KIND_TRAIT(ContinueStmt, ObjectKind::ContinueStmt)
+DEFINE_KIND_TRAIT(InlineStmt, ObjectKind::InlineStmt)
 
 // Type types
 DEFINE_KIND_TRAIT(UnknownType, ObjectKind::UnknownType)
@@ -131,8 +132,8 @@ struct KindTrait<Stmt> {
                                          ObjectKind::ClusterScopeStmt, ObjectKind::HierarchyScopeStmt,
                                          ObjectKind::SpmdScopeStmt,    ObjectKind::SeqStmts,
                                          ObjectKind::EvalStmt,         ObjectKind::BreakStmt,
-                                         ObjectKind::ContinueStmt};
-  static constexpr size_t count = 15;
+                                         ObjectKind::ContinueStmt,     ObjectKind::InlineStmt};
+  static constexpr size_t count = 16;
 };
 
 // ScopeStmt base class - matches any scope kind (5 derived classes)

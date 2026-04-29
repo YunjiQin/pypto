@@ -97,7 +97,7 @@ def test_program_with_level_role():
     @pl.program
     class P:
         @pl.function(level=pl.Level.HOST, role=pl.Role.SubWorker)
-        def worker(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+        def worker(x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
             return x
 
         @pl.function(level=pl.Level.POD, role=pl.Role.Orchestrator)
@@ -127,7 +127,7 @@ def test_program_mixed_with_and_without_level():
             return x
 
         @pl.function(level=pl.Level.HOST, role=pl.Role.SubWorker)
-        def worker(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+        def worker(x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
             return x
 
     main_fn = P.get_function("main")

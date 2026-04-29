@@ -11,7 +11,7 @@
 
 import pypto.language as pl
 import pytest
-from pypto import codegen, passes
+from pypto import codegen, ir, passes
 
 
 class TestDistributedCodegen:
@@ -60,7 +60,7 @@ class TestDistributedCodegen:
         @pl.program
         class Input:
             @pl.function(level=pl.Level.HOST, role=pl.Role.SubWorker)
-            def verify(self, f: pl.Tensor[[64], pl.FP32]):
+            def verify(f: pl.Tensor[[64], pl.FP32]):
                 pass
 
             @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
@@ -100,7 +100,7 @@ class TestDistributedCodegen:
                 return y
 
             @pl.function(level=pl.Level.HOST, role=pl.Role.SubWorker)
-            def verify(self, f: pl.Tensor[[64], pl.FP32]):
+            def verify(f: pl.Tensor[[64], pl.FP32]):
                 pass
 
             @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
@@ -146,7 +146,7 @@ class TestDistributedCodegen:
         @pl.program
         class Input:
             @pl.function(level=pl.Level.HOST, role=pl.Role.SubWorker)
-            def simple_worker(self, x: pl.Tensor[[64], pl.FP32]):
+            def simple_worker(x: pl.Tensor[[64], pl.FP32]):
                 pass
 
         program = passes.convert_to_ssa()(Input)
@@ -204,7 +204,7 @@ class TestDistributedCodegen:
         @pl.program
         class Input:
             @pl.function(level=pl.Level.HOST, role=pl.Role.SubWorker)
-            def worker(self, x: pl.Tensor[[64], pl.FP32]):
+            def worker(x: pl.Tensor[[64], pl.FP32]):
                 pass
 
         program = passes.convert_to_ssa()(Input)
@@ -220,7 +220,7 @@ class TestDistributedCodegen:
         @pl.program
         class Input:
             @pl.function(level=pl.Level.HOST, role=pl.Role.SubWorker)
-            def verify(self, f: pl.Tensor[[128, 128], pl.FP32]):
+            def verify(f: pl.Tensor[[128, 128], pl.FP32]):
                 import torch  # noqa: PLC0415
 
                 expected = torch.full((128, 128), 5.0, dtype=torch.float32)
@@ -239,16 +239,13 @@ class TestDistributedCodegen:
         assert "submit_sub" in code
         assert 'sub_ids["verify"]' in code
 
-    def test_sub_worker_callable_captured(self):
-        """HOST Worker callable is captured in the sub_worker registry."""
-        from pypto.language.parser.decorator import (  # noqa: PLC0415
-            get_sub_worker_callables,  # pyright: ignore[reportAttributeAccessIssue]
-        )
+    def test_sub_worker_body_inlined_in_ir(self):
+        """SubWorker body is captured as an InlineStmt on the IR Function."""
 
         @pl.program
         class Input:
             @pl.function(level=pl.Level.HOST, role=pl.Role.SubWorker)
-            def verify(self, f: pl.Tensor[[64], pl.FP32]):
+            def verify(f: pl.Tensor[[64], pl.FP32]):
                 pass
 
             @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
@@ -256,9 +253,11 @@ class TestDistributedCodegen:
                 self.verify(x)
                 return x
 
-        subs = get_sub_worker_callables(Input)
-        assert "verify" in subs
-        assert isinstance(subs["verify"], str)
+        verify_fn = Input.get_function("verify")
+        assert verify_fn is not None
+        assert isinstance(verify_fn.body, ir.InlineStmt)
+        assert verify_fn.body.language == ir.InlineLanguage.Python
+        assert isinstance(verify_fn.body.body, str)
 
     def test_create_tensor_emits_shared_torch_zeros(self):
         """tensor.create in HOST orchestrator emits torch.zeros(...).share_memory_()."""
@@ -349,7 +348,6 @@ class TestDistributedCodegen:
 
             @pl.function(level=pl.Level.HOST, role=pl.Role.SubWorker)
             def reduce_sum(
-                self,
                 sum_ab: pl.Tensor[[64], pl.FP32],
                 diff_ab: pl.Tensor[[64], pl.FP32],
                 f: pl.Out[pl.Tensor[[64], pl.FP32]],
@@ -383,48 +381,40 @@ class TestDistributedCodegen:
 
 
 class TestSubWorkerSourceGeneration:
-    """Test _generate_sub_worker_source for correct param names and imports."""
+    """Test _emit_sub_worker_module for correct param names and imports."""
 
-    def test_sub_worker_source_uses_original_param_names(self):
-        """_user_* function params use original names, not SSA-renamed ones."""
-        from pypto.backend.pto_backend import _generate_sub_worker_source  # noqa: PLC0415
+    def test_sub_worker_source_param_names_match_signature(self):
+        """_user_* function params come from the IR function params."""
+        from pypto.backend.pto_backend import _emit_sub_worker_module  # noqa: PLC0415
 
-        body = "assert torch.allclose(f, expected)\n"
-        source = _generate_sub_worker_source("verify", body, ["f__ssa_v0"])
+        @pl.program
+        class P:
+            @pl.function(level=pl.Level.HOST, role=pl.Role.SubWorker)
+            def verify(f: pl.Tensor[[64], pl.FP32]):
+                assert f is not None
 
-        # _user_verify should use original name 'f'
-        assert "def _user_verify(f):" in source
-        # wrapper should unpack with SSA name and call _user with SSA value
-        assert "f__ssa_v0 = _tensor_from_continuous(args.tensor(0))" in source
-        assert "_user_verify(f__ssa_v0)" in source
+        verify_fn = P.get_function("verify")
+        assert verify_fn is not None
+        source = _emit_sub_worker_module(verify_fn)
+        param_name = verify_fn.params[0].name_hint
+        assert f"def _user_verify({param_name}):" in source
+        assert f"{param_name} = _tensor_from_continuous(args.tensor(0))" in source
+        assert f"_user_verify({param_name})" in source
 
     def test_sub_worker_source_imports_torch(self):
         """Generated SubWorker source includes import torch."""
-        from pypto.backend.pto_backend import _generate_sub_worker_source  # noqa: PLC0415
+        from pypto.backend.pto_backend import _emit_sub_worker_module  # noqa: PLC0415
 
-        source = _generate_sub_worker_source("worker", "pass\n", ["x__ssa_v0"])
+        @pl.program
+        class P:
+            @pl.function(level=pl.Level.HOST, role=pl.Role.SubWorker)
+            def worker(x: pl.Tensor[[64], pl.FP32]):
+                pass
+
+        worker_fn = P.get_function("worker")
+        assert worker_fn is not None
+        source = _emit_sub_worker_module(worker_fn)
         assert "import torch" in source
-
-    def test_sub_worker_source_multiple_params(self):
-        """Multiple SSA params all stripped correctly."""
-        from pypto.backend.pto_backend import _generate_sub_worker_source  # noqa: PLC0415
-
-        body = "result = torch.add(sum_ab, diff_ab)\nf[:] = result\n"
-        source = _generate_sub_worker_source(
-            "reduce_sum",
-            body,
-            ["sum_ab__ssa_v0", "diff_ab__ssa_v0", "f__ssa_v0"],
-        )
-
-        assert "def _user_reduce_sum(sum_ab, diff_ab, f):" in source
-        assert "_user_reduce_sum(sum_ab__ssa_v0, diff_ab__ssa_v0, f__ssa_v0)" in source
-
-    def test_sub_worker_source_no_suffix_passthrough(self):
-        """Param without auto-name suffix passes through unchanged."""
-        from pypto.backend.pto_backend import _generate_sub_worker_source  # noqa: PLC0415
-
-        source = _generate_sub_worker_source("worker", "pass\n", ["x"])
-        assert "def _user_worker(x):" in source
 
 
 if __name__ == "__main__":

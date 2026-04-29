@@ -58,7 +58,7 @@ class L3DependencyProgram:
         return out_f
 
     @pl.function(level=pl.Level.HOST, role=pl.Role.SubWorker)
-    def verify(self, f: pl.Tensor[[128, 128], pl.FP32]):
+    def verify(f: pl.Tensor[[128, 128], pl.FP32]):
         expected = torch.full((128, 128), 5.0, dtype=torch.float32)
         if not torch.allclose(f, expected, rtol=1e-5, atol=1e-5):
             raise AssertionError(
@@ -97,13 +97,6 @@ class L3DependencyInlineProgram:
             with pl.at(level=pl.Level.CORE_GROUP):
                 out = pl.sub(a, b)
                 pl.assemble(sub_buf, out, [0, 0])
-        with pl.at(level=pl.Level.HOST, role=pl.Role.SubWorker):
-            expected = torch.full((128, 128), 5.0, dtype=torch.float32)
-            if not torch.allclose(out_sum, expected, rtol=1e-5, atol=1e-5):
-                raise AssertionError(
-                    f"SubWorker verify failed: expected 5.0, "
-                    f"got max={out_sum.max().item()}, min={out_sum.min().item()}"
-                )
         return out_sum
 
 

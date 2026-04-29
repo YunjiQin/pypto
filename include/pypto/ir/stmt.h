@@ -1050,6 +1050,41 @@ class ContinueStmt : public Stmt {
 using ContinueStmtPtr = std::shared_ptr<const ContinueStmt>;
 
 /**
+ * @brief Language carried by an InlineStmt body.
+ */
+enum class InlineLanguage : uint8_t {
+  Python = 0,
+};
+
+/**
+ * @brief Inline statement carrying a verbatim source body in a target language.
+ *
+ * Used to embed a block of source text (e.g. a SubWorker's Python body) directly
+ * into the IR. Passes treat it as an opaque leaf — no children to traverse.
+ */
+class InlineStmt : public Stmt {
+ public:
+  InlineStmt(std::string body, InlineLanguage language, Span span,
+             std::vector<std::string> leading_comments = {})
+      : Stmt(std::move(span), std::move(leading_comments)), body_(std::move(body)), language_(language) {}
+
+  [[nodiscard]] ObjectKind GetKind() const override { return ObjectKind::InlineStmt; }
+  [[nodiscard]] std::string TypeName() const override { return "InlineStmt"; }
+
+  static constexpr auto GetFieldDescriptors() {
+    return std::tuple_cat(Stmt::GetFieldDescriptors(),
+                          std::make_tuple(reflection::UsualField(&InlineStmt::body_, "body"),
+                                          reflection::UsualField(&InlineStmt::language_, "language")));
+  }
+
+ public:
+  std::string body_;
+  InlineLanguage language_;
+};
+
+using InlineStmtPtr = std::shared_ptr<const InlineStmt>;
+
+/**
  * @brief Attach leading comments to an existing statement
  *
  * Stmts are handed around as `shared_ptr<const Stmt>` to discourage mutation of

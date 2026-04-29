@@ -1119,6 +1119,18 @@ void BindIR(nb::module_& m) {
   continue_stmt_class.def(nb::init<const Span&>(), nb::arg("span"), "Create a continue statement");
   BindFields<ContinueStmt>(continue_stmt_class);
 
+  // InlineLanguage enum — language tag for InlineStmt bodies.
+  nb::enum_<InlineLanguage>(ir, "InlineLanguage", "Source language carried by an InlineStmt body")
+      .value("Python", InlineLanguage::Python, "Python source")
+      .export_values();
+
+  // InlineStmt - const shared_ptr
+  auto inline_stmt_class = nb::class_<InlineStmt, Stmt>(
+      ir, "InlineStmt", "Inline statement: opaque source body in a target language");
+  inline_stmt_class.def(nb::init<std::string, InlineLanguage, const Span&>(), nb::arg("body"),
+                        nb::arg("language"), nb::arg("span"), "Create an inline statement");
+  BindFields<InlineStmt>(inline_stmt_class);
+
   // FunctionType enum
   nb::enum_<FunctionType>(ir, "FunctionType", "Function type classification")
       .value("Opaque", FunctionType::Opaque, "Unspecified function type (default)")

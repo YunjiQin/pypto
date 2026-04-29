@@ -42,21 +42,15 @@ def _find_scope_stmt(stmt: ir.Stmt) -> ir.ScopeStmt | None:
 # ─── Basic pl.at() parsing ────────────────────────────────────────────────
 
 
-def test_parse_pl_at_host_worker():
-    """Parse with pl.at(level=HOST, role=Worker)."""
+def test_parse_pl_at_host_worker_rejected():
+    """Inline ``with pl.at(role=SubWorker)`` is rejected; use @pl.function instead."""
+    with pytest.raises(ParserSyntaxError, match="not supported"):
 
-    @pl.function
-    def f(x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
-        with pl.at(level=pl.Level.HOST, role=pl.Role.SubWorker):
-            _ = x
-        return x
-
-    scope = _find_scope_stmt(f.body)
-    assert scope is not None
-    assert scope.scope_kind == ir.ScopeKind.Hierarchy
-    hierarchy_scope = cast(_HasLevelRole, scope)
-    assert hierarchy_scope.level == ir.Level.HOST
-    assert hierarchy_scope.role == ir.Role.SubWorker
+        @pl.function
+        def f(x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+            with pl.at(level=pl.Level.HOST, role=pl.Role.SubWorker):
+                _ = x
+            return x
 
 
 def test_parse_pl_at_global_orchestrator():
@@ -114,12 +108,12 @@ def test_parse_pl_at_alias_pod():
 
 
 def test_parse_pl_at_nested():
-    """Parse nested pl.at blocks."""
+    """Parse nested pl.at Hierarchy blocks (Orchestrator scopes)."""
 
     @pl.function
     def f(x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
         with pl.at(level=pl.Level.GLOBAL, role=pl.Role.Orchestrator):
-            with pl.at(level=pl.Level.HOST, role=pl.Role.SubWorker):
+            with pl.at(level=pl.Level.HOST, role=pl.Role.Orchestrator):
                 _ = x
         return x
 
@@ -134,7 +128,7 @@ def test_parse_pl_at_nested():
     assert inner.scope_kind == ir.ScopeKind.Hierarchy
     inner_scope = cast(_HasLevelRole, inner)
     assert inner_scope.level == ir.Level.HOST
-    assert inner_scope.role == ir.Role.SubWorker
+    assert inner_scope.role == ir.Role.Orchestrator
 
 
 # ─── Error cases ──────────────────────────────────────────────────────────
@@ -202,14 +196,14 @@ def test_printer_hierarchy_scope_roundtrip():
 
     @pl.function
     def f(x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
-        with pl.at(level=pl.Level.HOST, role=pl.Role.SubWorker):
+        with pl.at(level=pl.Level.HOST, role=pl.Role.Orchestrator):
             _ = x
         return x
 
     printed = str(f)
     assert "pl.at(" in printed
     assert "Level.HOST" in printed
-    assert "Role.SubWorker" in printed
+    assert "Role.Orchestrator" in printed
 
 
 # ─── New pl.at() InCore / AutoInCore forms ───────────────────────────────────

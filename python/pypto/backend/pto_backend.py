@@ -940,155 +940,61 @@ def _generate_with_distributed(
             for path, content in chip_files.items():
                 result_files[f"next_levels/{func.name}/{path}"] = content
 
-    # 3. SubWorker functions → sub_workers/{name}.py
-    # The registry is keyed by program name; ``transformed_program.name`` is
-    # preserved by the pass pipeline so the lookup matches the entry recorded
-    # at decoration time.
-    from pypto.language.parser.decorator import (  # noqa: PLC0415
-        get_sub_worker_callables,  # pyright: ignore[reportAttributeAccessIssue]
-    )
-
-    raw_subs = get_sub_worker_callables(transformed_program)
-    for func_name, body in raw_subs.items():
-        func = transformed_program.get_function(func_name)
-        if func is not None:
-            param_names = [p.name_hint for p in func.params]
-            source = _generate_sub_worker_source(func_name, body, param_names)
-            result_files[f"sub_workers/{func_name}.py"] = source
+    # 3. HOST SubWorker functions → sub_workers/{name}.py
+    # Only HOST-level (Linqu level >= 3) SubWorkers carry an InlineStmt body
+    # captured by the decorator. Lower-level role=SubWorker kernels (e.g. CHIP
+    # InCore promoted by auto-derive) keep their DSL body and are emitted by
+    # chip-level codegen above.
+    for func in transformed_program.functions.values():
+        if (
+            func.role == _ir_core.Role.SubWorker
+            and func.level is not None
+            and _ir_core.level_to_linqu_level(func.level) >= 3
+        ):
+            result_files[f"sub_workers/{func.name}.py"] = _emit_sub_worker_module(func)
 
     return result_files
 
 
-def _strip_auto_name_suffix(name: str) -> str:
-    """Strip IR auto-name suffix (e.g. ``__ssa_v0``) to recover the original user-facing name.
+def _emit_sub_worker_module(func: _ir_core.Function) -> str:
+    """Emit a self-contained SubWorker module callable as ``fn(args: TaskArgs)``.
 
-    The auto-name system guarantees base names never contain ``__``
-    (see ``auto_name_utils.h:ValidateBaseName``), so splitting on the
-    first ``__`` is reliable.
-    """
-    idx = name.find("__")
-    return name[:idx] if idx > 0 else name
-
-
-def _strip_inline_comment(line: str) -> str:
-    """Strip a Python inline ``#`` comment, ignoring ``#`` inside string literals."""
-    in_str: str | None = None
-    i = 0
-    while i < len(line):
-        ch = line[i]
-        if in_str is not None:
-            if ch == "\\":
-                i += 2
-                continue
-            if ch == in_str:
-                in_str = None
-        elif ch in ("'", '"'):
-            in_str = ch
-        elif ch == "#":
-            return line[:i]
-        i += 1
-    return line
-
-
-def _find_def_body_start(lines: list[str]) -> int:
-    """Return the index of the first body line in a Python ``def`` block.
-
-    Skips decorators, then advances past the full function signature
-    (which may span multiple lines). The signature ends at the first
-    top-level ``:`` (parens depth == 0). Strings and inline ``#`` comments
-    are handled so they do not falsely match the colon.
-    """
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if stripped.startswith("@"):
-            continue
-        if not stripped.startswith("def "):
-            return i
-        paren = 0
-        for j in range(i, len(lines)):
-            sig_line = _strip_inline_comment(lines[j])
-            in_str: str | None = None
-            k = 0
-            while k < len(sig_line):
-                ch = sig_line[k]
-                if in_str is not None:
-                    if ch == "\\":
-                        k += 2
-                        continue
-                    if ch == in_str:
-                        in_str = None
-                elif ch in ("'", '"'):
-                    in_str = ch
-                elif ch in "([{":
-                    paren += 1
-                elif ch in ")]}":
-                    paren -= 1
-                elif ch == ":" and paren == 0:
-                    return j + 1
-                k += 1
-        return len(lines)
-    return len(lines)
-
-
-def _generate_sub_worker_source(
-    func_name: str,
-    body_source: str,
-    param_names: list[str],
-) -> str:
-    """Generate a self-contained SubWorker module callable as ``fn(args: TaskArgs)``.
-
-    Args:
-        func_name: SubWorker function name.
-        body_source: Raw source text of the user's function body.
-        param_names: Parameter names from the IR outlined function (SSA-renamed).
+    The user's function body lives on ``func.body`` as an :class:`InlineStmt`
+    captured by the decorator. The emitted module wraps the body in
+    ``def _user_{name}(<params>)`` plus a dispatcher ``{name}(args)`` that
+    unpacks tensors from ``TaskArgs``.
     """
     import textwrap  # noqa: PLC0415
 
-    user_func_lines = ""
-    if body_source:
-        dedented = textwrap.dedent(body_source)
-        lines = dedented.splitlines()
-        body_start = _find_def_body_start(lines)
-        body_lines = lines[body_start:]
-        if body_lines:
-            user_func_lines = textwrap.dedent("\n".join(body_lines))
+    body = func.body
+    if not isinstance(body, _ir_core.InlineStmt):
+        raise RuntimeError(f"SubWorker '{func.name}' must have an InlineStmt body, got {type(body).__name__}")
 
-    # The body source uses original (pre-SSA) names; IR params carry SSA suffixes.
-    # Use original names for _user_* params so the body references resolve correctly.
-    # If two SSA-renamed params share the same base (e.g. x__ssa_v0 + x__ssa_v1
-    # when an outer var is captured across redefinitions), de-dup with a numeric
-    # suffix to keep the emitted ``def _user_*`` syntactically valid.
-    seen: dict[str, int] = {}
-    orig_names: list[str] = []
-    for n in param_names:
-        base = _strip_auto_name_suffix(n)
-        idx = seen.get(base, 0)
-        seen[base] = idx + 1
-        orig_names.append(base if idx == 0 else f"{base}_{idx}")
-    orig_params_str = ", ".join(orig_names)
-    ssa_params_str = ", ".join(param_names)
-
-    unpack_lines = [
-        f"    {name} = _tensor_from_continuous(args.tensor({i}))" for i, name in enumerate(param_names)
-    ]
-    unpack_block = "\n".join(unpack_lines) if unpack_lines else "    pass"
-    user_body = textwrap.indent(user_func_lines, "    ") if user_func_lines else "    pass"
+    param_names = [p.name_hint for p in func.params]
+    params_str = ", ".join(param_names)
+    indented_body = textwrap.indent(body.body, "    ") if body.body else "    pass"
+    unpack_block = (
+        "\n".join(
+            f"    {name} = _tensor_from_continuous(args.tensor({i}))" for i, name in enumerate(param_names)
+        )
+        or "    pass"
+    )
 
     return (
-        f'"""SubWorker: {func_name} — auto-generated, callable as fn(args: TaskArgs)."""\n'
+        f'"""SubWorker: {func.name} — auto-generated, callable as fn(args: TaskArgs)."""\n'
         f"\n"
         f"import torch\n"
         f"\n"
         f"from pypto.runtime.distributed_runner import _tensor_from_continuous\n"
         f"\n"
         f"\n"
-        f"def _user_{func_name}({orig_params_str}):\n"
-        f"{user_body}\n"
+        f"def _user_{func.name}({params_str}):\n"
+        f"{indented_body}\n"
         f"\n"
         f"\n"
-        f"def {func_name}(args):\n"
+        f"def {func.name}(args):\n"
         f"{unpack_block}\n"
-        f"    _user_{func_name}({ssa_params_str})\n"
+        f"    _user_{func.name}({params_str})\n"
     )
 
 
