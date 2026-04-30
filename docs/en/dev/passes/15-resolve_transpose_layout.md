@@ -154,6 +154,20 @@ The pass is a no-op when no InCore function contains a `tile.load(..., transpose
 
 ## Interaction with `tensor.transpose` at Orchestration
 
-`tensor.transpose` at the Orchestration layer (issue #1209) deduces a result type that toggles `layout` between `ND` and `DN` for trailing-two-dim swaps (in `DeduceTensorTransposeType`). When the transposed tensor flows into an InCore parameter, that parameter inherits the `DN` tag and matches the same kernel-side codegen path this pass produces — so a downstream `tile.load(..., target_memory=Mat, transpose=True)` (the matmul B^T pattern) consumes the orchestration-side transpose for free, no explicit `pl.DN` annotation required.
+`tensor.transpose` at the Orchestration layer (issue #1209) records two complementary pieces of information on its result type (in `DeduceTensorTransposeType`):
 
-**Vec target is a known limitation.** Cross-layout `TLOAD(VecTile, GlobalTensor)` is rejected by PTO ISA (only `ND→ND` / `DN→DN` / `NZ→NZ` are supported), and `tile.load` further restricts `transpose=True` to `target_memory=Mat`. Consequently, `pl.transpose` at orchestration followed by a Vec-target consumer (e.g. `pl.slice` inside a non-matmul `pl.at(level=CORE_GROUP)` block) can compile its IR correctly but will fail PTO ISA compilation on Ascend 910B. Workarounds: route the load through a Mat tile (matmul-style), perform an explicit incore `tile.transpose` after the load, or materialize a contiguous transposed copy at orchestration.
+1. **Layout tag.** For canonical trailing-two-dim swaps, `layout` toggles between `ND` and `DN`. PTOAS reads this tag to validate kernel boundaries.
+2. **Explicit physical strides.** The runtime `Tensor::transpose` is a metadata-only swap of `shapes` / `offsets` — the underlying GM bytes stay in the source's row-major layout. So the post-transpose view's physical strides are the input's strides reordered at `(axis1, axis2)`. `DeduceTensorTransposeType` builds row-major strides over the input shape (`MakeIndexMul` collapses ConstInt chains, so static shapes get plain ConstInt strides; dynamic shapes get symbolic ones) and swaps them at the same axes as the shape. Non-trailing transposes are also supported via this path — they keep `layout = ND` and rely solely on the strides.
+
+Codegen disambiguates the two callers of the DN tag by checking `tensor_view_->stride`:
+
+| Source of DN | `stride` | `EmitMakeTensorViews` / partition emit |
+| ------------ | -------- | -------------------------------------- |
+| This pass (`tile.load(transpose=True)`) | empty | implicit "swap last two dims" — emit `[N, M]` shape with `[1, M]` strides over the IR shape `[M, N]` |
+| `tensor.transpose` | non-empty | skip the implicit swap — emit IR shape directly with the recorded strides |
+
+This way a downstream `tile.load(..., target_memory=Mat, transpose=True)` (the matmul B^T pattern) still consumes a DN-tagged input from `tensor.transpose` correctly via the explicit-stride path, without re-applying the implicit shape swap that would double-transpose the access pattern.
+
+**Combination not yet supported.** `tile.load(transpose=True)` *consuming* a `tensor.transpose` result (i.e. an InCore param that already carries explicit strides AND would be promoted to DN by this pass) is rejected with a `CHECK` failure. Reconciling explicit physical strides with the DN-only convention this pass produces requires a separate design — see follow-up tracked from issue #1209.
+
+**Vec target is supported on a5 only.** Cross-layout `TLOAD(VecTile_RowMajor, GlobalTensor<DN>)` is rejected by PTOAS on a2a3 (the static assertion is `TLOAD(VecTile, GlobalTensor) only support ND2ND/DN2DN/NZ2NZ`), and `tile.load` further restricts `transpose=True` to `target_memory=Mat`. a5 (and the `a5sim` simulator) lifts this restriction, so a `pl.transpose` followed by a Vec-target consumer (e.g. `pl.slice` inside a non-matmul `pl.at(level=CORE_GROUP)` block) compiles and runs correctly there. The regression test `tests/st/runtime/test_trans.py::test_transpose_slice_assemble_a5sim` covers exactly this case. On a2a3, the same DSL pattern compiles to correct IR/.pto but fails at the kernel C++ stage; workarounds are unchanged from before — route the load through a Mat tile (matmul-style), perform an explicit `tile.transpose` after the load, or materialize a contiguous transposed copy at orchestration.
