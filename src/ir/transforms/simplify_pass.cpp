@@ -16,23 +16,28 @@
  */
 
 #include <algorithm>
+#include <cstddef>
 #include <memory>
 #include <optional>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
+#include "pypto/core/logging.h"
 #include "pypto/ir/arith/analyzer.h"
 #include "pypto/ir/arith/ir_mutator_with_analyzer.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/scalar_expr.h"
+#include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/utils/dead_code_elimination.h"
+#include "pypto/ir/transforms/utils/deep_clone_utils.h"
 #include "pypto/ir/transforms/utils/loop_state_repair.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
@@ -81,6 +86,54 @@ class MultiAssignCollector : public IRVisitor {
   std::unordered_set<const Var*> seen_;
   int nesting_depth_ = 0;
 };
+
+/// Strip the trailing YieldStmt from @p body and return both the stripped
+/// body and the yielded values that the caller should bind into its
+/// var_remap_ as `return_vars[i] → yielded_values[i]`. Used by control-flow
+/// folds (Fold A for IfStmt, Fold B for ForStmt) that lift a kept branch /
+/// unrolled body into the parent scope.
+///
+/// Substituting return_vars via var_remap_ (rather than emitting a literal
+/// `AssignStmt(return_var, yielded)`) avoids creating alias assignments that
+/// the orchestration codegen's role-aware name disambiguation cannot lower
+/// cleanly — e.g. `out__rv_v2 = out__co_l0_rv_v3` printing as
+/// `auto out = out;` because both vars share the role-derived base name
+/// `out`. The substituted form lets subsequent SimplifyMutator visits
+/// (including the function's ReturnStmt) read the yielded value directly.
+///
+/// Recurses through trailing SeqStmts to find the yield, mirroring
+/// `transform_utils::GetLastYieldStmt` — a well-formed control-flow body
+/// can place its terminating YieldStmt inside a nested SeqStmts wrapper.
+///
+/// Pre: @p body is a well-formed control-flow body with `return_vars`
+/// non-empty — its (possibly nested) tail is a YieldStmt with
+/// `value_.size() == return_vars.size()`.
+struct StrippedYield {
+  StmtPtr body;                         ///< @p body with the trailing YieldStmt removed.
+  std::vector<ExprPtr> yielded_values;  ///< Values from the removed YieldStmt, one per return_var.
+};
+
+StrippedYield StripTrailingYield(const StmtPtr& body, size_t return_var_count) {
+  if (auto seq = As<SeqStmts>(body)) {
+    INTERNAL_CHECK(!seq->stmts_.empty()) << "Internal error: control-flow body must end with YieldStmt "
+                                            "when return_vars is non-empty";
+    auto stripped = seq->stmts_;
+    auto inner = StripTrailingYield(stripped.back(), return_var_count);
+    if (inner.body) {
+      stripped.back() = inner.body;
+    } else {
+      stripped.pop_back();
+    }
+    return {loop_repair::MakeBody(stripped, seq->span_), std::move(inner.yielded_values)};
+  }
+  auto yield_stmt = std::dynamic_pointer_cast<const YieldStmt>(body);
+  INTERNAL_CHECK(yield_stmt) << "Internal error: control-flow body tail must be YieldStmt when "
+                                "return_vars is non-empty";
+  INTERNAL_CHECK(yield_stmt->value_.size() == return_var_count)
+      << "Internal error: yielded value count " << yield_stmt->value_.size()
+      << " does not match return_vars count " << return_var_count;
+  return {/*body=*/nullptr, yield_stmt->value_};
+}
 
 class SimplifyMutator : public arith::IRMutatorWithAnalyzer {
  public:
@@ -165,6 +218,82 @@ class SimplifyMutator : public arith::IRMutatorWithAnalyzer {
 
     auto start_ci = As<ConstInt>(new_start);
     auto stop_ci = As<ConstInt>(new_stop);
+
+    // Fold B: collapse a *pure* sequential ForStmt when the analyzer can
+    // prove the trip count is 0 or 1. "Pure" means no chunk_config, no attrs,
+    // and Sequential kind — these forms have no execution-model side effects
+    // (no chunk-loop pairing, no Parallel/Unroll/Pipeline scheduling) that a
+    // downstream pass might depend on observing as a ForStmt.
+    //
+    // Trip-count proof:
+    //   step >= 1 (forward iteration)
+    //   AND (stop <= start            → 0 trips)
+    //   OR  (start < stop             AND
+    //        stop  <= start + step    → 1 trip)
+    //
+    // CanProve is used instead of literal-only ConstInt matching so closure-
+    // captured trip counts like `for k in pl.range(C, C + 1)` collapse the
+    // same way `pl.range(0, 1)` does.
+    const bool is_pure_for =
+        !op->chunk_config_.has_value() && op->attrs_.empty() && op->kind_ == ForKind::Sequential;
+    if (is_pure_for && analyzer_->CanProveGreaterEqual(new_step, 1)) {
+      const Span& sp = op->span_;
+      int trips = -1;
+      if (analyzer_->CanProve(MakeLe(new_stop, new_start, sp))) {
+        trips = 0;
+      } else if (analyzer_->CanProve(MakeAnd(MakeLt(new_start, new_stop, sp),
+                                             MakeLe(new_stop, MakeAdd(new_start, new_step, sp), sp), sp))) {
+        trips = 1;
+      }
+
+      if (trips == 0) {
+        // Loop body never executes: each return_var takes its iter_arg's init value.
+        std::vector<StmtPtr> out;
+        out.reserve(op->return_vars_.size());
+        for (size_t i = 0; i < op->return_vars_.size(); ++i) {
+          auto rv = MaybeRebuildVar(op->return_vars_[i]);
+          out.push_back(std::make_shared<AssignStmt>(rv, new_iter_args[i]->initValue_, sp));
+        }
+        return loop_repair::MakeBody(out, sp);
+      }
+      if (trips == 1) {
+        // Exactly one iteration: substitute loop_var → start and each
+        // iter_arg → its init value via DeepClone (matches the substitution
+        // pattern used by LoopUnrollMutator in unroll_loops_pass.cpp), then
+        // re-visit so further folds happen, then rewrite the trailing
+        // YieldStmt into AssignStmts on the return_vars.
+        //
+        // DeepClone is used (rather than a local var_remap_ override + analyzer
+        // Bind) so the substitution penetrates Var references buried inside
+        // type annotations — e.g. MemRef byte_offsets that mention the loop
+        // variable. A var_remap_-only approach misses those uses because
+        // SimplifyType / SimplifyExpr go through the analyzer at definition
+        // sites only when the type is rebuilt; uses inside nested control-flow
+        // bodies or tile-view shapes get printed verbatim.
+        std::unordered_map<const Var*, ExprPtr> sub_map;
+        sub_map.reserve(1 + op->iter_args_.size());
+        sub_map.emplace(op->loop_var_.get(), new_start);
+        for (size_t i = 0; i < op->iter_args_.size(); ++i) {
+          sub_map.emplace(op->iter_args_[i].get(), new_iter_args[i]->initValue_);
+        }
+        // clone_def_vars=true is load-bearing: MultiAssignCollector ran on the
+        // pre-fold IR and marked any scalar Var defined inside nested for-loop
+        // bodies as multi_assigned (the safety check that protects pre-SSA
+        // callers). After the loop is unrolled and lifted, those Vars are
+        // single-assigned at top-level, but multi_assigned_ still references
+        // the original Var pointers — analyzer Bind would be skipped on those.
+        // Producing fresh Var clones at every DefField breaks that staleness:
+        // the cloned Vars are not in multi_assigned_, so subsequent uses of
+        // (e.g.) `cur_offset = 0` propagate via analyzer Bind as expected.
+        auto cloned = DeepClone(op->body_, sub_map, /*clone_def_vars=*/true);
+
+        // Re-visit so any algebraic patterns exposed by the substitution
+        // (e.g. `0 + 64 → 64`) fold in this same Simplify run.
+        auto unrolled_body = VisitStmt(cloned.cloned_body);
+        return LiftBodyToReturnVars(unrolled_body, op->return_vars_);
+      }
+    }
+
     bool bound = start_ci && stop_ci && stop_ci->value_ > start_ci->value_;
     if (bound) {
       analyzer_->Bind(op->loop_var_, start_ci->value_, stop_ci->value_);
@@ -227,6 +356,35 @@ class SimplifyMutator : public arith::IRMutatorWithAnalyzer {
     if (op->else_body_.has_value()) {
       auto ctx = analyzer_->GetConstraintContext(MakeNot(new_condition, new_condition->span_));
       new_else = VisitStmt(*op->else_body_);
+    }
+
+    // Fold A: collapse the IfStmt when the analyzer can prove the polarity.
+    // True  → keep then_body_; drop else.
+    // False → keep else_body_ if present, else replace with empty body
+    //         (which is only valid when return_vars_ is empty per IR contract).
+    // When return_vars_ is non-empty, the kept branch's trailing YieldStmt is
+    // rewritten into AssignStmt(return_vars[i], yielded_value[i]) so SSA
+    // references after the IfStmt remain well-defined.
+    //
+    // CanProve is used instead of an `As<ConstBool>` check because the
+    // analyzer's constraint stack (loop-var bounds, scalar bindings, outer
+    // if-branch constraints) often establishes the polarity even when
+    // SimplifyExpr leaves the condition symbolic.
+    const bool always_true = analyzer_->CanProve(new_condition);
+    const bool always_false =
+        !always_true && analyzer_->CanProve(MakeNot(new_condition, new_condition->span_));
+    if (always_true || always_false) {
+      StmtPtr kept;
+      if (always_true) {
+        kept = new_then;
+      } else if (new_else.has_value()) {
+        kept = *new_else;
+      } else {
+        INTERNAL_CHECK(op->return_vars_.empty())
+            << "Internal error: IfStmt with no else branch must have empty return_vars_";
+        return loop_repair::MakeBody({}, op->span_);
+      }
+      return LiftBodyToReturnVars(kept, op->return_vars_);
     }
 
     bool changed = (new_condition.get() != op->condition_.get()) ||
@@ -411,6 +569,26 @@ class SimplifyMutator : public arith::IRMutatorWithAnalyzer {
     auto it = var_remap_.find(key);
     if (it == var_remap_.end()) return nullptr;
     return std::dynamic_pointer_cast<const Var>(it->second);
+  }
+
+  /// Lift @p kept_body into the parent scope when a control-flow fold has
+  /// chosen it as the surviving branch. Strips the trailing YieldStmt and
+  /// records `return_vars[i] → yielded_value[i]` in `var_remap_` so any
+  /// downstream uses (subsequent siblings, ReturnStmt) read the yielded
+  /// value directly. Shared by Fold A (IfStmt) and the one-trip case of
+  /// Fold B (ForStmt).
+  ///
+  /// Substituting via var_remap_ (rather than emitting `AssignStmt(rv, val)`)
+  /// avoids alias assignments that the orchestration codegen lowers
+  /// incorrectly when both sides derive from a role-tagged parameter name
+  /// (e.g. both vars have base name "out", producing `auto out = out;`).
+  StmtPtr LiftBodyToReturnVars(const StmtPtr& kept_body, const std::vector<VarPtr>& return_vars) {
+    if (return_vars.empty()) return kept_body;
+    auto stripped = StripTrailingYield(kept_body, return_vars.size());
+    for (size_t i = 0; i < return_vars.size(); ++i) {
+      var_remap_[return_vars[i].get()] = stripped.yielded_values[i];
+    }
+    return stripped.body ? stripped.body : loop_repair::MakeBody({}, kept_body->span_);
   }
 
   std::unordered_set<const Var*> multi_assigned_;
