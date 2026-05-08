@@ -161,7 +161,11 @@ jobs:
 
       - name: Test system tests
         timeout-minutes: 15
-        run: pytest tests/st -v --device="$DEVICE_RANGE" --precompile-workers=128 --pto-isa-commit=2c607938
+        run: pytest tests/st -v --device="$DEVICE_RANGE" --precompile-workers=128 --pto-isa-commit=2c607938 --ignore=tests/st/distributed
+
+      - name: Test distributed system tests
+        timeout-minutes: 5
+        run: pytest tests/st/distributed -v --device="$DEVICE_RANGE" --pto-isa-commit=2c607938
 
       - name: Test swimlane output
         run: |

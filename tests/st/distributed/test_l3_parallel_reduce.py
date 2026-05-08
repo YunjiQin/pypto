@@ -23,6 +23,8 @@ Verifies: multiple independent chip tasks in DAG, SubWorker aggregation
 of two chip outputs, cross-fork data visibility for multi-tensor flows.
 """
 
+import sys
+
 import pypto.language as pl
 import pytest
 import torch
@@ -108,13 +110,13 @@ class L3ParallelReduceProgram:
 class TestL3ParallelReduce:
     """L3 distributed runtime: two independent chip tasks + SubWorker reduce."""
 
-    def test_execute(self, test_config):
+    def test_execute(self, test_config, device_ids):
         """End-to-end: compile + execute, verify f = (a+b) + (a-b) = 2a."""
         compiled = ir.compile(
             L3ParallelReduceProgram,
             platform=test_config.platform,
             distributed_config=DistributedConfig(
-                device_ids=[7],
+                device_ids=device_ids[:1],
                 num_sub_workers=1,
                 block_dim=3,
                 aicpu_thread_num=4,
@@ -137,4 +139,4 @@ class TestL3ParallelReduce:
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+    pytest.main([__file__, "-v", *sys.argv[1:]])

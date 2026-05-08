@@ -21,6 +21,8 @@ Verifies: TensorMap dependency inference, cross-fork data visibility,
 DAG ordering (SubWorker runs after chip completes).
 """
 
+import sys
+
 import pypto.language as pl
 import pytest
 import torch
@@ -103,13 +105,13 @@ class L3DependencyInlineProgram:
 class TestL3Dependency:
     """L3 distributed runtime: compile and execute via Worker(level=3)."""
 
-    def test_execute(self, test_config):
+    def test_execute(self, test_config, device_ids):
         """End-to-end: compile + execute via Worker(level=3), verify f = a + b."""
         compiled = ir.compile(
             L3DependencyProgram,
             platform=test_config.platform,
             distributed_config=DistributedConfig(
-                device_ids=[9],
+                device_ids=device_ids[:1],
                 num_sub_workers=1,
                 block_dim=3,
                 aicpu_thread_num=4,
@@ -128,13 +130,15 @@ class TestL3Dependency:
             f"got max diff = {(f - expected).abs().max().item()}"
         )
 
-    def test_execute_inline(self, test_config):
+    def test_execute_inline(self, test_config, device_ids):
         """End-to-end: all levels inlined via pl.at(), verify sum = a + b."""
+        if len(device_ids) < 2:
+            pytest.skip(f"test_execute_inline needs 2 devices, got {device_ids}")
         compiled = ir.compile(
             L3DependencyInlineProgram,
             platform=test_config.platform,
             distributed_config=DistributedConfig(
-                device_ids=[9, 10],
+                device_ids=device_ids[:2],
                 num_sub_workers=1,
                 block_dim=3,
                 aicpu_thread_num=4,
@@ -161,4 +165,4 @@ class TestL3Dependency:
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+    pytest.main([__file__, "-v", *sys.argv[1:]])

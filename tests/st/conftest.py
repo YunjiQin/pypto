@@ -314,6 +314,17 @@ def test_config(request) -> RunConfig:
 
 
 @pytest.fixture(scope="session")
+def device_ids(request) -> list[int]:
+    """Session-scoped fixture returning the full ``--device`` list.
+
+    Distributed tests need access to all allocated device ids (not just the
+    first one stored in ``RunConfig.device_id``) so they can pick a slice
+    that matches the CI runner's dynamic allocation rather than hardcoding.
+    """
+    return _parse_device_option(request.config.getoption("--device"))
+
+
+@pytest.fixture(scope="session")
 def test_runner(test_config) -> TestRunner:
     """Session-scoped fixture providing a test runner instance.
 
