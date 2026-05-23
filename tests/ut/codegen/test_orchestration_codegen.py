@@ -901,8 +901,16 @@ class TestOrchestration:
         # PTO2_SCOPE wraps the for loop body
         assert "PTO2_SCOPE()" in code
 
-        # tensor.slice generates array variables and runtime .view() call with dynamic offset
-        assert "uint32_t chunk_shapes[2] = {16, 16};" in code
+        # tensor.slice generates array variables and runtime .view() call with dynamic offset.
+        # Shape dims are clamped to the source extent (offset already emitted above) so the
+        # strided runtime never sees an over-extent view. The clamp guards the unsigned
+        # subtraction with a ternary so an offset past the source extent saturates to 0u.
+        assert (
+            "uint32_t chunk_shapes[2] = {"
+            "(chunk_offsets[0] >= ext_data.shapes[0] ? 0u : std::min<uint32_t>(16, ext_data.shapes[0] - chunk_offsets[0])), "
+            "(chunk_offsets[1] >= ext_data.shapes[1] ? 0u : std::min<uint32_t>(16, ext_data.shapes[1] - chunk_offsets[1]))};"
+            in code
+        )
         assert "uint32_t chunk_offsets[2] = {static_cast<uint32_t>((i * 16)), 0};" in code
         assert "Tensor chunk = ext_data.view(chunk_shapes, chunk_offsets);" in code
 
@@ -932,7 +940,12 @@ class TestOrchestration:
 
         code = _generate_orch_code(ValidShapeSliceProgram)
 
-        assert "uint32_t chunk_shapes[2] = {16, 16};" in code
+        assert (
+            "uint32_t chunk_shapes[2] = {"
+            "(chunk_offsets[0] >= ext_data.shapes[0] ? 0u : std::min<uint32_t>(16, ext_data.shapes[0] - chunk_offsets[0])), "
+            "(chunk_offsets[1] >= ext_data.shapes[1] ? 0u : std::min<uint32_t>(16, ext_data.shapes[1] - chunk_offsets[1]))};"
+            in code
+        )
         assert "uint32_t chunk_offsets[2] = {0, 0};" in code
         assert "Tensor chunk = ext_data.view(chunk_shapes, chunk_offsets);" in code
 
@@ -976,8 +989,14 @@ class TestOrchestration:
 
         code = _generate_orch_code(ReshapeAfterSliceProgram)
 
-        # slice still emits view on the external tensor.
-        assert "uint32_t chunk_shapes[3] = {1, 16, 16};" in code
+        # slice still emits view on the external tensor (shape dims clamped to source extent).
+        assert (
+            "uint32_t chunk_shapes[3] = {"
+            "(chunk_offsets[0] >= ext_data.shapes[0] ? 0u : std::min<uint32_t>(1, ext_data.shapes[0] - chunk_offsets[0])), "
+            "(chunk_offsets[1] >= ext_data.shapes[1] ? 0u : std::min<uint32_t>(16, ext_data.shapes[1] - chunk_offsets[1])), "
+            "(chunk_offsets[2] >= ext_data.shapes[2] ? 0u : std::min<uint32_t>(16, ext_data.shapes[2] - chunk_offsets[2]))};"
+            in code
+        )
         assert "Tensor chunk = ext_data.view(chunk_shapes, chunk_offsets);" in code
         # reshape emits its shape array and calls .reshape on the local Tensor (no ext_ prefix).
         assert "uint32_t r_shapes[2] = {16, 16};" in code
@@ -1045,6 +1064,49 @@ class TestOrchestration:
         assert "Tensor chunk = ext_data.view(chunk_shapes, chunk_offsets);" in code
         # transpose calls .transpose on the local Tensor (no ext_ prefix).
         assert "Tensor t = chunk.transpose(1, 2);" in code
+
+    def test_tensor_as_layout_cross_flip_lowers_to_transpose(self):
+        """Cross-layout flip (ND→DN) lowers to runtime Tensor::transpose on the
+        trailing pair (shapes + strides swapped, start_offset preserved)."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        ib = IRBuilder()
+        with ib.function("orch_as_layout", type=ir.FunctionType.Orchestration) as f:
+            b = f.param("b", ir.TensorType([8, 4], DataType.FP16))
+            f.return_type(ir.TensorType([4, 8], DataType.FP16))
+            b_dn = ib.let("b_dn", tensor_ops.as_layout(b, ir.TensorLayout.DN))
+            ib.return_stmt(b_dn)
+        orch = f.get_result()
+        program = ir.Program([orch], "test_as_layout_cross_flip", ir.Span.unknown())
+
+        code = _generate_orch_code(program)
+
+        # Cross-layout flip swaps the trailing pair via runtime Tensor::transpose
+        # on the external tensor handle (start_offset preserved).
+        assert "Tensor b_dn = ext_b.transpose(0, 1);" in code
+        # The deleted pre-#808 fields must never be emitted.
+        assert "raw_shapes" not in code
+        assert "is_raw_eq_shapes" not in code
+
+    def test_tensor_as_layout_identity_flip_aliases(self):
+        """tensor.as_layout with target == source layout emits a plain alias, not a transpose."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        ib = IRBuilder()
+        with ib.function("orch_as_layout_id", type=ir.FunctionType.Orchestration) as f:
+            b = f.param("b", ir.TensorType([8, 4], DataType.FP16))
+            f.return_type(ir.TensorType([8, 4], DataType.FP16))
+            b_same = ib.let("b_same", tensor_ops.as_layout(b, ir.TensorLayout.ND))
+            ib.return_stmt(b_same)
+        orch = f.get_result()
+        program = ir.Program([orch], "test_as_layout_identity", ir.Span.unknown())
+
+        code = _generate_orch_code(program)
+
+        assert "Tensor b_same = ext_b;" in code
+        assert ".transpose(" not in code
 
     def test_if_statement(self):
         """Test if/else codegen with conditional scalar values."""
