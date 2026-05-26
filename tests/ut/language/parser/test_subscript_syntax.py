@@ -835,12 +835,37 @@ class TestTileSubscriptWrite:
         assert "tile.assemble" in printed
         assert "pl.tile.reshape(row, [1, 16])" in printed
 
+    def test_tile_subscript_write_rank_reduce_with_lead_unit(self):
+        """tile 2D-floor source [1, N] (lead_units=1) lifted into a 3D target
+        with 2 scalar drops + 1 slice. The lift must skip the tile floor's
+        leading unit axes when reconstructing the target shape — without that,
+        ``[1, N]`` would mis-iterate to ``[1, 1, 1]`` and the reshape product
+        check would reject."""
+
+        @pl.function
+        def lift_with_lead(
+            x: pl.Tensor[[8, 64, 128], pl.FP32],
+            i: pl.Scalar[pl.INDEX],
+            j: pl.Scalar[pl.INDEX],
+        ) -> pl.Tensor[[8, 64, 128], pl.FP32]:
+            t: pl.Tile[[8, 64, 128], pl.FP32] = pl.tile.load(x, [0, 0, 0], [8, 64, 128])
+            plane: pl.Tile[[64, 128], pl.FP32] = t[i]  # rank-reducing read
+            row: pl.Tile[[1, 128], pl.FP32] = plane[j]  # 2D-floor: lead_units=1
+            t[i, j, :] = row
+            return pl.tile.store(t, [0, 0, 0], x)
+
+        printed = lift_with_lead.as_python()
+        assert "tile.assemble" in printed
+        # Target shape must use src.shape[lead_units:] (= [128]) at the kept axis,
+        # not src.shape[0] (= the floor's lead unit).
+        assert "pl.tile.reshape(row, [1, 1, 128])" in printed
+
     def test_tile_subscript_write_rank_reduce_narrow_valid_rejected(self):
         """Tile rank-reduce + narrow valid_shape is rejected: tile.reshape
         cannot carry valid_shape, so the rank lift would silently lose the
         narrowing. Force users to take the pl.store path instead."""
 
-        with pytest.raises(UnsupportedFeatureError, match="tile.reshape cannot carry valid_shape"):
+        with pytest.raises(UnsupportedFeatureError, match=r"tile\.reshape cannot carry valid_shape"):
 
             @pl.function
             def bad_tile(

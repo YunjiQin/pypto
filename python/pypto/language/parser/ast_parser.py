@@ -1630,6 +1630,7 @@ class ASTParser:
                 source_valid_shape,
                 drop_dims,
                 extents,
+                lead_units,
                 kind_name,
                 span,
             )
@@ -1645,24 +1646,29 @@ class ASTParser:
         source_valid_shape: list[ir.Expr] | None,
         drop_dims: list[int],
         extents: list[int | ir.Expr],
+        lead_units: int,
         kind_name: str,
         span: ir.Span,
     ) -> ir.Expr:
         """Reshape source up to the full-rank target window for rank-reducing writes.
 
-        Inserts unit dims at the dropped axis positions so the assemble's
+        Inserts unit dims at the ``drop_dims`` positions so the assemble's
         source/window ranks match — mirrors the implicit reshape numpy does on
-        write. When the source carries an explicit valid_shape (possibly
-        narrower than its padded static_shape, see issue #1509), the lift must
-        keep the padded static_shape (otherwise tensor.reshape's product check
-        rejects) and carry valid_shape forward through reshape's 3rd arg.
+        write. Reshape target always derives from the source's *own* padded
+        ``static_shape`` (minus any tile 2D-floor lead unit axes), so the
+        reshape product check passes whether or not the source carries a
+        narrower ``valid_shape`` (issue #1509).
+
+        When the source carries an explicit narrower ``valid_shape``, that
+        narrowing is carried forward via ``tensor.reshape``'s optional 3rd
+        argument; ``tile.reshape`` has no such parameter, so a narrowed tile
+        + rank-lift combo is rejected here (the user should switch to
+        ``pl.store``).
         """
-        reshape_op = ir_op.tensor.reshape if kind_name == "tensor" else ir_op.tile.reshape
-
-        if source_valid_shape is None:
-            return reshape_op(source_expr, list(extents), span=span)
-
-        if kind_name != "tensor":
+        # Narrowed tile + rank-lift is unreachable through reshape — tile.reshape
+        # has no valid_shape parameter, so the lift would silently drop the
+        # narrowing. Reject upfront and point users to pl.store.
+        if source_valid_shape is not None and kind_name != "tensor":
             raise UnsupportedFeatureError(
                 "Subscript-write with rank reduction is not supported when "
                 "the source tile carries an explicit valid_shape — "
@@ -1674,16 +1680,23 @@ class ASTParser:
             )
 
         drop_set = set(drop_dims)
-        src_iter = iter(source_type.shape)
-        vs_iter = iter(source_valid_shape)
         unit: ir.Expr = ir.ConstInt(1, DataType.INDEX, span)
-        lifted_static: list[int | ir.Expr] = [
-            unit if d in drop_set else next(src_iter) for d in range(len(extents))
-        ]
-        lifted_valid: list[int | ir.Expr] = [
-            unit if d in drop_set else next(vs_iter) for d in range(len(extents))
-        ]
-        return reshape_op(source_expr, lifted_static, lifted_valid, span=span)
+
+        def _lift_shape(seq: Sequence[int | ir.Expr]) -> list[int | ir.Expr]:
+            # Skip the tile 2D-floor lead unit axes — they were padded into seq
+            # only to satisfy the tile ≥2D invariant; the lift reconstructs the
+            # target rank from the kept positions and the drop_dims unit fillers.
+            it = iter(list(seq)[lead_units:])
+            return [unit if d in drop_set else next(it) for d in range(len(extents))]
+
+        reshape_op = ir_op.tensor.reshape if kind_name == "tensor" else ir_op.tile.reshape
+        reshape_args: list[list[int | ir.Expr]] = [_lift_shape(source_type.shape)]
+        if source_valid_shape is not None:
+            # Tensor path with explicit (possibly narrower) valid_shape — carry
+            # it through reshape's optional 3rd arg so the narrowing survives
+            # the rank lift (issue #1509).
+            reshape_args.append(_lift_shape(source_valid_shape))
+        return reshape_op(source_expr, *reshape_args, span=span)
 
     def _parse_array_subscript_assignment(
         self,
