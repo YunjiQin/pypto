@@ -724,6 +724,28 @@ class TestTensorSubscriptWrite:
         assert isinstance(dynamic_valid, ir.Function)
         assert "tensor.assemble" in dynamic_valid.as_python()
 
+    def test_tensor_subscript_write_rank_reduce_narrow_valid_preserves_static(self):
+        """Rank-reducing write + narrow valid_shape must lift the padded
+        static_shape (not the window extents) and carry valid_shape through
+        reshape's 3rd arg — otherwise the reshape product check rejects."""
+
+        @pl.function
+        def rank_reduce_narrow(
+            C: pl.Tensor[[32, 8, 8], pl.FP32],
+            src: pl.Tensor[[16, 16], pl.FP32],
+            i: pl.Scalar[pl.INDEX],
+        ) -> pl.Tensor[[32, 8, 8], pl.FP32]:
+            # static=[16,16] (ISA-padded), valid=[8,8] matches the [8, 8] window
+            narrowed = pl.set_validshape(src, 8, 8)
+            C[i, :, :] = narrowed
+            return C
+
+        printed = rank_reduce_narrow.as_python()
+        # The lift must preserve src's padded [16, 16] and carry [8, 8] forward.
+        assert "tensor.assemble" in printed
+        # 3-arg tensor.reshape with the padded static and the narrowed valid_shape.
+        assert "pl.tensor.reshape(narrowed, [1, 16, 16], [1, 8, 8])" in printed
+
 
 class TestTileSubscriptWrite:
     """Tests for tile subscript-write syntax on Tile types."""
@@ -793,6 +815,24 @@ class TestTileSubscriptWrite:
 
         printed = narrow_tile_write.as_python()
         assert "tile.assemble" in printed
+
+    def test_tile_subscript_write_rank_reduce_narrow_valid_rejected(self):
+        """Tile rank-reduce + narrow valid_shape is rejected: tile.reshape
+        cannot carry valid_shape, so the rank lift would silently lose the
+        narrowing. Force users to take the pl.store path instead."""
+
+        with pytest.raises(UnsupportedFeatureError, match="tile.reshape cannot carry valid_shape"):
+
+            @pl.function
+            def bad_tile(
+                x: pl.Tensor[[32, 16, 16], pl.FP32],
+                src: pl.Tile[[16, 16], pl.FP32],
+                i: pl.Scalar[pl.INDEX],
+            ) -> pl.Tensor[[32, 16, 16], pl.FP32]:
+                t: pl.Tile[[8, 16, 16], pl.FP32] = pl.tile.load(x, [0, 0, 0], [8, 16, 16])
+                narrowed = pl.set_validshape(src, 8, 8)
+                t[i, :, :] = narrowed
+                return pl.tile.store(t, [0, 0, 0], x)
 
 
 if __name__ == "__main__":

@@ -1613,15 +1613,66 @@ class ASTParser:
             )
 
         if src_rank != len(extents):
-            # Lift the rank-reduced source back to the full-rank target window
-            # (unit dims at the dropped positions) so the assemble's source/window
-            # ranks match — mirrors the implicit reshape numpy does on a write.
-            reshape_op = ir_op.tensor.reshape if kind_name == "tensor" else ir_op.tile.reshape
-            source_expr = reshape_op(source_expr, list(extents), span=span)
+            source_expr = self._lift_subscript_write_source_rank(
+                source_expr,
+                source_type,
+                source_valid_shape,
+                drop_dims,
+                extents,
+                kind_name,
+                span,
+            )
 
         assemble_call = assemble_op(base_expr, source_expr, offsets, span=span)
         var = self._assign_or_let(var_name, assemble_call, span)
         self.scope_manager.define_var(var_name, var, span=span)
+
+    def _lift_subscript_write_source_rank(
+        self,
+        source_expr: ir.Expr,
+        source_type: ir.TensorType | ir.TileType,
+        source_valid_shape: list[ir.Expr] | None,
+        drop_dims: list[int],
+        extents: list[int | ir.Expr],
+        kind_name: str,
+        span: ir.Span,
+    ) -> ir.Expr:
+        """Reshape source up to the full-rank target window for rank-reducing writes.
+
+        Inserts unit dims at the dropped axis positions so the assemble's
+        source/window ranks match — mirrors the implicit reshape numpy does on
+        write. When the source carries an explicit valid_shape (possibly
+        narrower than its padded static_shape, see issue #1509), the lift must
+        keep the padded static_shape (otherwise tensor.reshape's product check
+        rejects) and carry valid_shape forward through reshape's 3rd arg.
+        """
+        reshape_op = ir_op.tensor.reshape if kind_name == "tensor" else ir_op.tile.reshape
+
+        if source_valid_shape is None:
+            return reshape_op(source_expr, list(extents), span=span)
+
+        if kind_name != "tensor":
+            raise UnsupportedFeatureError(
+                "Subscript-write with rank reduction is not supported when "
+                "the source tile carries an explicit valid_shape — "
+                "tile.reshape cannot carry valid_shape across the rank lift.",
+                span=span,
+                hint="Write the tile via pl.store directly, or use slice "
+                "indices on every axis instead of scalar indices to avoid "
+                "rank reduction.",
+            )
+
+        drop_set = set(drop_dims)
+        src_iter = iter(source_type.shape)
+        vs_iter = iter(source_valid_shape)
+        unit: ir.Expr = ir.ConstInt(1, DataType.INDEX, span)
+        lifted_static: list[int | ir.Expr] = [
+            unit if d in drop_set else next(src_iter) for d in range(len(extents))
+        ]
+        lifted_valid: list[int | ir.Expr] = [
+            unit if d in drop_set else next(vs_iter) for d in range(len(extents))
+        ]
+        return reshape_op(source_expr, lifted_static, lifted_valid, span=span)
 
     def _parse_array_subscript_assignment(
         self,
