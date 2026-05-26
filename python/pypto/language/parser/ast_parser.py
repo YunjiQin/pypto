@@ -172,34 +172,28 @@ def _fold_const_slice_extent(upper: object, lower: object) -> int | None:
 
 
 def _get_source_valid_shape(source_type: ir.Type) -> list[ir.Expr] | None:
-    """Return the source's valid_shape iff it encodes actual narrowing.
+    """Return the source's view ``valid_shape``, or ``None`` when no view metadata.
 
-    Returns ``None`` when there is no semantic narrowing — either no view
-    metadata at all, or the effective ``valid_shape`` equals the static shape
-    (the canonical no-narrow case, e.g. a tile's implicit view). Filtering
-    here keeps callers from accidentally treating "valid == static" as
-    narrowing (which would push 1D-tile / non-narrow rank-lift writes onto
-    the issue #1509 path that's intended for actual padding).
+    Pure accessor — does NOT decide whether the source is actually narrowed
+    (whether ``valid_shape`` differs from ``shape``). Callers that need the
+    narrowing semantics should compare against ``source_type.shape`` themselves
+    (e.g. via :func:`_shape_exprs_match`).
 
     TensorType reads ``tensor_view.valid_shape``; TileType uses
     ``get_effective_tile_view()`` so a canonicalized implicit view (stored as
-    ``None``) still surfaces its semantic valid_shape.
+    ``None``) still surfaces its semantic ``valid_shape``.
     """
     if isinstance(source_type, ir.TensorType):
         view = source_type.tensor_view
         if view is None or not view.valid_shape:
             return None
-        valid = list(view.valid_shape)
-    elif isinstance(source_type, ir.TileType):
+        return list(view.valid_shape)
+    if isinstance(source_type, ir.TileType):
         view = source_type.get_effective_tile_view()
         if not view.valid_shape:
             return None
-        valid = list(view.valid_shape)
-    else:
-        return None
-    if _shape_exprs_match(source_type.shape, valid):
-        return None
-    return valid
+        return list(view.valid_shape)
+    return None
 
 
 def _shape_exprs_match(lhs: Sequence[ir.Expr], rhs: Sequence[ir.Expr]) -> bool:
@@ -1665,10 +1659,19 @@ class ASTParser:
         + rank-lift combo is rejected here (the user should switch to
         ``pl.store``).
         """
-        # Narrowed tile + rank-lift is unreachable through reshape — tile.reshape
-        # has no valid_shape parameter, so the lift would silently drop the
-        # narrowing. Reject upfront and point users to pl.store.
-        if source_valid_shape is not None and kind_name != "tensor":
+        # "Narrowed" means valid_shape is actually smaller than shape; a view
+        # with valid_shape == shape (e.g. a tile's canonical implicit view) is
+        # semantically equivalent to no view and must NOT be treated as a
+        # narrow source — otherwise canonical 1D-tile rank-lift writes would
+        # hit the issue #1509 path meant for ISA-padded sources.
+        is_narrowed = source_valid_shape is not None and not _shape_exprs_match(
+            source_type.shape, source_valid_shape
+        )
+
+        # tile.reshape has no valid_shape parameter, so a narrowed tile +
+        # rank-lift would silently drop the narrowing. Reject upfront and point
+        # users to pl.store.
+        if is_narrowed and kind_name != "tensor":
             raise UnsupportedFeatureError(
                 "Subscript-write with rank reduction is not supported when "
                 "the source tile carries an explicit valid_shape — "
@@ -1691,10 +1694,11 @@ class ASTParser:
 
         reshape_op = ir_op.tensor.reshape if kind_name == "tensor" else ir_op.tile.reshape
         reshape_args: list[list[int | ir.Expr]] = [_lift_shape(source_type.shape)]
-        if source_valid_shape is not None:
-            # Tensor path with explicit (possibly narrower) valid_shape — carry
-            # it through reshape's optional 3rd arg so the narrowing survives
-            # the rank lift (issue #1509).
+        if is_narrowed:
+            # Tensor path with a genuinely narrower valid_shape — carry it via
+            # reshape's optional 3rd arg so the narrowing survives the rank
+            # lift (issue #1509). Asserted non-None by the is_narrowed guard.
+            assert source_valid_shape is not None
             reshape_args.append(_lift_shape(source_valid_shape))
         return reshape_op(source_expr, *reshape_args, span=span)
 
