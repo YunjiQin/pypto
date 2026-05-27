@@ -128,12 +128,15 @@ def put(
 ) -> Call:
     """Cross-rank put: write the local slice ``src`` into the peer rank's slice of ``dst``.
 
-    Side-effect-only (the returned Call carries ``UnknownType``). Lowers to
+    Side-effect-only (the returned Call carries ``UnknownType``). Rewritten by
+    ``ConvertTensorToTileOps`` to a ``tile.create``-allocated VEC staging tile plus
+    a ``pld.tile.put`` call so the staging tile flows through PyPTO's memory
+    allocator (required at ``--pto-level=level3``); backend codegen then emits
     ``CommRemoteOffset(ctx, peer) + addptr + make_tensor_view + partition_view +
-    a synthesised VEC staging tile + TPUT`` at codegen. Both operands are
-    GM/tensor-level window views (the staging tile is internal), so this is a
-    ``pld.tensor`` op, paired with the GM-to-GM TGET rather than the
-    tile-producing ``pld.tile.remote_load``.
+    TPUT`` against that pre-allocated tile. Both operands are GM/tensor-level
+    window views (the staging tile is internal), so this is a ``pld.tensor`` op,
+    paired with the GM-to-GM TGET rather than the tile-producing
+    ``pld.tile.remote_load``.
 
     ``dst`` / ``peer`` / ``src`` are positional-or-keyword so the printed IR
     (which emits them positionally) round-trips through the parser; ``atomic``
