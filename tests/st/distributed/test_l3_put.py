@@ -230,11 +230,10 @@ def _build_atomic_add_program():
 
 @pytest.mark.skip(
     reason=(
-        "pld.tensor.put end-to-end requires: (a) tile.store accepting "
-        "DistributedTensor destinations (Phase-1 stage-in), (b) N7 host_orch "
-        "python codegen emitting add_scalar(ctx) per DistributedTensor, "
-        "(c) N8 driver wiring CommGroup window buffers. The InCore PTO codegen "
-        "(N6 P1) is in place — drop this skip once (a)-(c) land."
+        "PTOAS drops the synchronisation between the stage-in tile.store and the "
+        "subsequent pld.tensor.put -- the put can issue before the local window "
+        "slice has been written, so the peer reads stale data. Re-enable once "
+        "PTOAS treats the store -> put pair as an ordered dependency."
     )
 )
 class TestL3Put:
