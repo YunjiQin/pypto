@@ -10,45 +10,49 @@
 """L3 distributed st: 2-rank EP dispatch + local_expert + combine — 1:1 PyPTO
 port of ``runtime/examples/workers/l3/ep_dispatch_combine``.
 
-This is a structural port of the C++ runtime example, not a simplified analog.
-The three AIV kernels (``dispatch`` / ``local_expert`` / ``combine``) become
-three :class:`pl.FunctionType.InCore` kernels chained from ``chip_orch``, with
-the same window layout, the same routing protocol, and the same data
-direction at every cross-rank op:
+This is a structural port of the C++ runtime example. The three AIV kernels
+(``dispatch`` / ``local_expert`` / ``combine``) become three
+:class:`pl.FunctionType.InCore` kernels chained from ``chip_orch``, with the
+same window layout, the same routing protocol, the same per-src signal cells
+for every barrier, the same dynamic-loop iteration style, and the same data
+direction at every cross-rank op.
 
 * **dispatch**: histogram → publish ``send_counts`` via TNOTIFY(AtomicAdd) +
-  count_done barrier → prefix_sum → ``payload_push`` 3-channel push (x BF16 /
-  w FP32 / idx INT32) into peer's ``recv_x``/``recv_w``/``recv_idx`` keyed by
-  ``(local_expert, slot)`` → data_done barrier.
-* **local_expert**: ``recv_y[e, s, :] = cast_bf16(cast_fp32(recv_x) *
-  recv_w[..., 0])`` with the BF16 round-trip preserved.
+  count_done barrier (per-src signal cells) → prefix_sum → ``payload_push``
+  3-channel push (x BF16 / w FP32 / idx INT32) into peer's
+  ``recv_x``/``recv_w``/``recv_idx`` keyed by ``(local_expert, slot)`` →
+  data_done barrier → ``stage_out`` window → host-backed
+  ``recv_x_out`` / ``recv_w_out`` / ``recv_idx_out``.
+* **local_expert**: ``recv_y[e, s, :] = cast_bf16(cast_fp32(recv_x_out) *
+  recv_w_out[..., 0])`` with the BF16 round-trip preserved; reads the staged
+  host outputs (not the window), mirroring the runtime kernel's argument
+  list.
 * **combine**: TPUT-style push of ``recv_y[idx_lin, :]`` to peer's
-  ``routed_y_buf[r, :]`` where ``r = t * TOPK + k`` from ``recv_idx``, then
-  combine_done barrier, then FP32 reduce_sum along TOPK into ``routed_y``.
+  ``routed_y_buf[r, :]`` where ``r = t * TOPK + k`` from ``recv_idx_out``,
+  then combine_done barrier (per-src signal cells), then FP32 reduce_sum
+  along TOPK into ``routed_y``.
 
-The cross-rank push points (``payload_push`` in dispatch, the recv_y push in
-combine) use the new :func:`pld.tile.remote_store` op. The TPUT semantics
-decompose as ``local_load + remote_subview_store``: each push site is one
-``pl.load`` of a local tile followed by one ``pld.tile.remote_store`` to a
-subview of a peer's window-bound tensor. No data-direction inversion.
+**Iteration style — 1:1 with runtime.** Every loop uses ``pl.range`` (runtime
+``for (int i = 0; i < N; ++i)``) instead of ``pl.unroll``. The runtime kernel
+does no compile-time unrolling — neither do we. The natural ``(t, k)``
+traversal in payload_push is equivalent to the runtime's sorted route table:
+``cursor`` is per-bucket so within-bucket ``(t, k)`` lex order (stable in
+either scheme) is all that determines slot assignment, and we skip the
+explicit insertion sort.
 
-The histogram phase reads ``indices`` via ``pl.read`` scalar GM accesses
-(matching the runtime kernel's ``int eid = indices[r];`` pattern) so the
-``[T, TOPK]`` INT32 tensor doesn't need to be padded to a 32-byte-aligned
-vector tile width; ``pl.array.create`` carries ``send_counts`` / ``cursor``
-register-local arrays so the scalar control flow translates directly.
+**Per-src signal cells — 1:1 with runtime.** Every barrier signal
+(``count_done`` / ``data_done`` / ``combine_done``) is sized ``[N_RANKS, 1]``;
+each rank notifies peer's ``[my_rank, 0]`` cell and waits on its local
+``[src, 0]`` for every ``src != my_rank``. Matches ``count_done_sig[N]`` /
+``data_done_sig[N]`` / ``combine_done_sig[N]`` in the C++ kernel and
+generalizes to ``N_RANKS > 2``.
 
-Sort vs. natural order — the runtime kernel insertion-sorts routes by
-``(dst, loc_e)`` so the payload_push cursor advances within each bucket
-contiguously. Slot determinism only requires that ``cursor[dst][loc_e]`` be
-incremented exactly once per route hitting that bucket, so any traversal
-order works; we iterate ``(t, k)`` in natural lexicographic order, which is
-simpler to express in pypto and produces the same delivered routes (just at
-different slot offsets within each src's slab).
-
-The 2-rank constraint matches the runtime example exactly; for ``N>2`` the
-publish/barrier loops would generalize to per-src signal cells, mirroring
-``count_done_sig[N]`` in the C++ kernel.
+**Stage-out — 1:1 with runtime.** The dispatch kernel emits four host-backed
+outputs: ``recv_x_out [L*R, D] BF16``, ``recv_w_out [L, R] FP32``,
+``recv_idx_out [L, R] INT32``, and ``recv_count_out [L, 1] INT32``. Per-row
+1×D tile copies for x; scalar GM reads of column 0 for w / idx (the wide
+window was filled as ``[value, 0, …, 0]`` so column 0 is the real payload).
+Downstream kernels read from the staged outputs, not the window.
 """
 
 import sys
@@ -86,39 +90,43 @@ def _build_ep_dispatch_combine_program():
         # dispatch — 1:1 of runtime/dispatch.cpp.
         #
         # Reads:   indices, x_norm, w_padded, idx_padded (host-backed inputs)
-        # Writes:  recv_count_out (host-backed [L, 1] INT32 output)
+        # Writes:  recv_x_out / recv_w_out / recv_idx_out / recv_count_out
+        #          (host-backed staged outputs)
         #          pub_counts, recv_x, recv_w, recv_idx (window slots)
-        # Barriers: count_done (publish→prefix_sum), data_done (push→exit)
+        # Barriers: count_done (publish→prefix_sum), data_done (push→stage_out)
         # ----------------------------------------------------------------
         @pl.function(type=pl.FunctionType.InCore)
-        def dispatch_step(  # noqa: PLR0913, PLR0912
+        def dispatch_step(  # noqa: PLR0913, PLR0912, PLR0915
             self,
             indices: pl.Tensor[[T, TOPK], pl.INT32],
             x_norm: pl.Tensor[[T, D], pl.BF16],
             w_padded: pl.Tensor[[N_ROUTES, W_PAD], pl.FP32],
             idx_padded: pl.Tensor[[N_ROUTES, IDX_PAD], pl.INT32],
+            recv_x_out: pl.Out[pl.Tensor[[L * R, D], pl.BF16]],
+            recv_w_out: pl.Out[pl.Tensor[[L, R], pl.FP32]],
+            recv_idx_out: pl.Out[pl.Tensor[[L, R], pl.INT32]],
             recv_count_out: pl.Out[pl.Tensor[[L, 1], pl.INT32]],
             pub_counts: pld.DistributedTensor[[N_RANKS * N_RANKS, L], pl.INT32],
-            count_done: pld.DistributedTensor[[1, 1], pl.INT32],
+            count_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
             recv_x: pld.DistributedTensor[[L * R, D], pl.BF16],
             recv_w: pld.DistributedTensor[[L * R, W_PAD], pl.FP32],
             recv_idx: pld.DistributedTensor[[L * R, IDX_PAD], pl.INT32],
-            data_done: pld.DistributedTensor[[1, 1], pl.INT32],
-            peer: pl.Scalar[pl.INT32],
+            data_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
-        ) -> pl.Tensor[[L, 1], pl.INT32]:
+        ) -> tuple[
+            pl.Tensor[[L * R, D], pl.BF16],
+            pl.Tensor[[L, R], pl.FP32],
+            pl.Tensor[[L, R], pl.INT32],
+            pl.Tensor[[L, 1], pl.INT32],
+        ]:
             # ---------- histogram: scalar histogram on indices ----------
-            # Read each (t, k) route via scalar GM access, increment
-            # send_counts[d][e]. send_counts is a register-local INT32 array
-            # of length N_RANKS*L — same shape as the runtime kernel's
-            # ``int send_counts[N][L]`` C-stack array.
             send_counts = pl.array.create(N_RANKS * L, pl.INT32)
-            for d in pl.unroll(N_RANKS):
-                for e in pl.unroll(L):
+            for d in pl.range(N_RANKS):
+                for e in pl.range(L):
                     send_counts[d * L + e] = 0
 
-            for t in pl.unroll(T):
-                for k in pl.unroll(TOPK):
+            for t in pl.range(T):
+                for k in pl.range(TOPK):
                     eid = pl.read(indices, [t, k])
                     d = eid // L
                     e = eid - d * L
@@ -127,149 +135,168 @@ def _build_ep_dispatch_combine_program():
 
             # ---------- publish: TNOTIFY(AtomicAdd) send_counts to peers ----
             # Each rank publishes its full [N_RANKS, L] send_counts row to
-            # every peer's pub_counts[my_rank][:][:] slice. AtomicAdd from
-            # zero is equivalent to a store (HCCL window zero-init), and
-            # self-rank is included so pub_counts[my_rank][:][:] gets
-            # populated locally too.
-            for peer_const in pl.unroll(N_RANKS):
-                for d in pl.unroll(N_RANKS):
-                    for e in pl.unroll(L):
+            # every peer's pub_counts[my_rank][:][:] slice. Self-rank is
+            # included so pub_counts[my_rank][:][:] gets populated locally.
+            for peer in pl.range(N_RANKS):
+                for d in pl.range(N_RANKS):
+                    for e in pl.range(L):
                         v = send_counts[d * L + e]
-                        # Skip v == 0 cells — matches runtime/dispatch.cpp's
-                        # `if (v == 0) continue;` (AtomicAdd 0 is a no-op but
-                        # still issues a cross-rank op).
                         if v != 0:
-                            # Flatten (my_rank, d, e) into the 2D pub_counts
-                            # layout: row = my_rank * N_RANKS + d, col = e.
                             pld.system.notify(
                                 target=pub_counts,
-                                peer=peer_const,
+                                peer=peer,
                                 offsets=[my_rank * N_RANKS + d, e],
                                 value=v,
                                 op=pld.NotifyOp.AtomicAdd,
                             )
 
-            # ---------- count_done barrier ----------
-            pld.system.notify(
-                target=count_done,
-                peer=peer,
-                offsets=[0, 0],
-                value=1,
-                op=pld.NotifyOp.AtomicAdd,
-            )
-            pld.system.wait(
-                signal=count_done,
-                offsets=[0, 0],
-                expected=1,
-                cmp=pld.WaitCmp.Ge,
-            )
+            # ---------- count_done barrier — per-src signal cells ----------
+            # Matches runtime/dispatch.cpp's count_done_sig[N]: notify peer's
+            # [my_rank, 0]; wait on local [src, 0] for every src != my_rank.
+            for peer in pl.range(N_RANKS):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=count_done,
+                        peer=peer,
+                        offsets=[my_rank, 0],
+                        value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(N_RANKS):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=count_done,
+                        offsets=[src, 0],
+                        expected=1,
+                        cmp=pld.WaitCmp.Ge,
+                    )
 
             # ---------- prefix_sum: my_slot_at_dst + recv_count ----------
-            # my_slot_at_dst[dst][e] = sum_{s<my_rank} pub_counts[s][dst][e]
-            #   — sender's slot offset on each peer's recv area.
-            # recv_count[e]        = sum_{s<N_RANKS} pub_counts[s][my_rank][e]
-            #   — total rows arriving at THIS rank's local expert e.
+            # The SSA pass auto-detects `acc` as a loop-carried variable
+            # (assigned in body, exists before the loop) and inserts the
+            # IterArg/Yield machinery — no manual workaround needed.
             my_slot_at_dst = pl.array.create(N_RANKS * L, pl.INT32)
-            for d in pl.unroll(N_RANKS):
-                for e in pl.unroll(L):
-                    acc = pl.array.create(1, pl.INT32)
-                    acc[0] = 0
-                    for s in pl.unroll(N_RANKS):
+            for d in pl.range(N_RANKS):
+                for e in pl.range(L):
+                    acc = pl.const(0, pl.INT32)
+                    for s in pl.range(N_RANKS):
                         if s < my_rank:
-                            acc[0] = acc[0] + pl.read(pub_counts, [s * N_RANKS + d, e])
-                    my_slot_at_dst[d * L + e] = acc[0]
+                            acc = acc + pl.read(pub_counts, [s * N_RANKS + d, e])
+                    my_slot_at_dst[d * L + e] = acc
 
-            for e in pl.unroll(L):
-                acc = pl.array.create(1, pl.INT32)
-                acc[0] = 0
-                for s in pl.unroll(N_RANKS):
-                    acc[0] = acc[0] + pl.read(pub_counts, [s * N_RANKS + my_rank, e])
-                pl.write(recv_count_out, [e, 0], acc[0])
+            for e in pl.range(L):
+                acc = pl.const(0, pl.INT32)
+                for s in pl.range(N_RANKS):
+                    acc = acc + pl.read(pub_counts, [s * N_RANKS + my_rank, e])
+                pl.write(recv_count_out, [e, 0], acc)
 
-            # ---------- payload_push: 3-channel push via remote_store ------
-            # For each route (t, k), look up (dst, loc_e) from indices,
-            # compute slot = my_slot_at_dst[dst][loc_e] + cursor[dst][loc_e],
-            # and push x / w / idx as 1×C tiles to peer's recv_x/w/idx at
-            # row = loc_e * R + slot.
-            #
-            # Self-rank is NOT skipped: dst can equal my_rank for tokens
-            # that route to a local expert. CommRemotePtr returns the local
-            # address for peer==my_rank, so remote_store falls back to a
-            # local subview store automatically.
+            # ---------- payload_push: natural (t, k) iteration ----------
+            # Equivalent to runtime's sorted route-table scan: cursor is
+            # per-bucket so within-bucket (t, k) lex order (preserved by
+            # either scheme) is all that determines slot assignment.
             cursor = pl.array.create(N_RANKS * L, pl.INT32)
-            for d in pl.unroll(N_RANKS):
-                for e in pl.unroll(L):
+            for d in pl.range(N_RANKS):
+                for e in pl.range(L):
                     cursor[d * L + e] = 0
 
-            for t in pl.unroll(T):
-                # x_norm[t, :] is reused across both k iterations — load once
-                # per t and reuse for every (t, k) push.
-                x_tile = pl.load(x_norm, [t, 0], [1, D])
-                for k in pl.unroll(TOPK):
+            for t in pl.range(T):
+                for k in pl.range(TOPK):
                     eid = pl.read(indices, [t, k])
                     dst = eid // L
                     loc_e = eid - dst * L
                     bucket = dst * L + loc_e
                     cur_val = cursor[bucket]
-                    cursor[bucket] = cur_val + 1
                     slot_off = my_slot_at_dst[bucket]
                     slot = slot_off + cur_val
                     row = loc_e * R + slot
+                    cursor[bucket] = cur_val + 1
+                    r_route = t * TOPK + k
 
-                    # Channel 1: x BF16 [1, D] — x_norm[t, :] → peer.recv_x[row, :]
+                    # Channel 1: x BF16 [1, D]
+                    x_tile = pl.load(x_norm, [t, 0], [1, D])
                     pld.tile.remote_store(x_tile, target=recv_x, peer=dst, offsets=[row, 0])
 
-                    # Channel 2: w FP32 [1, W_PAD] — host pre-packed [w, 0, ..., 0]
-                    r_route = t * TOPK + k
+                    # Channel 2: w FP32 [1, W_PAD]
                     w_tile = pl.load(w_padded, [r_route, 0], [1, W_PAD])
                     pld.tile.remote_store(w_tile, target=recv_w, peer=dst, offsets=[row, 0])
 
-                    # Channel 3: idx INT32 [1, IDX_PAD] — host pre-packed [r, 0, ..., 0]
+                    # Channel 3: idx INT32 [1, IDX_PAD]
                     idx_tile = pl.load(idx_padded, [r_route, 0], [1, IDX_PAD])
                     pld.tile.remote_store(idx_tile, target=recv_idx, peer=dst, offsets=[row, 0])
 
-            # ---------- data_done barrier ----------
-            pld.system.notify(
-                target=data_done,
-                peer=peer,
-                offsets=[0, 0],
-                value=1,
-                op=pld.NotifyOp.AtomicAdd,
-            )
-            pld.system.wait(
-                signal=data_done,
-                offsets=[0, 0],
-                expected=1,
-                cmp=pld.WaitCmp.Ge,
-            )
-            return recv_count_out
+            # ---------- data_done barrier — per-src signal cells ----------
+            for peer in pl.range(N_RANKS):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=data_done,
+                        peer=peer,
+                        offsets=[my_rank, 0],
+                        value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(N_RANKS):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=data_done,
+                        offsets=[src, 0],
+                        expected=1,
+                        cmp=pld.WaitCmp.Ge,
+                    )
+
+            # ---------- stage_out: window → host-backed outputs ----------
+            # recv_x_out: per-row 1×D tile copy; mirrors dispatch.cpp's per-row
+            # TLOAD/TSTORE loop.
+            for e in pl.range(L):
+                for slot in pl.range(R):
+                    row = e * R + slot
+                    x_tile = pl.load(recv_x, [row, 0], [1, D])
+                    pl.store(x_tile, [row, 0], recv_x_out)
+
+            # recv_w_out: per-expert TLOAD [R, W_PAD] + row_sum (compacts
+            # along W_PAD axis; sum recovers slot [0] since [1, W_PAD) is
+            # zero by design) + reshape [R, 1] → [1, R] + TSTORE. Mirrors
+            # the runtime's TROWSUM stage_out for the weight channel.
+            for e in pl.range(L):
+                w_wide: pl.Tile[[R, W_PAD], pl.FP32] = pl.load(recv_w, [e * R, 0], [R, W_PAD])
+                tmp: pl.Tile[[R, 1], pl.FP32] = pl.tile.create(
+                    [R, 1], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+                )
+                w_sum: pl.Tile[[R, 1], pl.FP32] = pl.tile.row_sum(w_wide, tmp)
+                w_row: pl.Tile[[1, R], pl.FP32] = pl.tile.reshape(w_sum, [1, R])
+                pl.store(w_row, [e, 0], recv_w_out)
+
+            # recv_idx_out: scalar copy of column 0 (matches dispatch.cpp's
+            # fallback path, which avoids INT32 TROWSUM hangs on a2a3).
+            for e in pl.range(L):
+                for slot in pl.range(R):
+                    r_val = pl.read(recv_idx, [e * R + slot, 0])
+                    pl.write(recv_idx_out, [e, slot], r_val)
+
+            return recv_x_out, recv_w_out, recv_idx_out, recv_count_out
 
         # ----------------------------------------------------------------
         # local_expert — 1:1 of runtime/local_expert.cpp.
         #
-        # recv_y[e, slot, :] = cast_bf16(cast_fp32(recv_x[e, slot, :]) *
-        #                                recv_w[e, slot, 0])    for slot < recv_count[e]
+        # recv_y[e, slot, :] = cast_bf16(cast_fp32(recv_x_out[e, slot, :]) *
+        #                                recv_w_out[e, slot])
         #
-        # Pure local — no cross-rank ops.
+        # Reads the staged host-backed outputs. Pure local — no cross-rank ops.
         # ----------------------------------------------------------------
         @pl.function(type=pl.FunctionType.InCore)
         def local_expert_step(
             self,
+            recv_x_out: pl.Tensor[[L * R, D], pl.BF16],
+            recv_w_out: pl.Tensor[[L, R], pl.FP32],
             recv_count: pl.Tensor[[L, 1], pl.INT32],
             recv_y: pl.Out[pl.Tensor[[L * R, D], pl.BF16]],
-            recv_x: pld.DistributedTensor[[L * R, D], pl.BF16],
-            recv_w: pld.DistributedTensor[[L * R, W_PAD], pl.FP32],
         ) -> pl.Tensor[[L * R, D], pl.BF16]:
-            for e in pl.unroll(L):
-                # pl.read returns the tensor's INT32 dtype; pl.range needs an
-                # INDEX bound, so cast explicitly (matches the row_idx cast
-                # idiom in tests/st/runtime/.../test_incore_array.py).
+            for e in pl.range(L):
                 n_rows = pl.cast(pl.read(recv_count, [e, 0]), pl.INDEX)
                 for slot in pl.range(n_rows):
                     row = e * R + slot
-                    x_bf = pl.load(recv_x, [row, 0], [1, D])
+                    x_bf = pl.load(recv_x_out, [row, 0], [1, D])
                     x_fp = pl.cast(x_bf, target_type=pl.FP32)
-                    w_scalar = pl.read(recv_w, [row, 0])
+                    w_scalar = pl.read(recv_w_out, [e, slot])
                     y_fp = pl.mul(x_fp, w_scalar)
                     y_bf = pl.cast(y_fp, target_type=pl.BF16)
                     pl.store(y_bf, [row, 0], recv_y)
@@ -278,69 +305,58 @@ def _build_ep_dispatch_combine_program():
         # ----------------------------------------------------------------
         # combine — 1:1 of runtime/combine.cpp.
         #
-        # Phase push: for each (dst, e), push recv_y rows to peer dst's
-        #             routed_y_buf[r, :] (r = t*TOPK+k from recv_idx).
-        # combine_done barrier.
-        # Phase reduce: for each token t, reduce_sum cast_fp32(
-        #               routed_y_buf[t*TOPK+k, :]) over k into routed_y[t, :] FP32.
-        #
-        # The push direction is the same as runtime — recv_y on rank A
-        # carries OUR tokens' expert outputs (A ran the expert step on data
-        # we pushed via dispatch), so we push them BACK to our originating
-        # ranks' routed_y_buf. With remote_store, this is one pl.load of a
-        # 1×D BF16 tile + one pld.tile.remote_store per row.
+        # Reads recv_idx_out (host-backed [L, R] INT32) and pub_counts
+        # (window). Pushes recv_y rows to peer dst's routed_y_buf[r, :] where
+        # r = recv_idx_out[e, src_off + row]. combine_done barrier uses
+        # per-src signal cells.
         # ----------------------------------------------------------------
         @pl.function(type=pl.FunctionType.InCore)
         def combine_step(
             self,
             recv_y: pl.Tensor[[L * R, D], pl.BF16],
+            recv_idx_out: pl.Tensor[[L, R], pl.INT32],
             routed_y_out: pl.Out[pl.Tensor[[T, D], pl.FP32]],
             pub_counts: pld.DistributedTensor[[N_RANKS * N_RANKS, L], pl.INT32],
-            recv_idx: pld.DistributedTensor[[L * R, IDX_PAD], pl.INT32],
             routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
-            combine_done: pld.DistributedTensor[[1, 1], pl.INT32],
-            peer: pl.Scalar[pl.INT32],
+            combine_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
         ) -> pl.Tensor[[T, D], pl.FP32]:
             # ---------- push: TPUT recv_y rows to peer's routed_y_buf ----
-            for dst in pl.unroll(N_RANKS):
-                for e in pl.unroll(L):
-                    # n / src_off feed pl.range and offset arithmetic — both
-                    # want INDEX. Read as the tensor's INT32 dtype and cast.
+            for dst in pl.range(N_RANKS):
+                for e in pl.range(L):
                     n = pl.cast(pl.read(pub_counts, [dst * N_RANKS + my_rank, e]), pl.INDEX)
-                    # src_off = sum_{s<dst} pub_counts[s][my_rank][e]
-                    src_off = pl.array.create(1, pl.INT32)
-                    src_off[0] = 0
-                    for s in pl.unroll(N_RANKS):
+                    src_off = pl.const(0, pl.INT32)
+                    for s in pl.range(N_RANKS):
                         if s < dst:
-                            src_off[0] = src_off[0] + pl.read(pub_counts, [s * N_RANKS + my_rank, e])
-                    src_off_idx = pl.cast(src_off[0], pl.INDEX)
+                            src_off = src_off + pl.read(pub_counts, [s * N_RANKS + my_rank, e])
+                    src_off_idx = pl.cast(src_off, pl.INDEX)
                     for row in pl.range(n):
                         idx_lin = e * R + src_off_idx + row
-                        r_route = pl.read(recv_idx, [idx_lin, 0])
+                        r_route = pl.read(recv_idx_out, [e, src_off_idx + row])
                         y_tile = pl.load(recv_y, [idx_lin, 0], [1, D])
                         pld.tile.remote_store(y_tile, target=routed_y_buf, peer=dst, offsets=[r_route, 0])
 
-            # ---------- combine_done barrier ----------
-            pld.system.notify(
-                target=combine_done,
-                peer=peer,
-                offsets=[0, 0],
-                value=1,
-                op=pld.NotifyOp.AtomicAdd,
-            )
-            pld.system.wait(
-                signal=combine_done,
-                offsets=[0, 0],
-                expected=1,
-                cmp=pld.WaitCmp.Ge,
-            )
+            # ---------- combine_done barrier — per-src signal cells ----------
+            for peer in pl.range(N_RANKS):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=combine_done,
+                        peer=peer,
+                        offsets=[my_rank, 0],
+                        value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(N_RANKS):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=combine_done,
+                        offsets=[src, 0],
+                        expected=1,
+                        cmp=pld.WaitCmp.Ge,
+                    )
 
             # ---------- reduce: routed_y[t] = sum_k cast_fp32(routed_y_buf[t*TOPK+k]) ----
-            # TOPK=2 statically — straight unrolled add, matching the
-            # existing combine_step structure (avoids nesting init_values
-            # inside the t-loop).
-            for t in pl.unroll(T):
+            for t in pl.range(T):
                 y0 = pl.load(routed_y_buf, [t * TOPK, 0], [1, D])
                 y1 = pl.load(routed_y_buf, [t * TOPK + 1, 0], [1, D])
                 y0_fp = pl.cast(y0, target_type=pl.FP32)
@@ -356,30 +372,30 @@ def _build_ep_dispatch_combine_program():
             x_norm: pl.Tensor[[T, D], pl.BF16],
             w_padded: pl.Tensor[[N_ROUTES, W_PAD], pl.FP32],
             idx_padded: pl.Tensor[[N_ROUTES, IDX_PAD], pl.INT32],
+            recv_x_out: pl.Out[pl.Tensor[[L * R, D], pl.BF16]],
+            recv_w_out: pl.Out[pl.Tensor[[L, R], pl.FP32]],
+            recv_idx_out: pl.Out[pl.Tensor[[L, R], pl.INT32]],
             recv_count_out: pl.Out[pl.Tensor[[L, 1], pl.INT32]],
             recv_y: pl.Out[pl.Tensor[[L * R, D], pl.BF16]],
             routed_y: pl.Out[pl.Tensor[[T, D], pl.FP32]],
             pub_counts: pld.DistributedTensor[[N_RANKS * N_RANKS, L], pl.INT32],
-            count_done: pld.DistributedTensor[[1, 1], pl.INT32],
+            count_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
             recv_x: pld.DistributedTensor[[L * R, D], pl.BF16],
             recv_w: pld.DistributedTensor[[L * R, W_PAD], pl.FP32],
             recv_idx: pld.DistributedTensor[[L * R, IDX_PAD], pl.INT32],
-            data_done: pld.DistributedTensor[[1, 1], pl.INT32],
+            data_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
             routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
-            combine_done: pld.DistributedTensor[[1, 1], pl.INT32],
-            peer: pl.Scalar[pl.INT32],
+            combine_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
         ) -> pl.Tensor[[T, D], pl.FP32]:
-            # Sequential chaining: dispatch → local_expert → combine.
-            # Cross-kernel dependencies flow via host-backed pl.Out outputs
-            # (recv_count_out / recv_y / routed_y) and shared window slots.
-            # InOut/Out parameters use SSA-functional discipline — rebind via
-            # the call's return value before passing to the next kernel.
-            recv_count_out = self.dispatch_step(
+            recv_x_out, recv_w_out, recv_idx_out, recv_count_out = self.dispatch_step(
                 indices,
                 x_norm,
                 w_padded,
                 idx_padded,
+                recv_x_out,
+                recv_w_out,
+                recv_idx_out,
                 recv_count_out,
                 pub_counts,
                 count_done,
@@ -387,18 +403,16 @@ def _build_ep_dispatch_combine_program():
                 recv_w,
                 recv_idx,
                 data_done,
-                peer,
                 my_rank,
             )
-            recv_y = self.local_expert_step(recv_count_out, recv_y, recv_x, recv_w)
+            recv_y = self.local_expert_step(recv_x_out, recv_w_out, recv_count_out, recv_y)
             return self.combine_step(
                 recv_y,
+                recv_idx_out,
                 routed_y,
                 pub_counts,
-                recv_idx,
                 routed_y_buf,
                 combine_done,
-                peer,
                 my_rank,
             )
 
@@ -409,37 +423,42 @@ def _build_ep_dispatch_combine_program():
             x_norms: pl.Tensor[[N_RANKS, T, D], pl.BF16],
             w_padded: pl.Tensor[[N_RANKS, N_ROUTES, W_PAD], pl.FP32],
             idx_padded: pl.Tensor[[N_RANKS, N_ROUTES, IDX_PAD], pl.INT32],
+            recv_x_outs: pl.Out[pl.Tensor[[N_RANKS, L * R, D], pl.BF16]],
+            recv_w_outs: pl.Out[pl.Tensor[[N_RANKS, L, R], pl.FP32]],
+            recv_idx_outs: pl.Out[pl.Tensor[[N_RANKS, L, R], pl.INT32]],
             recv_count_outs: pl.Out[pl.Tensor[[N_RANKS, L, 1], pl.INT32]],
             recv_ys: pl.Out[pl.Tensor[[N_RANKS, L * R, D], pl.BF16]],
             routed_ys: pl.Out[pl.Tensor[[N_RANKS, T, D], pl.FP32]],
         ) -> pl.Tensor[[N_RANKS, T, D], pl.FP32]:
-            # Window allocations — one buffer per cross-rank slot. Bytes
-            # mirror the runtime example's k*Bytes constants.
+            # Window allocations — one buffer per cross-rank slot. Barrier
+            # signals are sized [N_RANKS, 1] to host per-src cells, matching
+            # count_done_sig[N] / data_done_sig[N] / combine_done_sig[N].
             pub_counts_buf = pld.alloc_window_buffer(N_RANKS * N_RANKS * L * 4)  # INT32
-            count_done_buf = pld.alloc_window_buffer(4)
+            count_done_buf = pld.alloc_window_buffer(N_RANKS * 4)
             recv_x_buf = pld.alloc_window_buffer(L * R * D * 2)  # BF16
             recv_w_buf = pld.alloc_window_buffer(L * R * W_PAD * 4)  # FP32
             recv_idx_buf = pld.alloc_window_buffer(L * R * IDX_PAD * 4)  # INT32
-            data_done_buf = pld.alloc_window_buffer(4)
+            data_done_buf = pld.alloc_window_buffer(N_RANKS * 4)
             routed_y_buf_buf = pld.alloc_window_buffer(N_ROUTES * D * 2)  # BF16
-            combine_done_buf = pld.alloc_window_buffer(4)
+            combine_done_buf = pld.alloc_window_buffer(N_RANKS * 4)
 
             for r in pl.range(pld.world_size()):
                 pub_counts = pld.window(pub_counts_buf, [N_RANKS * N_RANKS, L], dtype=pl.INT32)
-                count_done = pld.window(count_done_buf, [1, 1], dtype=pl.INT32)
+                count_done = pld.window(count_done_buf, [N_RANKS, 1], dtype=pl.INT32)
                 recv_x = pld.window(recv_x_buf, [L * R, D], dtype=pl.BF16)
                 recv_w = pld.window(recv_w_buf, [L * R, W_PAD], dtype=pl.FP32)
                 recv_idx = pld.window(recv_idx_buf, [L * R, IDX_PAD], dtype=pl.INT32)
-                data_done = pld.window(data_done_buf, [1, 1], dtype=pl.INT32)
+                data_done = pld.window(data_done_buf, [N_RANKS, 1], dtype=pl.INT32)
                 routed_y_buf = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
-                combine_done = pld.window(combine_done_buf, [1, 1], dtype=pl.INT32)
-                # Ring partner: peer = (r + 1) % nranks; for N_RANKS=2 this
-                # is the other rank.
+                combine_done = pld.window(combine_done_buf, [N_RANKS, 1], dtype=pl.INT32)
                 self.chip_orch(
                     indices[r],
                     x_norms[r],
                     w_padded[r],
                     idx_padded[r],
+                    recv_x_outs[r],
+                    recv_w_outs[r],
+                    recv_idx_outs[r],
                     recv_count_outs[r],
                     recv_ys[r],
                     routed_ys[r],
@@ -451,7 +470,6 @@ def _build_ep_dispatch_combine_program():
                     data_done,
                     routed_y_buf,
                     combine_done,
-                    (r + 1) % pld.world_size(),
                     r,
                     device=r,
                 )
@@ -461,12 +479,7 @@ def _build_ep_dispatch_combine_program():
 
 
 def _generate_routing_indices(seed: int) -> torch.Tensor:
-    """Generate ``indices[N_RANKS][T, TOPK]`` so no expert exceeds RECV_MAX.
-
-    Top-k entries within a single token are forced unique. Reseed if any
-    per-expert receive count would overflow R. Mirrors the runtime example's
-    ``generate_routing_indices``.
-    """
+    """Generate ``indices[N_RANKS][T, TOPK]`` so no expert exceeds RECV_MAX."""
     rng = torch.Generator().manual_seed(seed)
     while True:
         indices = torch.zeros(N_RANKS, T, TOPK, dtype=torch.int32)
@@ -490,12 +503,6 @@ def _generate_routing_indices(seed: int) -> torch.Tensor:
 
 
 def _pack_weights_padded(weights: torch.Tensor) -> torch.Tensor:
-    """Pack ``[N_RANKS, T, TOPK]`` weights into ``[N_RANKS, N_ROUTES, W_PAD]`` FP32.
-
-    Mirrors the runtime example's ``pack_weights_padded``: row r=t*TOPK+k is
-    ``[weight_value, 0, ..., 0]`` — actual weight at column 0, zeros at
-    [1, W_PAD). The receiver writes the full 1×W_PAD tile and reads column 0.
-    """
     out = torch.zeros((N_RANKS, N_ROUTES, W_PAD), dtype=torch.float32)
     for r in range(N_RANKS):
         for t in range(T):
@@ -506,11 +513,6 @@ def _pack_weights_padded(weights: torch.Tensor) -> torch.Tensor:
 
 
 def _pack_idx_padded() -> torch.Tensor:
-    """Pack ``[N_RANKS, N_ROUTES, IDX_PAD]`` idx tiles where row r = (r, 0, ..., 0).
-
-    Identical layout for every rank — r = t*TOPK + k is intrinsic, not
-    rank-specific. Mirrors the runtime example's ``pack_idx_padded``.
-    """
     out = torch.zeros((N_RANKS, N_ROUTES, IDX_PAD), dtype=torch.int32)
     for t in range(T):
         for k in range(TOPK):
@@ -519,19 +521,64 @@ def _pack_idx_padded() -> torch.Tensor:
     return out
 
 
-def _compute_golden(x_norms: torch.Tensor, indices: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
-    """Host reference for ``routed_y`` — mirrors the runtime ``_verify_routed_y``.
+def _compute_golden_recv(
+    x_norms: torch.Tensor,
+    indices: torch.Tensor,
+    weights: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Replay dispatch protocol on host → per-rank dispatch goldens.
 
-    For each rank r: ``routed_y[r][t, :] = sum_k cast_fp32(cast_bf16(
-    x_norms[r][t, :].fp32 * weights[r, t, k]))``.
+    Mirrors runtime ``compute_golden`` in main.py:
+      expected_recv_x[r]   BF16  [L, R, D]
+      expected_recv_w[r]   FP32  [L, R]
+      expected_recv_idx[r] INT32 [L, R]   (r_route = t * TOPK + k)
+      expected_count[r]    INT32 [L]
+    """
+    expected_recv_x = torch.zeros(N_RANKS, L, R, D, dtype=torch.bfloat16)
+    expected_recv_w = torch.zeros(N_RANKS, L, R, dtype=torch.float32)
+    expected_recv_idx = torch.zeros(N_RANKS, L, R, dtype=torch.int32)
+    expected_count = torch.zeros(N_RANKS, L, dtype=torch.int32)
 
-    The dispatch protocol is end-to-end shape-preserving for routed_y: each
-    (t, k) on rank r dispatches to some (dst, loc_e), gets multiplied by the
-    rank's weight, cast through BF16, and pushed back by combine to the
-    original (t, k) slot on rank r. So the formula depends only on r's own
-    inputs — routing details cancel out. Takes the *unpadded* ``[N_RANKS,
-    T, TOPK]`` weights — the W_PAD layout only affects on-device tile width
-    and never reaches the reduce.
+    send_counts = torch.zeros(N_RANKS, N_RANKS, L, dtype=torch.int32)
+    for src in range(N_RANKS):
+        for t in range(T):
+            for k in range(TOPK):
+                eid = int(indices[src, t, k].item())
+                dst = eid // L
+                loc_e = eid % L
+                send_counts[src, dst, loc_e] += 1
+
+    for dst in range(N_RANKS):
+        slot_offset = torch.zeros(N_RANKS, L, dtype=torch.int32)
+        running = torch.zeros(L, dtype=torch.int32)
+        for src in range(N_RANKS):
+            slot_offset[src] = running.clone()
+            running = running + send_counts[src, dst]
+
+        for src in range(N_RANKS):
+            cursor = torch.zeros(L, dtype=torch.int32)
+            for t in range(T):
+                for k in range(TOPK):
+                    eid = int(indices[src, t, k].item())
+                    if eid // L != dst:
+                        continue
+                    loc_e = eid % L
+                    slot = int(slot_offset[src, loc_e].item() + cursor[loc_e].item())
+                    cursor[loc_e] += 1
+                    expected_recv_x[dst, loc_e, slot, :] = x_norms[src, t, :]
+                    expected_recv_w[dst, loc_e, slot] = weights[src, t, k]
+                    expected_recv_idx[dst, loc_e, slot] = t * TOPK + k
+
+        for e in range(L):
+            expected_count[dst, e] = int(running[e].item())
+
+    return expected_recv_x, expected_recv_w, expected_recv_idx, expected_count
+
+
+def _compute_golden_routed(x_norms: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    """Per-rank ``routed_y`` golden — only depends on r's own inputs because
+    the dispatch+combine protocol is end-to-end shape-preserving for routed_y
+    (each (t, k) on rank r round-trips back to the original (t, k) slot).
     """
     expected = torch.zeros((N_RANKS, T, D), dtype=torch.float32)
     for r in range(N_RANKS):
@@ -568,10 +615,6 @@ class TestL3EpDispatchCombine:
             ),
         )
 
-        # x_norm[r, t, d] = r*100 + t*10 + d  → max = 1*100 + 7*10 + 63 = 233.
-        # All values are integers ≤ 256 so they fit BF16 exactly (8-bit
-        # mantissa + hidden bit gives exact integers up to 2^8). The host
-        # golden therefore lines up bit-for-bit on the BF16 round-trip.
         x_norms = torch.tensor(
             [[[r * 100 + t * 10 + d for d in range(D)] for t in range(T)] for r in range(N_RANKS)],
             dtype=torch.bfloat16,
@@ -587,9 +630,9 @@ class TestL3EpDispatchCombine:
         weights_padded = _pack_weights_padded(weights)
         idx_padded = _pack_idx_padded()
 
-        # Host-backed intermediates that need pre-allocation. recv_count_out
-        # and recv_ys are kernel outputs that combine reads; they need to be
-        # passed to the orch as OUTPUT_EXISTING tensors.
+        recv_x_outs = torch.zeros((N_RANKS, L * R, D), dtype=torch.bfloat16)
+        recv_w_outs = torch.zeros((N_RANKS, L, R), dtype=torch.float32)
+        recv_idx_outs = torch.zeros((N_RANKS, L, R), dtype=torch.int32)
         recv_count_outs = torch.zeros((N_RANKS, L, 1), dtype=torch.int32)
         recv_ys = torch.zeros((N_RANKS, L * R, D), dtype=torch.bfloat16)
         routed_ys = torch.zeros((N_RANKS, T, D), dtype=torch.float32)
@@ -599,18 +642,50 @@ class TestL3EpDispatchCombine:
             x_norms,
             weights_padded,
             idx_padded,
+            recv_x_outs,
+            recv_w_outs,
+            recv_idx_outs,
             recv_count_outs,
             recv_ys,
             routed_ys,
         )
 
-        expected = _compute_golden(x_norms, indices, weights)
-        max_diff = (routed_ys - expected).abs().max().item()
-        # 1e-3 mirrors the runtime example's tolerance — the only error
-        # source is the per-(t, k) BF16 cast that both sides perform
-        # identically.
-        assert torch.allclose(routed_ys, expected, atol=1e-3), (
-            f"ep_dispatch_combine mismatch: max diff = {max_diff}"
+        # ---------- dispatch-stage goldens ----------
+        expected_recv_x, expected_recv_w, expected_recv_idx, expected_count = _compute_golden_recv(
+            x_norms, indices, weights
+        )
+        recv_count_outs_2d = recv_count_outs.squeeze(-1)
+        assert torch.equal(recv_count_outs_2d, expected_count), (
+            f"recv_count mismatch: got={recv_count_outs_2d.tolist()} expected={expected_count.tolist()}"
+        )
+        recv_x_outs_4d = recv_x_outs.reshape(N_RANKS, L, R, D)
+        for r in range(N_RANKS):
+            for e in range(L):
+                n = int(expected_count[r, e].item())
+                if n == 0:
+                    continue
+                got_x = recv_x_outs_4d[r, e, :n, :].to(torch.float32)
+                exp_x = expected_recv_x[r, e, :n, :].to(torch.float32)
+                assert torch.equal(got_x, exp_x), (
+                    f"recv_x mismatch at rank {r} expert {e}: max diff = {(got_x - exp_x).abs().max().item()}"
+                )
+                got_w = recv_w_outs[r, e, :n]
+                exp_w = expected_recv_w[r, e, :n]
+                assert torch.allclose(got_w, exp_w, atol=1e-6), (
+                    f"recv_w mismatch at rank {r} expert {e}: max diff = {(got_w - exp_w).abs().max().item()}"
+                )
+                got_idx = recv_idx_outs[r, e, :n]
+                exp_idx = expected_recv_idx[r, e, :n]
+                assert torch.equal(got_idx, exp_idx), (
+                    f"recv_idx mismatch at rank {r} expert {e}: "
+                    f"got={got_idx.tolist()} expected={exp_idx.tolist()}"
+                )
+
+        # ---------- combine-stage golden ----------
+        expected_routed = _compute_golden_routed(x_norms, weights)
+        max_diff = (routed_ys - expected_routed).abs().max().item()
+        assert torch.allclose(routed_ys, expected_routed, atol=1e-3), (
+            f"ep_dispatch_combine routed_y mismatch: max diff = {max_diff}"
         )
 
 
