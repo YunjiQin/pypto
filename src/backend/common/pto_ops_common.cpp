@@ -2322,18 +2322,20 @@ static std::string MakeRemoteLoadCodegenPTO(const CallPtr& op, codegen::CodegenB
   return "";
 }
 
-// pld.tile.remote_store(src_tile, target, peer, offsets) — write a local tile
-// into a peer's slice of a window-bound DistributedTensor. Lowers to:
+// pld.tile.remote_store(src_tile, target, peer, offsets[, shapes]) — write a
+// local tile into a peer's slice of a window-bound DistributedTensor. Lowers
+// to:
 //   delems    = func.call @CommRemoteOffset_<dtype>(ctx, peer) : ... -> index
 //   peer_ptr  = pto.addptr local_ptr, delems
 //   peer_view = pto.make_tensor_view peer_ptr, shape=..., strides=...
-//   pto.partition_view peer_view, offsets=..., sizes=<tile.valid_shape>
+//   pto.partition_view peer_view, offsets=..., sizes=<tile.valid_shape | shapes>
 //   pto.tstore ins(<tile>) outs(<pview>)
 static std::string MakeRemoteStoreCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
   auto& codegen = dynamic_cast<codegen::PTOCodegen&>(codegen_base);
-  CHECK(op->args_.size() == 4) << "pld.tile.remote_store requires 4 arguments (src_tile, target, peer, "
-                                  "offsets), got "
-                               << op->args_.size();
+  CHECK(op->args_.size() == 4 || op->args_.size() == 5)
+      << "pld.tile.remote_store requires 4 or 5 arguments (src_tile, target, peer, offsets[, shapes]), "
+         "got "
+      << op->args_.size();
 
   auto src_tile = AsVarLike(op->args_[0]);
   INTERNAL_CHECK_SPAN(src_tile, op->span_) << "pld.tile.remote_store src_tile must be a Var or IterArg";
@@ -2344,27 +2346,40 @@ static std::string MakeRemoteStoreCodegenPTO(const CallPtr& op, codegen::Codegen
   auto offsets_tuple = As<ir::MakeTuple>(op->args_[3]);
   INTERNAL_CHECK_SPAN(offsets_tuple, op->span_) << "pld.tile.remote_store offsets must be MakeTuple";
 
-  // Tile-level partition shape comes from the tile's effective valid_shape
-  // (matches tile.store's contract). The peer view is full-tensor; partition
-  // then slices it down to the tile-sized region at the given offsets.
-  const auto tile_view = ir::tile_view_semantics::GetEffectiveTileView(*tile_type);
-  const auto& valid_shape = tile_view.valid_shape;
-  INTERNAL_CHECK_SPAN(valid_shape.size() == 2, op->span_)
-      << "pld.tile.remote_store tile valid_shape must be 2D";
-  auto height_code = codegen.GetExprAsCode(valid_shape[0]);
-  auto width_code = codegen.GetExprAsCode(valid_shape[1]);
-
-  std::string height_dim = "?", width_dim = "?";
-  if (auto h = As<ir::ConstInt>(valid_shape[0])) height_dim = std::to_string(h->value_);
-  if (auto w = As<ir::ConstInt>(valid_shape[1])) width_dim = std::to_string(w->value_);
+  ir::MakeTuplePtr shapes_tuple;
+  if (op->args_.size() > 4) {
+    shapes_tuple = As<ir::MakeTuple>(op->args_[4]);
+    INTERNAL_CHECK_SPAN(shapes_tuple, op->span_)
+        << "pld.tile.remote_store optional shapes argument must be MakeTuple";
+  }
 
   auto peer_view = EmitCommRemoteView(binding, op->args_[2], codegen);
-
   const std::string dtype_str = codegen.GetTypeString(binding.type->dtype_);
-  std::string partition_type = MakePartitionTensorViewType({height_dim, width_dim}, dtype_str);
-  std::string partition_view = EmitPartitionViewPTO(
-      binding.var->name_hint_ + "_peer", peer_view.ssa, peer_view.view_type_str, partition_type,
-      LowerTupleToIndexSSA(offsets_tuple, codegen), {height_code, width_code}, codegen);
+
+  std::string partition_type;
+  std::vector<std::string> size_codes;
+  if (shapes_tuple) {
+    const auto& shape_elems = shapes_tuple->elements_;
+    partition_type = MakePartitionTensorViewType(GetDimStrings(shape_elems), dtype_str);
+    size_codes = GetSizeCodes(shape_elems, codegen);
+  } else {
+    const auto tile_view = ir::tile_view_semantics::GetEffectiveTileView(*tile_type);
+    const auto& valid_shape = tile_view.valid_shape;
+    INTERNAL_CHECK_SPAN(valid_shape.size() == 2, op->span_)
+        << "pld.tile.remote_store tile valid_shape must be 2D";
+    auto height_code = codegen.GetExprAsCode(valid_shape[0]);
+    auto width_code = codegen.GetExprAsCode(valid_shape[1]);
+
+    std::string height_dim = "?", width_dim = "?";
+    if (auto h = As<ir::ConstInt>(valid_shape[0])) height_dim = std::to_string(h->value_);
+    if (auto w = As<ir::ConstInt>(valid_shape[1])) width_dim = std::to_string(w->value_);
+    partition_type = MakePartitionTensorViewType({height_dim, width_dim}, dtype_str);
+    size_codes = {height_code, width_code};
+  }
+
+  std::string partition_view =
+      EmitPartitionViewPTO(binding.var->name_hint_ + "_peer", peer_view.ssa, peer_view.view_type_str,
+                           partition_type, LowerTupleToIndexSSA(offsets_tuple, codegen), size_codes, codegen);
 
   std::string tile_buf = codegen.GetVarName(src_tile);
   std::string tile_buf_type = codegen.GetExprTypeAnnotation(op->args_[0]);

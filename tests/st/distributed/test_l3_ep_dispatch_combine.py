@@ -50,7 +50,7 @@ generalizes to ``N_RANKS > 2``.
 **Stage-out — 1:1 with runtime.** The dispatch kernel emits four host-backed
 outputs: ``recv_x_out [L*R, D] BF16``, ``recv_w_out [L, R] FP32``,
 ``recv_idx_out [L, R] INT32``, and ``recv_count_out [L, 1] INT32``. Per-row
-1×D tile copies for x; scalar GM reads of column 0 for w / idx (the wide
+1xD tile copies for x; scalar GM reads of column 0 for w / idx (the wide
 window was filled as ``[value, 0, …, 0]`` so column 0 is the real payload).
 Downstream kernels read from the staged outputs, not the window.
 """
@@ -244,7 +244,7 @@ def _build_ep_dispatch_combine_program():
                     )
 
             # ---------- stage_out: window → host-backed outputs ----------
-            # recv_x_out: per-row 1×D tile copy; mirrors dispatch.cpp's per-row
+            # recv_x_out: per-row 1xD tile copy; mirrors dispatch.cpp's per-row
             # TLOAD/TSTORE loop.
             for e in pl.range(L):
                 for slot in pl.range(R):
