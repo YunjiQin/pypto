@@ -796,14 +796,20 @@ FunctionPtr TransformSimplify(const FunctionPtr& func,
   SimplifyMutator mutator(analyzer.get(), std::move(collector.multi_assigned));
   auto new_body = mutator.VisitStmt(func->body_);
 
-  // Final step: conservative scalar DCE prunes scalar bindings whose only
-  // uses were folded out by the mutator above. Call-backed assignments are
-  // preserved because the IR has no purity annotations yet — a Call may
-  // have observable side effects we cannot reason about. ``protected_vars``
-  // additionally shields scalars whose only consumer lives outside this
-  // function (e.g. the ``core_num`` attr of a dispatched Spmd function).
+  // Final step: drop dead IfStmt phi return_vars + matching yield slots,
+  // then run conservative scalar DCE that prunes scalar bindings whose only
+  // uses were folded out by the mutator above (or orphaned by the phi-prune
+  // step). Call-backed assignments are preserved because the IR has no
+  // purity annotations yet — a Call may have observable side effects we
+  // cannot reason about. ``protected_vars`` additionally shields scalars
+  // whose only consumer lives outside this function (e.g. the ``core_num``
+  // attr of a dispatched Spmd function). Phi-prune runs first so the now-
+  // orphan branch-body scalar assigns become visible to the scalar DCE
+  // in the same Simplify invocation (fixes #1603 — outlining was
+  // capturing dead phi as a spurious Scalar[INDEX] return).
   auto flat = transform_utils::FlattenToStmts(new_body);
-  auto pruned = dce::EliminateDeadScalarAssignments(flat, protected_vars);
+  auto phi_pruned = dce::EliminateDeadIfReturnVars(flat);
+  auto pruned = dce::EliminateDeadScalarAssignments(phi_pruned, protected_vars);
   bool dce_changed = pruned.size() != flat.size() ||
                      !std::equal(pruned.begin(), pruned.end(), flat.begin(),
                                  [](const StmtPtr& a, const StmtPtr& b) { return a.get() == b.get(); });

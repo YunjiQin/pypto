@@ -71,6 +71,26 @@ std::vector<StmtPtr> EliminateDeadScalarAssignments(const std::vector<StmtPtr>& 
 std::vector<StmtPtr> EliminateDeadScalarAssignments(const std::vector<StmtPtr>& stmts,
                                                     const std::unordered_set<const Var*>& protected_vars);
 
+/// Drop `IfStmt::return_vars_` entries whose Var has no use anywhere in the
+/// surrounding statement list, and the matching slot from each branch's
+/// trailing `YieldStmt`. Recurses into nested control-flow and scope bodies,
+/// iterating to a fixed point so cascading deaths (outer phi drop → inner
+/// phi becomes dead) are fully collapsed.
+///
+/// The helper is type-agnostic: Scalar, Tile, and Tensor return_vars are all
+/// candidates when no direct Var* use exists. Side effects in the branch
+/// bodies are preserved by `EliminateDeadScalarAssignments` (Call/Submit
+/// RHS conservatively kept) when this helper is composed with it; only the
+/// yield slot and the `return_vars_[i]` entry are removed.
+///
+/// Liveness is purely identity-based: a `return_vars_[i]` is dead iff
+/// `var.get()` is not collected by `VarDefUseCollector` over the entire
+/// statement list. That collector already handles ScopeStmt attrs
+/// (`manual_dep_edges` / `task_id_var` / `arg_direction_overrides_vars`),
+/// `Submit::deps_`, and every `YieldStmt::value_` slot — so all known
+/// channels through which a Var can be referenced are covered.
+std::vector<StmtPtr> EliminateDeadIfReturnVars(const std::vector<StmtPtr>& stmts);
+
 }  // namespace dce
 }  // namespace ir
 }  // namespace pypto

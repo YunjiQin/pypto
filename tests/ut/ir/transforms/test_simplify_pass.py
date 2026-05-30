@@ -1534,5 +1534,126 @@ class TestManualScopeSubmit:
         ir.assert_structural_equal(after, Before)
 
 
+# ============================================================================
+# Dead IfStmt phi return_vars — issue #1603
+# After ConvertToSSA, an if/else rebinding the same name in both arms produces
+# IfStmt::return_vars_ (a phi). When that phi has no downstream consumer the
+# outlining pass captures it as a spurious return on the outlined function and
+# orchestration codegen miscompiles. Simplify must DCE the dead phi.
+# ============================================================================
+
+
+class TestDeadIfReturnVarsDCE:
+    def test_drops_dead_scalar_phi_from_unused_if_else_rebind(self):
+        """Issue #1603 minimal repro: a Scalar[INDEX] rebound in both arms of
+        an if/else with no downstream use. After convert_to_ssa() + simplify()
+        the IfStmt carries no phi return_vars, and the dead branch-body
+        scalar assigns are gone — but the side-effecting in-branch writes
+        (which actually use the per-branch SSA names) survive.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, cond: pl.Scalar[pl.BOOL], out: pl.Tensor[[1], pl.INDEX]):
+                if cond:
+                    t1: pl.Scalar[pl.INDEX] = 1
+                    pl.tensor.write(out, [0], t1)
+                else:
+                    t1: pl.Scalar[pl.INDEX] = 2
+                    pl.tensor.write(out, [0], t1)
+
+        @pl.program
+        class Expected:
+            @pl.function(strict_ssa=True)
+            def main(self, cond: pl.Scalar[pl.BOOL], out: pl.Tensor[[1], pl.INDEX]):
+                if cond:
+                    t1_0: pl.Scalar[pl.INDEX] = 1
+                    pl.tensor.write(out, [0], t1_0)
+                else:
+                    t1_1: pl.Scalar[pl.INDEX] = 2
+                    pl.tensor.write(out, [0], t1_1)
+
+        ssa_form = passes.convert_to_ssa()(Before)
+        after = passes.simplify()(ssa_form)
+        ir.assert_structural_equal(after, Expected)
+
+    def test_keeps_scalar_phi_with_downstream_use(self):
+        """Same if/else rebinding shape, but with a downstream consumer of t1
+        after the if/else. The phi must survive because the consumer reads it.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, cond: pl.Scalar[pl.BOOL], out: pl.Tensor[[1], pl.INDEX]):
+                if cond:
+                    t1: pl.Scalar[pl.INDEX] = 1
+                else:
+                    t1: pl.Scalar[pl.INDEX] = 2
+                pl.tensor.write(out, [0], t1)
+
+        ssa_form = passes.convert_to_ssa()(Before)
+        after = passes.simplify()(ssa_form)
+        func_after = next(iter(after.functions.values()))
+        if_stmts = [s for s in ir.flatten_to_stmts(func_after.body) if isinstance(s, ir.IfStmt)]
+        assert len(if_stmts) == 1
+        assert len(if_stmts[0].return_vars) == 1, (
+            "phi return_var must survive when t1 has a downstream user; "
+            f"got return_vars={if_stmts[0].return_vars}"
+        )
+
+    def test_drops_dead_tensor_phi_keeping_side_effect_ops(self):
+        """Tensor-typed dead phi: both branches do a tensor.write (side-effect
+        op preserved by DCE) and rebind t. With no downstream use of t, the
+        phi return_var is dropped, but the in-branch writes survive.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                cond: pl.Scalar[pl.BOOL],
+                a: pl.Scalar[pl.INDEX],
+                b: pl.Scalar[pl.INDEX],
+                out: pl.Tensor[[1], pl.INDEX],
+            ):
+                if cond:
+                    t: pl.Tensor[[1], pl.INDEX] = pl.tensor.create([1], dtype=pl.INDEX)
+                    pl.tensor.write(out, [0], a)
+                    pl.tensor.write(t, [0], a)
+                else:
+                    t: pl.Tensor[[1], pl.INDEX] = pl.tensor.create([1], dtype=pl.INDEX)
+                    pl.tensor.write(out, [0], b)
+                    pl.tensor.write(t, [0], b)
+
+        ssa_form = passes.convert_to_ssa()(Before)
+        after = passes.simplify()(ssa_form)
+        func_after = next(iter(after.functions.values()))
+        if_stmts = [s for s in ir.flatten_to_stmts(func_after.body) if isinstance(s, ir.IfStmt)]
+        assert len(if_stmts) == 1
+        assert len(if_stmts[0].return_vars) == 0, (
+            "Tensor phi return_var must be dropped when t has no downstream user; "
+            f"got return_vars={if_stmts[0].return_vars}"
+        )
+        # Side-effecting tensor.write to `out` must be preserved in both arms.
+        then_stmts = ir.flatten_to_stmts(if_stmts[0].then_body)
+        else_body = if_stmts[0].else_body
+        assert else_body is not None
+        else_stmts = ir.flatten_to_stmts(else_body)
+
+        def has_tensor_write(stmts):
+            for s in stmts:
+                expr = getattr(s, "expr", None) or getattr(s, "value", None)
+                op = getattr(expr, "op", None) if expr is not None else None
+                if op is not None and getattr(op, "name", "") == "tensor.write":
+                    return True
+            return False
+
+        assert has_tensor_write(then_stmts), "tensor.write side-effect in then branch must survive phi-prune"
+        assert has_tensor_write(else_stmts), "tensor.write side-effect in else branch must survive phi-prune"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
