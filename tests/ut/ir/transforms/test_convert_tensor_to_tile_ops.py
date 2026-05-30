@@ -2371,10 +2371,11 @@ class TestConvertGatherOp:
                 out: pl.Tensor[[4, 3], pl.FP32] = self.main_incore_0(inp, idx)
                 return out
 
-        # tensor.gather is fully lowered into a per-row loop: each iteration loads a
-        # [1, 16] input row and a [1, 3] index row, runs the index-form tile.gather
-        # (which needs a [1, 3] INT32 scratch tile), and assembles the row into the
-        # accumulator. Phase 3 adds the Out tensor param for the result.
+        # tensor.gather is fully lowered into a per-row loop: input/index are
+        # bridged into Vec via tile.load, then each iteration slices a [1, 16]
+        # input row and a [1, 3] index row, runs the index-form tile.gather
+        # (which needs a [1, 3] INT32 scratch tile), and assembles the row into
+        # the accumulator. Phase 3 adds the Out tensor param for the result.
         @pl.program
         class Expected:
             @pl.function(type=pl.FunctionType.InCore)
@@ -2384,14 +2385,12 @@ class TestConvertGatherOp:
                 idx: pl.Tensor[[4, 3], pl.INT32],
                 ret0__out: pl.Out[pl.Tensor[[4, 3], pl.FP32]],
             ) -> pl.Tensor[[4, 3], pl.FP32]:
+                inp_vec = pl.load(inp, [0, 0], [4, 16], [4, 16], target_memory=pl.Mem.Vec, transpose=False)
+                idx_vec = pl.load(idx, [0, 0], [4, 3], [4, 3], target_memory=pl.Mem.Vec, transpose=False)
                 gather_acc_init = pl.tile.create([4, 3], dtype=pl.FP32, target_memory=pl.Mem.Vec)
                 for gather_lv, (gather_ia,) in pl.range(4, init_values=(gather_acc_init,)):
-                    gather_inp_row = pl.load(
-                        inp, [gather_lv, 0], [1, 16], [1, 16], target_memory=pl.Mem.Vec, transpose=False
-                    )
-                    gather_idx_row = pl.load(
-                        idx, [gather_lv, 0], [1, 3], [1, 3], target_memory=pl.Mem.Vec, transpose=False
-                    )
+                    gather_inp_row = pl.tile.slice(inp_vec, [1, 16], [gather_lv, 0], [1, 16])
+                    gather_idx_row = pl.tile.slice(idx_vec, [1, 3], [gather_lv, 0], [1, 3])
                     gather_row_tmp = pl.tile.create([1, 3], dtype=pl.INT32, target_memory=pl.Mem.Vec)
                     gather_row = pl.tile.gather(gather_inp_row, gather_idx_row, gather_row_tmp)
                     gather_asmbl = pl.tile.assemble(gather_ia, gather_row, [gather_lv, 0])
