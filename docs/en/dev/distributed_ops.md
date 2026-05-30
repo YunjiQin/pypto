@@ -11,17 +11,18 @@ in this family (strict kind-trait matching — `As<DistributedTensorType>` does
 not match a plain `TensorType`), so a non-window-bound tensor can never be fed
 into a cross-rank operation by accident.
 
-There are **five ops** and **three ABI enums**:
+There are **six ops** and **three ABI enums**:
 
 | Op | Direction | Result | Hardware |
 | -- | --------- | ------ | -------- |
 | `pld.tile.remote_load` | pull (read peer → local tile) | `TileType` | TLOAD |
+| `pld.tile.remote_store` | push (write local tile → peer) | `Unknown` (side effect) | TSTORE |
 | `pld.tensor.get` | pull (read peer → local GM) | `Unknown` (side effect) | TGET |
 | `pld.tensor.put` | push (write local → peer) | `Unknown` (side effect) | TPUT |
 | `pld.system.notify` | signal a peer's slot | `Unknown` (side effect) | TNOTIFY |
 | `pld.system.wait` | block on own slot | `Unknown` (side effect) | TWAIT |
 
-The four side-effect-only ops produce [`UnknownType`](ir/02-types.md): they
+The five side-effect-only ops produce [`UnknownType`](ir/02-types.md): they
 exist for their cross-rank effect, not for an SSA value a consumer reads.
 
 ## Namespacing: why `tile.*` vs `tensor.*` vs `system.*`
@@ -30,6 +31,9 @@ The namespace encodes the IR level the op lives at, not an arbitrary grouping:
 
 - **`pld.tile.remote_load`** produces a *tile* (on-core SRAM region), so it is a
   sibling of `tile.load` and lives in `pld.tile`.
+- **`pld.tile.remote_store`** consumes a *tile* (the symmetric write companion
+  of `remote_load`), so it is a sibling of `tile.store` and lives in
+  `pld.tile`.
 - **`pld.tensor.get`** reads and writes *tensor* (GM) operands — both `dst` and
   `src` are window-bound `DistributedTensor` views and the VEC staging tile
   that TGET bounces through is synthesised at codegen, never on the DSL
@@ -92,6 +96,35 @@ rank equals `target.shape.size()`.
 DSL (`python/pypto/language/distributed/op/tile_ops.py`) exposes `peer` /
 `offsets` / `shape` as keyword-only for readability; the IR op keeps them
 positional, matching `tile.load`.
+
+### `pld.tile.remote_store` (TSTORE)
+
+```text
+pld.tile.remote_store(src_tile, target, peer, offsets) -> Unknown
+```
+
+Writes a local tile into a region of the `peer` rank's slice of a window-bound
+`DistributedTensor`. Mirrors `tile.store` at the IR level (positional `offsets`
+tuple + side-effect-only return) but the destination is a *remote* slice —
+address translation happens at codegen via `CommRemoteOffset(ctx, peer) +
+addptr + make_tensor_view`.
+
+Verifier: `src_tile` must be `TileType`; `target` must be
+`DistributedTensorType`; `peer` must be a `ScalarType` rank index; `offsets`
+must be a `MakeTuple` whose rank equals `target.shape.size()`; `src_tile.dtype`
+must match `target.dtype`.
+
+Codegen: the tile is 2-D (height × width) after the standard tile pipeline; the
+emitted `pto.partition_view` has the same rank as `target`, with the leading
+`(target.rank - 2)` dims set to size 1 (matching `notify`'s `one_dims(rank,
+"1")` pattern). This lets a 2-D tile push land on the inner two dims of any
+N-D peer slice (N ≥ 2) without forcing the caller to reshape — and it is the
+regression guard against the older codegen that emitted a fixed-2D
+`partition_view` regardless of target rank.
+
+DSL (`python/pypto/language/distributed/op/tile_ops.py`) exposes `target` /
+`peer` / `offsets` as keyword-only for readability; the IR op keeps them
+positional, matching `tile.store`.
 
 ### `pld.tensor.put` (TPUT)
 
@@ -183,8 +216,9 @@ binds physical buffers to.
 ## Testing
 
 - **IR / parser**: `tests/ut/ir/parser/test_remote_load.py`,
-  `test_system_ops.py`, `test_get_op.py`, `test_put_op.py`, plus the negative
-  verifier coverage in `tests/ut/ir/test_distributed_ops.py`.
+  `tests/ut/ir/parser/test_remote_store.py`, `test_system_ops.py`,
+  `test_get_op.py`, `test_put_op.py`, plus the negative verifier coverage
+  in `tests/ut/ir/test_distributed_ops.py`.
 - **Codegen**: `tests/ut/codegen/distributed/test_distributed_pto_codegen.py`.
 - **End-to-end (ST)**: `tests/st/distributed/test_l3_remote_load.py`,
   `test_l3_notify_wait.py`, `test_l3_get.py`, `test_l3_put.py`. These are

@@ -168,6 +168,72 @@ def test_remote_load_emits_func_call_to_offset_helper_with_addptr_at_call_site()
     assert "pto.load_scalar" not in kernel, "CommContext scalar reads belong in the helper"
 
 
+def test_remote_store_emits_tstore_with_partition_view_pattern():
+    """remote_store lowers to func.call @CommRemoteOffset_<dtype> + addptr +
+    make_tensor_view + partition_view + pto.tstore at the call site."""
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            data: pld.DistributedTensor[[16, 64], pl.FP16],
+            peer: pl.Scalar[pl.INT32],
+        ):
+            tile = pld.tile.remote_load(data, peer=peer, offsets=[0, 0], shape=[16, 32])
+            pld.tile.remote_store(tile, target=data, peer=peer, offsets=[0, 0])
+
+    mlir = _generate_mlir(P)
+    funcs = _split_module(mlir)
+    kernel = funcs["kernel"]
+
+    # The 2-D tile partition view type for the store side carries the tile's
+    # height×width (16×32) and the target's dtype.
+    assert "!pto.partition_tensor_view<16x32xf16>" in kernel, kernel
+    # tstore uses the peer-addressed partition_view, naming the peer view per
+    # the EmitPartitionViewPTO contract.
+    assert "pto.tstore" in kernel, kernel
+    assert "_peer_pview" in kernel, kernel
+    # Address translation lives at the call site (same constraints as remote_load).
+    assert "func.call @CommRemoteOffset_f16" in kernel, kernel
+    assert "pto.addptr" in kernel, kernel
+    assert "pto.make_tensor_view" in kernel, kernel
+
+
+def test_remote_store_pads_partition_view_with_ones_for_3d_target():
+    """For an N-D (N > 2) target, the partition_view rank matches the target
+    rank — leading dims are size-1 (matching notify's one_dims(rank, "1")
+    pattern) so the 2-D tile lands on the inner two dims of the peer slice
+    without forcing the caller to reshape.
+
+    This is the regression guard for the previous hidden bug where a 3-D
+    DistributedTensor target passed the verifier (target_rank > 0) but the
+    codegen emitted a rank-mismatched ``pto.partition_view`` that PTOAS
+    would reject.
+    """
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            inp: pl.Tensor[[16, 32], pl.FP16],
+            data: pld.DistributedTensor[[4, 16, 64], pl.FP16],
+            peer: pl.Scalar[pl.INT32],
+        ):
+            tile = pl.load(inp, [0, 0], [16, 32])
+            pld.tile.remote_store(tile, target=data, peer=peer, offsets=[0, 0, 0])
+
+    mlir = _generate_mlir(P)
+    funcs = _split_module(mlir)
+    kernel = funcs["kernel"]
+
+    # The partition view on the store side must be 3-D, with a leading 1 in
+    # the outermost dim and the tile's two inner dims appended.
+    assert "!pto.partition_tensor_view<1x16x32xf16>" in kernel, kernel
+    assert "pto.tstore" in kernel, kernel
+
+
 def test_one_comm_remote_offset_helper_per_dtype():
     """The module emits a distinct @CommRemoteOffset_<dtype> helper per element dtype."""
 

@@ -21,11 +21,7 @@
  *
  * IR signature::
  *
- *     pld.tile.remote_store(src_tile, target, peer, offsets[, shapes]) -> Unknown
- *
- * The optional 5th ``shapes`` argument mirrors ``tile.store``'s optional 4th
- * shapes tuple — when present it carries the N-D partition shape so codegen
- * can emit a rank-matched ``partition_view`` for ``target_rank > 2``.
+ *     pld.tile.remote_store(src_tile, target, peer, offsets) -> Unknown
  *
  * The DSL surface (``pld.tile.remote_store`` in
  * ``python/pypto/language/distributed/op/tile_ops.py``) exposes ``target`` /
@@ -43,8 +39,6 @@
  * * ``peer`` must be a :class:`ScalarType` expression (integer rank index).
  * * ``offsets`` must be a :class:`MakeTuple`, with rank equal to
  *   ``target.shape.size()``.
- * * ``shapes`` (optional) must be a :class:`MakeTuple` whose rank matches
- *   ``offsets`` when provided.
  * * ``src_tile`` dtype must match ``target`` dtype.
  */
 
@@ -66,9 +60,9 @@ namespace {
 
 TypePtr DeduceRemoteStoreType(const std::vector<ExprPtr>& args,
                               const std::vector<std::pair<std::string, std::any>>& /*kwargs*/) {
-  CHECK(args.size() == 4 || args.size() == 5) << "pld.tile.remote_store requires 4 or 5 positional arguments "
-                                                 "(src_tile, target, peer, offsets[, shapes]), but got "
-                                              << args.size();
+  CHECK(args.size() == 4) << "pld.tile.remote_store requires 4 positional arguments "
+                             "(src_tile, target, peer, offsets), but got "
+                          << args.size();
   for (size_t i = 0; i < args.size(); ++i) {
     CHECK(args[i]) << "pld.tile.remote_store positional argument #" << i << " must not be null";
   }
@@ -101,18 +95,6 @@ TypePtr DeduceRemoteStoreType(const std::vector<ExprPtr>& args,
       << ") must match target tensor rank (" << target_rank << ")";
   CHECK(target_rank > 0) << "pld.tile.remote_store requires at least one dimension on target";
 
-  // Optional 5th argument: shapes tuple (mirrors tile.store's optional shapes
-  // tuple for N-D partition codegen).
-  if (args.size() == 5) {
-    auto shapes_tuple = As<MakeTuple>(args[4]);
-    CHECK(shapes_tuple) << "pld.tile.remote_store optional 5th argument must be a shapes tuple "
-                           "(MakeTuple of scalars), got "
-                        << args[4]->TypeName();
-    CHECK(shapes_tuple->elements_.size() == offsets_tuple->elements_.size())
-        << "pld.tile.remote_store shapes rank (" << shapes_tuple->elements_.size()
-        << ") must match offsets rank (" << offsets_tuple->elements_.size() << ")";
-  }
-
   // TPUT contract: src_tile dtype must match target dtype.
   CHECK(tile_type->dtype_ == dist_type->dtype_)
       << "pld.tile.remote_store src_tile dtype (" << tile_type->dtype_.ToString()
@@ -139,9 +121,6 @@ REGISTER_OP("pld.tile.remote_store")
     .add_argument("target", "Window-bound DistributedTensor destination (DistributedTensorType)")
     .add_argument("peer", "Peer rank index (ScalarType, integer)")
     .add_argument("offsets", "Offsets in target tensor coordinates (MakeTuple of scalars)")
-    .add_argument("shapes",
-                  "Optional N-D partition shapes (MakeTuple, same rank as offsets); "
-                  "absent for the default 2D codegen path")
     .no_memory_spec()
     .f_deduce_type(DeduceRemoteStoreType);
 
