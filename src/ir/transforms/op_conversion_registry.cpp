@@ -1085,8 +1085,11 @@ void OpConversionRegistry::RegisterGatherOps() {
                        << e->GetType()->TypeName();
           return {};
         };
-        auto [input_shape, input_dtype] = get_shape_dtype(input, "input");
-        auto [index_shape, _idx_dtype] = get_shape_dtype(index, "index");
+        auto input_info = get_shape_dtype(input, "input");
+        auto index_info = get_shape_dtype(index, "index");
+        const auto& input_shape = input_info.first;
+        const DataType input_dtype = input_info.second;
+        const auto& index_shape = index_info.first;
         const int64_t rank = static_cast<int64_t>(input_shape.size());
         CHECK(rank >= 2) << "tensor.gather conversion: rank must be >= 2, got " << rank;
 
