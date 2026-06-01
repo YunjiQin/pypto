@@ -23,6 +23,8 @@ Index form (torch-style semantics, validated against ``torch.gather``):
 3. Rank-3 + dim=-1 (collapses leading dims via ``tile.reshape``).
 4. Rank-3 + dim=1 (middle axis — flat-index gather).
 5. Rank-3 + dim=-3 (negative-dim normalization on the first axis).
+6. Rank-2 + dim=-1 on a local ``TileType`` input — regression for #1622: the
+   per-row ``tile.slice`` must be view-only so the source tile is not mutated.
 
 Mask form (hardware mask-pattern column selection):
 
@@ -215,6 +217,39 @@ class GatherRank3NegFirstDimProgram:
             out = pl.tensor.gather(inp, dim=-3, index=idx)
             output = pl.assemble(output, out, [0, 0, 0])
         return output
+
+
+@pl.program
+class GatherTileInputSourceUnchangedProgram:
+    """Regression for #1622: ``pl.tensor.gather`` on a local ``TileType`` input
+    must not mutate the source tile.
+
+    Builds a local tensor from ``src`` via ``pl.create_tensor`` + ``pl.assemble``
+    (so the upstream conversion lowers it to a ``TileType`` before
+    ``ConvertTensorToTileOps`` sees the gather), runs ``pl.tensor.gather`` on
+    it, then echoes the local tensor back out as ``src_echo``. With the pre-fix
+    lowering, the per-row ``tile.slice`` was emitted with an explicit
+    ``valid_shape`` equal to the slice shape, which triggered a materializing
+    ``pto.tmov`` whose destination aliased the source allocation — corrupting
+    row 0 of the source to the last-materialized row. The fixed (view-only)
+    lowering leaves ``src_echo`` bit-identical to ``src``.
+    """
+
+    @pl.function(type=pl.FunctionType.Opaque)
+    def main(
+        self,
+        src: pl.Tensor[[16, 64], pl.FP32],
+        idx: pl.Tensor[[16, 8], pl.INT32],
+        src_echo: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+        gathered: pl.Out[pl.Tensor[[16, 8], pl.FP32]],
+    ) -> tuple[pl.Tensor[[16, 64], pl.FP32], pl.Tensor[[16, 8], pl.FP32]]:
+        with pl.at(level=pl.Level.CORE_GROUP):
+            local = pl.create_tensor([16, 64], dtype=pl.FP32)
+            local = pl.assemble(local, src, [0, 0])
+            g = pl.tensor.gather(local, dim=-1, index=idx)
+            gathered = pl.assemble(gathered, g, [0, 0])
+            src_echo = pl.assemble(src_echo, local, [0, 0])
+        return src_echo, gathered
 
 
 @pl.program
@@ -502,6 +537,36 @@ class GatherRank3NegFirstDimTestCase(_GatherBaseTestCase):
         tensors["output"][:] = torch.gather(inp, dim=0, index=idx)
 
 
+class GatherTileInputSourceUnchangedTestCase(_GatherBaseTestCase):
+    def get_name(self) -> str:
+        return "gather_tile_input_source_unchanged"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("src", [16, 64], DataType.FP32, init_value=torch.randn),
+            TensorSpec(
+                "idx",
+                [16, 8],
+                DataType.INT32,
+                init_value=lambda: _rand_indices(0, 64, (16, 8)),
+            ),
+            TensorSpec("src_echo", [16, 64], DataType.FP32, is_output=True),
+            TensorSpec("gathered", [16, 8], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        return GatherTileInputSourceUnchangedProgram
+
+    def compute_expected(self, tensors, params=None):
+        src = tensors["src"]
+        idx = tensors["idx"].to(torch.int64)
+        tensors["gathered"][:] = torch.gather(src, dim=-1, index=idx)
+        # src_echo must remain bit-identical to src: gather is read-only on
+        # its source. Pre-fix, the local tile's row 0 was overwritten by the
+        # last-materialized row, so this assertion would fail.
+        tensors["src_echo"][:] = src
+
+
 class GatherMaskP0101TestCase(_GatherBaseTestCase):
     def get_name(self) -> str:
         return "gather_mask_p0101"
@@ -649,6 +714,22 @@ class TestGatherIndex:
     @pytest.mark.parametrize("platform", PLATFORMS)
     def test_gather_rank3_neg_first_dim(self, test_runner, platform):
         result = test_runner.run(GatherRank3NegFirstDimTestCase(platform=platform))
+        assert result.passed, f"Test failed: {result.error}"
+
+    @pytest.mark.parametrize("platform", PLATFORMS)
+    def test_gather_tile_input_source_unchanged(self, test_runner, platform):
+        """Regression for #1622: gather on a local TileType input must not
+        mutate the source tile.
+
+        Pre-fix, the per-row tile.slice in the TileType-input lowering used the
+        4-arg form (with an explicit valid_shape == shape), which routed
+        codegen through a materializing pto.tmov whose destination aliased the
+        source allocation. After the gather loop completed, the source tile's
+        row 0 held the last-materialized row's content instead of the
+        original. This test echoes the local source tile back out after the
+        gather and asserts it is bit-identical to the input.
+        """
+        result = test_runner.run(GatherTileInputSourceUnchangedTestCase(platform=platform))
         assert result.passed, f"Test failed: {result.error}"
 
 
