@@ -1079,11 +1079,13 @@ void OpConversionRegistry::RegisterGatherOps() {
         const auto& index = args[1];
 
         auto input_tile_type = As<TileType>(input->GetType());
-        CHECK(input_tile_type) << "tensor.gather conversion: input must be Vec tile after bridge, got "
-                               << input->GetType()->TypeName();
+        INTERNAL_CHECK_SPAN(input_tile_type, span)
+            << "tensor.gather conversion: input must be Vec tile after bridge, got "
+            << input->GetType()->TypeName();
         auto index_tile_type = As<TileType>(index->GetType());
-        CHECK(index_tile_type) << "tensor.gather conversion: index must be Vec tile after bridge, got "
-                               << index->GetType()->TypeName();
+        INTERNAL_CHECK_SPAN(index_tile_type, span)
+            << "tensor.gather conversion: index must be Vec tile after bridge, got "
+            << index->GetType()->TypeName();
 
         const auto& input_shape = input_tile_type->shape_;
         const auto& index_shape = index_tile_type->shape_;
