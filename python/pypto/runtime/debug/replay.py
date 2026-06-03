@@ -292,7 +292,16 @@ def _main(
     parser.add_argument("--device-id", type=int, default=0, help="Hardware device index")
     parser.add_argument("--pmu", type=int, default=0, metavar="LEVEL", help="PMU level")
     parser.add_argument("--swimlane", action="store_true", help="Enable L2 swimlane capture")
-    parser.add_argument("--dump-tensor", action="store_true", help="Enable per-task tensor dump")
+    parser.add_argument(
+        "--dump-tensor",
+        nargs="?",
+        type=int,
+        const=1,
+        default=0,
+        metavar="LEVEL",
+        help="Per-task tensor dump level: bare flag = 1 (partial, dump_tag-marked), "
+        "2 = full (every task), absent = 0 (off)",
+    )
     parser.add_argument("--dep-gen", action="store_true", help="Enable dep_gen profiling")
     parser.add_argument("--scope-stats", action="store_true", help="Enable scope_stats profiling")
     parser.add_argument(

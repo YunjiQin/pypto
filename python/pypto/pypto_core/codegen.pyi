@@ -57,6 +57,11 @@ class OrchestrationResult:
         """Kernel function name to core type mapping."""
         ...
 
+    @property
+    def func_name_to_signature(self) -> dict[str, list[str]]:
+        """Kernel name to tensor-arg ArgDirection name list (scalars excluded), in task-payload order."""
+        ...
+
 class DistributedCodegen:
     """Distributed codegen for Linqu hierarchy runtime C++ code."""
 

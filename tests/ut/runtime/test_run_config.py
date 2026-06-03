@@ -77,12 +77,30 @@ class TestRunConfigDfxFlags:
         assert cfg.enable_pmu == 4
         assert cfg.save_kernels is True
 
+    def test_dump_tensor_level_enables_dfx(self):
+        # enable_dump_tensor is a level: 0=off, 1=partial, 2=full. Any
+        # positive level enables DFX and forces save_kernels (artefact dir).
+        off = RunConfig(platform="a5", enable_dump_tensor=0)
+        assert off.any_dfx_enabled() is False
+        for level in (1, 2):
+            cfg = RunConfig(platform="a5", enable_dump_tensor=level)
+            assert cfg.enable_dump_tensor == level
+            assert cfg.any_dfx_enabled() is True
+            assert cfg.save_kernels is True
+
+    def test_dump_tensor_bool_maps_to_level(self):
+        # Back-compat: True is the partial level (1), False is off (0). bool is
+        # an int subtype so `> 0` truthiness and pass-through to CallConfig hold.
+        assert RunConfig(platform="a5", enable_dump_tensor=True).enable_dump_tensor == 1
+        assert RunConfig(platform="a5", enable_dump_tensor=False).enable_dump_tensor == 0
+        assert RunConfig(platform="a5", enable_dump_tensor=True).any_dfx_enabled() is True
+
     def test_dfx_flags_are_independent(self):
         # Enabling one flag must not implicitly enable another.
         cfg = RunConfig(platform="a5", enable_dep_gen=True)
         assert cfg.enable_dep_gen is True
         assert cfg.enable_l2_swimlane is False
-        assert cfg.enable_dump_tensor is False
+        assert cfg.enable_dump_tensor == 0
         assert cfg.enable_pmu == 0
         assert cfg.enable_scope_stats is False
 
@@ -94,7 +112,7 @@ class TestRunConfigDfxFlags:
         assert cfg.any_dfx_enabled() is True
         assert cfg.save_kernels is True
         assert cfg.enable_l2_swimlane is False
-        assert cfg.enable_dump_tensor is False
+        assert cfg.enable_dump_tensor == 0
         assert cfg.enable_pmu == 0
         assert cfg.enable_dep_gen is False
 
@@ -102,14 +120,14 @@ class TestRunConfigDfxFlags:
         cfg = RunConfig(
             platform="a5",
             enable_l2_swimlane=True,
-            enable_dump_tensor=True,
+            enable_dump_tensor=2,
             enable_pmu=2,
             enable_dep_gen=True,
             enable_scope_stats=True,
         )
         opts = _DfxOpts.from_run_config(cfg)
         assert opts.enable_l2_swimlane is True
-        assert opts.enable_dump_tensor is True
+        assert opts.enable_dump_tensor == 2
         assert opts.enable_pmu == 2
         assert opts.enable_dep_gen is True
         assert opts.enable_scope_stats is True

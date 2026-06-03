@@ -337,6 +337,14 @@ class IRPythonPrinter : public IRVisitor {
   // recovers ``deps=`` on ``pl.at(...)`` via _parse_at_meta.
   bool PrintScopeDepsAttr(const ScopeStmtPtr& op);
 
+  // Emit ``dumps=[t1, t2]`` if the scope carries ``kAttrDumpVars``; returns
+  // true when something was printed. Mirrors PrintScopeNoDepsAttr — the scope
+  // dump list is the carrier from ``pl.dump_tag`` / an explicit ``dumps=`` to
+  // the outliner (which translates it into the synthesised dispatch's
+  // ``kAttrDumpVars``), so it must survive a print/reparse roundtrip while the
+  // scope still exists.
+  bool PrintScopeDumpAttr(const ScopeStmtPtr& op);
+
   // Emit `` as <tid>`` if the scope carries ``kAttrTaskIdVar``. The caller is
   // responsible for placing the ``)`` before and the ``:\n`` after this call.
   bool PrintScopeTaskIdVarSuffix(const ScopeStmtPtr& op);
@@ -645,6 +653,21 @@ void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
       // This is a cross-function call - print as self.method_name()
       stream_ << "self." << gvar->name_ << "(";
 
+      // Selective dump (``kAttrDumpVars``) is surfaced below as a ``dumps=[...]``
+      // kwarg (symmetric with ``deps=`` and matching the Submit surface), NOT
+      // by wrapping args — there is no call-arg wrapper. Collect the marked
+      // Vars now; emit the kwarg after ``deps=`` so the round-trip recovers the
+      // same attr by VarPtr identity.
+      std::set<const Var*> dump_set;
+      for (const auto& [k, v] : op->attrs_) {
+        if (k != kAttrDumpVars) continue;
+        if (const auto* vars = std::any_cast<std::vector<VarPtr>>(&v)) {
+          for (const auto& var : *vars) {
+            if (var) dump_set.insert(var.get());
+          }
+        }
+      }
+
       for (size_t i = 0; i < op->args_.size(); ++i) {
         if (i > 0) stream_ << ", ";
         VisitExpr(op->args_[i]);
@@ -693,23 +716,44 @@ void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
         break;
       }
 
-      // When ``attrs_["arg_directions"]`` is populated (post DeriveCallDirections),
-      // surface the direction vector as a trailing ``attrs={"arg_directions": [...]}``
-      // keyword so the parser can recover it on the round-trip. When empty
-      // (legacy / pre-derive) keep the call bare for back-compatibility.
-      // A non-empty vector with a mismatched size is invalid IR — fail loudly
-      // instead of silently dropping the metadata.
+      // Machine-only ``attrs={...}`` dict for IR metadata that has no user-facing
+      // call kwarg: ``arg_directions`` (post DeriveCallDirections) and
+      // ``dump_vars`` (selective dump, seeded by ``pl.dump_tag`` / ``dumps=``).
+      // A plain ``self.kernel(...)`` deliberately exposes no ``dumps=`` kwarg —
+      // the dump targets live in IR only and round-trip via this dict, exactly
+      // like ``arg_directions``. The parser recovers both keys in
+      // ``_parse_kernel_call`` (see ``_extract_dump_vars_from_attrs``).
       auto call_arg_directions = op->GetArgDirections();
-      if (!call_arg_directions.empty()) {
-        INTERNAL_CHECK_SPAN(call_arg_directions.size() == op->args_.size(), op->span_)
-            << "Call arg_directions size (" << call_arg_directions.size() << ") must match args size ("
-            << op->args_.size() << ")";
-        stream_ << (need_kwarg_comma ? ", " : "") << "attrs={\"arg_directions\": [";
-        for (size_t i = 0; i < call_arg_directions.size(); ++i) {
-          if (i > 0) stream_ << ", ";
-          stream_ << prefix_ << ".adir." << ArgDirectionToDslName(call_arg_directions[i]);
+      const bool has_dirs = !call_arg_directions.empty();
+      const bool has_dump = !dump_set.empty();
+      if (has_dirs || has_dump) {
+        stream_ << (need_kwarg_comma ? ", " : "") << "attrs={";
+        bool first_key = true;
+        if (has_dump) {
+          stream_ << "\"dump_vars\": [";
+          bool first = true;
+          for (const auto& arg : op->args_) {
+            auto var = AsVarLike(arg);
+            if (!var || dump_set.count(var.get()) == 0) continue;
+            if (!first) stream_ << ", ";
+            first = false;
+            stream_ << GetVarName(var.get());
+          }
+          stream_ << "]";
+          first_key = false;
         }
-        stream_ << "]}";
+        if (has_dirs) {
+          INTERNAL_CHECK_SPAN(call_arg_directions.size() == op->args_.size(), op->span_)
+              << "Call arg_directions size (" << call_arg_directions.size() << ") must match args size ("
+              << op->args_.size() << ")";
+          stream_ << (first_key ? "" : ", ") << "\"arg_directions\": [";
+          for (size_t i = 0; i < call_arg_directions.size(); ++i) {
+            if (i > 0) stream_ << ", ";
+            stream_ << prefix_ << ".adir." << ArgDirectionToDslName(call_arg_directions[i]);
+          }
+          stream_ << "]";
+        }
+        stream_ << "}";
       }
 
       stream_ << ")";
@@ -917,6 +961,19 @@ void IRPythonPrinter::VisitExpr_(const SubmitPtr& op) {
     // the printer never crashes on a hand-built Submit.
     stream_ << op->op_->name_;
   }
+  // Selective dump (``kAttrDumpVars``) is surfaced below as a ``dumps=[...]``
+  // kwarg (symmetric with ``deps=``) on the submit surface. Collect the marked
+  // Vars now; emit the kwarg after ``deps=`` so the round-trip recovers the
+  // same attr (VarPtr identity).
+  std::set<const Var*> dump_set;
+  for (const auto& [k, v] : op->attrs_) {
+    if (k != kAttrDumpVars) continue;
+    if (const auto* vars = std::any_cast<std::vector<VarPtr>>(&v)) {
+      for (const auto& var : *vars) {
+        if (var) dump_set.insert(var.get());
+      }
+    }
+  }
   for (const auto& arg : op->args_) {
     stream_ << ", ";
     VisitExpr(arg);
@@ -928,6 +985,23 @@ void IRPythonPrinter::VisitExpr_(const SubmitPtr& op) {
       if (i > 0) stream_ << ", ";
       INTERNAL_CHECK_SPAN(op->deps_[i], op->span_) << "Submit dep at index " << i << " is null";
       VisitExpr(op->deps_[i]);
+    }
+    stream_ << "]";
+  }
+
+  // ``dumps=[...]`` — emitted in arg order so the round-trip recovers the same
+  // dump_vars vector (the parser builds it in arg order too). Only emitted when
+  // non-empty, mirroring ``deps=``. Strict parse validation guarantees every
+  // dump_var is a positional arg, so arg-order emission covers them all.
+  if (!dump_set.empty()) {
+    stream_ << ", dumps=[";
+    bool first = true;
+    for (const auto& arg : op->args_) {
+      auto var = AsVarLike(arg);
+      if (!var || dump_set.count(var.get()) == 0) continue;
+      if (!first) stream_ << ", ";
+      first = false;
+      VisitExpr(arg);
     }
     stream_ << "]";
   }
@@ -1403,6 +1477,10 @@ bool IRPythonPrinter::PrintScopeDepsAttr(const ScopeStmtPtr& op) {
   return PrintScopeVarListKwarg(op, kAttrManualDepEdges, "deps");
 }
 
+bool IRPythonPrinter::PrintScopeDumpAttr(const ScopeStmtPtr& op) {
+  return PrintScopeVarListKwarg(op, kAttrDumpVars, "dumps");
+}
+
 bool IRPythonPrinter::PrintScopeTaskIdVarSuffix(const ScopeStmtPtr& op) {
   for (const auto& [k, v] : op->attrs_) {
     if (k != kAttrTaskIdVar) continue;
@@ -1455,6 +1533,7 @@ void IRPythonPrinter::VisitStmt_(const HierarchyScopeStmtPtr& op) {
   }
   PrintScopeDepsAttr(op);
   PrintScopeNoDepsAttr(op);
+  PrintScopeDumpAttr(op);
   stream_ << ")";
   PrintScopeTaskIdVarSuffix(op);
   stream_ << ":\n";
@@ -1473,6 +1552,7 @@ void IRPythonPrinter::VisitStmt_(const InCoreScopeStmtPtr& op) {
   }
   PrintScopeDepsAttr(op);
   PrintScopeNoDepsAttr(op);
+  PrintScopeDumpAttr(op);
   stream_ << ")";
   PrintScopeTaskIdVarSuffix(op);
   stream_ << ":\n";
@@ -1494,6 +1574,7 @@ void IRPythonPrinter::VisitStmt_(const AutoInCoreScopeStmtPtr& op) {
   }
   PrintScopeDepsAttr(op);
   PrintScopeNoDepsAttr(op);
+  PrintScopeDumpAttr(op);
   stream_ << ")";
   PrintScopeTaskIdVarSuffix(op);
   stream_ << ":\n";
@@ -1815,9 +1896,9 @@ void IRPythonPrinter::VisitFunction(const FunctionPtr& func) {
     // ``auto_scope`` rides in attrs_ but prints as a dedicated kwarg (and is
     // filtered from the attrs={...} dict). Absent ⇒ default True ⇒ not printed.
     bool auto_scope_off = !func->GetAttr<bool>("auto_scope", true);
-    auto is_auto_scope_key = [](const std::string& k) { return k == "auto_scope"; };
+    auto is_filtered_attr_key = [](const std::string& k) { return k == "auto_scope"; };
     bool has_attrs = std::any_of(func->attrs_.begin(), func->attrs_.end(),
-                                 [&](const auto& kv) { return !is_auto_scope_key(kv.first); });
+                                 [&](const auto& kv) { return !is_filtered_attr_key(kv.first); });
     auto print_func_attr_value = [&](const std::string& key, const std::any& value) {
       if (key == "split") {
         int split_value = AnyCast<int>(value, "func attr key: " + key);
@@ -1867,7 +1948,7 @@ void IRPythonPrinter::VisitFunction(const FunctionPtr& func) {
         stream_ << "attrs={";
         bool first_attr = true;
         for (const auto& [key, value] : func->attrs_) {
-          if (is_auto_scope_key(key)) continue;
+          if (is_filtered_attr_key(key)) continue;
           if (!first_attr) stream_ << ", ";
           stream_ << std::quoted(key) << ": ";
           print_func_attr_value(key, value);

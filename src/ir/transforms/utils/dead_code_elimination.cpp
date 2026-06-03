@@ -178,7 +178,7 @@ void FindLiveRootsRecursiveImpl(const std::vector<StmtPtr>& stmts, const Removab
         if (v) live.insert(v.get());
       };
       for (const auto& [k, v] : scope_stmt->attrs_) {
-        if (k == kAttrManualDepEdges || k == kAttrArgDirOverrideVars) {
+        if (k == kAttrManualDepEdges || k == kAttrArgDirOverrideVars || k == kAttrDumpVars) {
           if (const auto* edges = std::any_cast<std::vector<VarPtr>>(&v)) {
             for (const auto& e : *edges) add_var(e);
           }

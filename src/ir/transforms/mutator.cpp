@@ -351,7 +351,7 @@ ExprPtr IRMutator::VisitExpr_(const CallPtr& op) {
   bool attrs_changed = false;
   new_attrs.reserve(op->attrs_.size());
   for (const auto& [k, v] : op->attrs_) {
-    if (k == kAttrManualDepEdges || k == kAttrArgDirOverrideVars) {
+    if (k == kAttrManualDepEdges || k == kAttrArgDirOverrideVars || k == kAttrDumpVars) {
       const auto* edges = std::any_cast<std::vector<VarPtr>>(&v);
       if (edges) {
         std::vector<VarPtr> new_edges;
@@ -448,14 +448,14 @@ ExprPtr IRMutator::VisitExpr_(const SubmitPtr& op) {
   auto new_type = RemapTypeViaVisitor(op->GetType());
   bool type_changed = (new_type.get() != op->GetType().get());
 
-  // Mutate Var-typed attrs (arg_direction_overrides_vars on Submit args).
-  // Note: kAttrManualDepEdges is intentionally NOT consulted on Submit — deps_
-  // is the source of truth (see .claude/rules/pass-submit-awareness.md).
+  // Mutate Var-typed attrs (arg_direction_overrides_vars / dump_vars on Submit
+  // args). Note: kAttrManualDepEdges is intentionally NOT consulted on Submit —
+  // deps_ is the source of truth (see .claude/rules/pass-submit-awareness.md).
   std::vector<std::pair<std::string, std::any>> new_attrs;
   bool attrs_changed = false;
   new_attrs.reserve(op->attrs_.size());
   for (const auto& [k, v] : op->attrs_) {
-    if (k == kAttrArgDirOverrideVars) {
+    if (k == kAttrArgDirOverrideVars || k == kAttrDumpVars) {
       const auto* edges = std::any_cast<std::vector<VarPtr>>(&v);
       if (edges) {
         std::vector<VarPtr> new_edges;
@@ -901,7 +901,7 @@ std::pair<std::vector<std::pair<std::string, std::any>>, bool> IRMutator::Mutate
   new_attrs.reserve(attrs.size());
   bool any_changed = false;
   for (const auto& [k, v] : attrs) {
-    if (k == kAttrManualDepEdges || k == kAttrArgDirOverrideVars) {
+    if (k == kAttrManualDepEdges || k == kAttrArgDirOverrideVars || k == kAttrDumpVars) {
       const auto* edges = std::any_cast<std::vector<VarPtr>>(&v);
       if (edges) {
         std::vector<VarPtr> new_edges;

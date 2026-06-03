@@ -766,6 +766,57 @@ inline std::vector<std::pair<std::string, std::any>> WithManualDepEdgesAttr(
 }
 
 /**
+ * @brief Reserved attr key on a ``Call`` for the per-call selective tensor
+ * dump set (simpler#844). Holds ``std::vector<VarPtr>`` — a subset of the
+ * call's ``args_`` (tensor Vars) whose ``Arg`` slots orchestration codegen
+ * marks via the runtime's per-task ``Arg::dump(...)`` API.
+ *
+ * Set by the DSL parser from the declarative ``pl.dump_tag(t)`` marker and the
+ * explicit ``dumps=[...]`` kwarg on ``pl.submit(...)`` / ``pl.at(...)``.
+ * Because the value is a Var list, it is tracked by Var identity
+ * through every pass: SSA rewrites the entries (``SubstCallAttrs``), inlining
+ * substitutes the callee Vars for the caller's, and DCE / liveness count them
+ * as uses — exactly like ``kAttrManualDepEdges`` / ``kAttrArgDirOverrideVars``.
+ * Codegen matches each ``args_[i]`` against this set by VarPtr identity, so no
+ * name comparison is ever needed.
+ *
+ * Empty / absent attr means the call dumps nothing. Codegen emits one
+ * ``Arg::dump(...)`` marker per call carrying a non-empty set; the runtime
+ * latches the dump level (off / partial / full) host-side, so no orch-body
+ * toggle is emitted.
+ *
+ * Also appears on a ``ScopeStmt`` as the post-outline carrier (simpler#844):
+ * for the ``@pl.jit`` / tensor-op style the kernel dispatch is synthesised by
+ * the outline passes rather than written as an explicit ``self.kernel(...)``.
+ * ``pl.dump_tag`` (forward-sticky) seeds the enclosing scope's ``kAttrDumpVars``
+ * at parse; ``InlineFunctions`` transfers an inline call's ``kAttrDumpVars``
+ * onto the scopes it splices in; the scope list round-trips as ``dumps=``
+ * on ``pl.at(...)`` and is rewritten by SSA/inline/DCE just like the no_dep
+ * scope attr ``kAttrArgDirOverrideVars``. The outliner then translates each
+ * captured scope dump Var into the synthesised dispatch's ``kAttrDumpVars`` by
+ * Var identity (mirroring the ``kAttrArgDirOverrideVars`` ->
+ * ``kAttrArgDirectionOverrides`` translation). Scope dump Vars not captured by
+ * that scope are skipped (a forward-sticky tag the scope simply never consumes).
+ */
+inline constexpr const char* kAttrDumpVars = "dump_vars";
+
+/**
+ * Build a copy of ``attrs`` with ``kAttrDumpVars`` set to ``vars``.
+ * Replaces an existing entry if present; otherwise appends.
+ */
+inline std::vector<std::pair<std::string, std::any>> WithDumpVarsAttr(
+    std::vector<std::pair<std::string, std::any>> attrs, std::vector<VarPtr> vars) {
+  for (auto& [k, v] : attrs) {
+    if (k == kAttrDumpVars) {
+      v = std::move(vars);
+      return attrs;
+    }
+  }
+  attrs.emplace_back(kAttrDumpVars, std::move(vars));
+  return attrs;
+}
+
+/**
  * @brief Reserved attr key for the physical device selector on a
  * host-orchestrator dispatch to a chip-level Orchestration function.
  *

@@ -235,6 +235,11 @@ jobs:
           pytest tests/st/runtime/framework_and_models/test_perf_swimlane.py \
             -v --device="$DEVICE_ID" --platform=a2a3 --enable-l2-swimlane --forked --pto-isa-commit=016396b57e2c17093f1194e6acd89bb112b0ab24
 
+      - name: Test dump-tensor output
+        run: |
+          pytest tests/st/runtime/framework_and_models/test_dump_tag.py \
+            -v --device="$DEVICE_ID" --platform=a2a3 --dump-tensor --pto-isa-commit=2c607938 --forked
+
   dist-system-tests:
     # No container: HCCL needs host-only env (HCCL_LOGIC_SUPERPOD_ID, plugin
     # paths from set_env.sh). In docker the chip child silent-crashes in

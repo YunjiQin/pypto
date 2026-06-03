@@ -94,5 +94,34 @@ def test_submit_with_deps_visible_in_mid_pipeline_dump():
     assert "deps=[" in text
 
 
+def test_submit_with_dumps_visible_in_mid_pipeline_dump():
+    """When ``dumps=[x]`` is attached, the mid-pipeline dump surfaces the
+    Submit's selective-dump targets as a ``dumps=[...]`` kwarg — there is no
+    ``pl.dump(...)`` arg-wrapper surface."""
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.InCore)
+        def producer(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+            return x
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def consumer(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+            return x
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+            with pl.manual_scope():
+                a, a_tid = pl.submit(self.producer, x)
+                b, _ = pl.submit(self.consumer, a, deps=[a_tid], dumps=[a])
+            return b
+
+    text = _ssa_then_print(Prog)
+    assert "pl.submit(self.consumer" in text
+    assert "dumps=[" in text, text
+    # The Call-only wrapper must NOT be how a submit surfaces its dumps.
+    assert "pl.dump(" not in text, text
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

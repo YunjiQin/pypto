@@ -836,14 +836,27 @@ class ScopeOutliner : public IRMutator {
     VarPtr scope_task_id_var = op->GetAttr<VarPtr>(kAttrTaskIdVar);
     std::vector<VarPtr> scope_dep_edges = op->GetAttr<std::vector<VarPtr>>(kAttrManualDepEdges);
     std::vector<VarPtr> scope_no_dep_vars = op->GetAttr<std::vector<VarPtr>>(kAttrArgDirOverrideVars);
+    // Scope-level selective-dump carrier (from ``pl.dump_tag`` at parse, an
+    // explicit / round-trip ``dumps=`` list, or the inline-call ``dump_vars``
+    // transfer). Each entry is an outer-scope tensor Var that should be dumped on
+    // this dispatch — translated below into the synthesised Call/Submit's
+    // ``kAttrDumpVars`` by Var identity, exactly as ``scope_no_dep_vars`` is
+    // translated into ``kAttrArgDirectionOverrides``.
+    std::vector<VarPtr> scope_dump_vars = op->GetAttr<std::vector<VarPtr>>(kAttrDumpVars);
 
-    std::vector<int32_t> arg_dir_override_indices;
-    if (!scope_no_dep_vars.empty()) {
-      std::unordered_map<const Var*, int32_t> input_var_to_idx;
+    // Map each captured input Var to its positional arg index. Shared by the
+    // no_dep override translation and the dump translation below; built once
+    // when either needs it.
+    std::unordered_map<const Var*, int32_t> input_var_to_idx;
+    if (!scope_no_dep_vars.empty() || !scope_dump_vars.empty()) {
       input_var_to_idx.reserve(input_vars.size());
       for (size_t i = 0; i < input_vars.size(); ++i) {
         input_var_to_idx[input_vars[i].get()] = static_cast<int32_t>(i);
       }
+    }
+
+    std::vector<int32_t> arg_dir_override_indices;
+    if (!scope_no_dep_vars.empty()) {
       arg_dir_override_indices.reserve(scope_no_dep_vars.size());
       for (const auto& v : scope_no_dep_vars) {
         INTERNAL_CHECK_SPAN(v, op->span_)
@@ -863,6 +876,31 @@ class ScopeOutliner : public IRMutator {
       // ``structural_equal``'s order-sensitive vector comparison report
       // semantic equality naturally and keep IR dumps deterministic.
       std::sort(arg_dir_override_indices.begin(), arg_dir_override_indices.end());
+    }
+
+    // Translate scope dump vars into the dispatch's selective-dump arg list.
+    // The dispatch's ``args_`` are exactly ``call_args`` (the captured input
+    // Vars), so the entry we record IS the Var object orchestration codegen
+    // matches ``args_[i]`` against by identity. A tagged tensor the scope does
+    // not capture is skipped (not an error) — it is simply a forward-sticky tag
+    // that this particular scope never consumes as a kernel arg. Dedup by
+    // identity; preserve arg order via ``input_var_to_idx`` ascending.
+    std::vector<VarPtr> dump_call_args;
+    if (!scope_dump_vars.empty()) {
+      std::vector<int32_t> dump_indices;
+      dump_indices.reserve(scope_dump_vars.size());
+      std::unordered_set<int32_t> seen_idx;
+      for (const auto& v : scope_dump_vars) {
+        if (!v) continue;
+        auto it = input_var_to_idx.find(v.get());
+        if (it == input_var_to_idx.end()) continue;  // tensor not captured here
+        if (seen_idx.insert(it->second).second) dump_indices.push_back(it->second);
+      }
+      std::sort(dump_indices.begin(), dump_indices.end());
+      dump_call_args.reserve(dump_indices.size());
+      for (int32_t idx : dump_indices) {
+        if (auto cav = AsVarLike(call_args[static_cast<size_t>(idx)])) dump_call_args.push_back(cav);
+      }
     }
 
     // Determine call return type. When ``task_id_var`` is set, append the
@@ -900,6 +938,12 @@ class ScopeOutliner : public IRMutator {
         submit_deps.push_back(v);
       }
       std::vector<std::pair<std::string, std::any>> submit_attrs;
+      // ``dump_vars`` first to mirror the parser's canonical Call attr order
+      // (_make_call_with_return_type writes dump_vars before arg_directions),
+      // so a print -> reparse of the synthesised dispatch round-trips.
+      if (!dump_call_args.empty()) {
+        submit_attrs.emplace_back(kAttrDumpVars, std::move(dump_call_args));
+      }
       if (!arg_dir_override_indices.empty()) {
         submit_attrs.emplace_back(kAttrArgDirectionOverrides, std::move(arg_dir_override_indices));
       }
@@ -909,6 +953,11 @@ class ScopeOutliner : public IRMutator {
           op->span_);
     } else {
       std::vector<std::pair<std::string, std::any>> call_attrs;
+      // ``dump_vars`` first — see the Submit branch above for the ordering
+      // rationale (matches _parse_kernel_call's reparse order).
+      if (!dump_call_args.empty()) {
+        call_attrs.emplace_back(kAttrDumpVars, std::move(dump_call_args));
+      }
       if (!scope_dep_edges.empty()) {
         call_attrs.emplace_back(kAttrManualDepEdges, std::move(scope_dep_edges));
       }

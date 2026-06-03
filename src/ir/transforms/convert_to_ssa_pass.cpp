@@ -326,6 +326,8 @@ class SSAConverter {
 
   /// Substitute Var references stored in Call attrs. Currently covers:
   ///   * ``kAttrManualDepEdges`` — ``std::vector<VarPtr>`` (dep edges)
+  ///   * ``kAttrDumpVars`` — ``std::vector<VarPtr>`` (selective dump
+  ///     targets from ``pl.dump_tag`` / ``dumps=``)
   ///   * ``kAttrDevice`` — ``ExprPtr`` (host-orch dispatch device selector,
   ///     typically a loop induction Var that SSA must version)
   ///
@@ -339,7 +341,7 @@ class SSAConverter {
     std::vector<std::pair<std::string, std::any>> out;
     out.reserve(attrs.size());
     for (const auto& [k, v] : attrs) {
-      if (k == kAttrManualDepEdges) {
+      if (k == kAttrManualDepEdges || k == kAttrDumpVars) {
         const auto* edges = std::any_cast<std::vector<VarPtr>>(&v);
         if (edges) {
           std::vector<VarPtr> new_edges;
@@ -964,17 +966,21 @@ class SSAConverter {
   }
 
   /// Substitute Var-typed entries in a ScopeStmt's ``attrs_``
-  /// (``manual_dep_edges`` / ``task_id_var`` / ``arg_direction_overrides_vars``).
-  /// Returns the rebuilt attrs and a flag indicating whether any entry was
-  /// rewritten — mirrors the per-Call ``SubstCallAttrs`` so SSA renaming
-  /// propagates into scope-level attrs the same way it does for Call attrs.
+  /// (``manual_dep_edges`` / ``task_id_var`` / ``arg_direction_overrides_vars`` /
+  /// ``dump_vars``). Returns the rebuilt attrs and a flag indicating whether any
+  /// entry was rewritten — mirrors the per-Call ``SubstCallAttrs`` so SSA
+  /// renaming propagates into scope-level attrs the same way it does for Call
+  /// attrs. ``dump_vars`` rides here as the carrier from ``pl.dump_tag`` /
+  /// ``dumps=`` to the outliner: substituting BEFORE the body (see
+  /// ``ConvertScope``) resolves each tagged tensor to the SSA version visible at
+  /// scope entry — exactly the value the synthesised dispatch receives as an arg.
   std::pair<std::vector<std::pair<std::string, std::any>>, bool> SubstScopeAttrs(
       const std::vector<std::pair<std::string, std::any>>& attrs) {
     bool changed = false;
     std::vector<std::pair<std::string, std::any>> out;
     out.reserve(attrs.size());
     for (const auto& [k, v] : attrs) {
-      if (k == kAttrManualDepEdges || k == kAttrArgDirOverrideVars) {
+      if (k == kAttrManualDepEdges || k == kAttrArgDirOverrideVars || k == kAttrDumpVars) {
         const auto* edges = std::any_cast<std::vector<VarPtr>>(&v);
         if (edges) {
           std::vector<VarPtr> new_edges;

@@ -410,7 +410,7 @@ def start_pipeline(  # noqa: PLR0913
     compile_workers: int,
     device_pool: "queue.Queue[int]",
     enable_l2_swimlane: bool = False,
-    enable_dump_tensor: bool = False,
+    enable_dump_tensor: int = 0,
     enable_pmu: int = 0,
     enable_dep_gen: bool = False,
     enable_scope_stats: bool = False,

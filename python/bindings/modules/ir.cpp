@@ -165,7 +165,8 @@ std::vector<std::pair<std::string, std::any>> ConvertKwargsDict(const nb::dict& 
       //   - kAttrArgDirections             -> vector<ArgDirection>
       //   - kAttrArgDirectionOverrides     -> vector<int32_t>
       //   - kAttrManualDepEdges /
-      //     kAttrArgDirOverrideVars        -> vector<VarPtr>
+      //     kAttrArgDirOverrideVars /
+      //     kAttrDumpVars                  -> vector<VarPtr>
       // Inferring from the first element would silently accept mismatched
       // payloads (e.g. ``manual_dep_edges=[1]``) and fail later in codegen
       // instead of raising at parse time.
@@ -184,7 +185,7 @@ std::vector<std::pair<std::string, std::any>> ConvertKwargsDict(const nb::dict& 
           idxs.push_back(static_cast<int32_t>(v));
         }
         kwargs.emplace_back(key, std::move(idxs));
-      } else if (key == kAttrManualDepEdges || key == kAttrArgDirOverrideVars) {
+      } else if (key == kAttrManualDepEdges || key == kAttrArgDirOverrideVars || key == kAttrDumpVars) {
         std::vector<VarPtr> vars;
         for (auto elem : seq) {
           if (!nb::isinstance<Var>(elem)) {
@@ -940,7 +941,8 @@ void BindIR(nb::module_& m) {
         }
         result[key.c_str()] = lst;
       } else if (value.type() == typeid(std::vector<VarPtr>)) {
-        // Used by attrs["manual_dep_edges"].
+        // Used by attrs["manual_dep_edges"], attrs["arg_direction_overrides_vars"],
+        // and attrs["dump_vars"].
         const auto& vars = AnyCast<std::vector<VarPtr>>(value, "converting to Python: " + key);
         nb::list lst;
         for (const auto& v : vars) {

@@ -979,6 +979,7 @@ class AtContext:
         optimizations: list[Optimization] | None = None,
         deps: list[Any] | None = None,
         no_dep_args: list[Any] | None = None,
+        dumps: list[Any] | None = None,
         # Deprecated kwargs (kept for back-compat; emit DeprecationWarning at parse time):
         optimization: _ChunkedLoopOptimizer | _ChunkedLoopOptimizerCall | None = None,
         split: SplitMode | None = None,
@@ -989,6 +990,7 @@ class AtContext:
         self.optimizations = optimizations
         self.deps = deps
         self.no_dep_args = no_dep_args
+        self.dumps = dumps
         self.optimization = optimization
         self.split = split
         self.name_hint = name_hint
@@ -1013,6 +1015,7 @@ def at(
     optimizations: list[Optimization] | None = None,
     deps: list[Any] | None = None,
     no_dep_args: list[Any] | None = None,
+    dumps: list[Any] | None = None,
     # Deprecated kwargs (kept for back-compat; emit DeprecationWarning at parse time):
     optimization: _ChunkedLoopOptimizer | _ChunkedLoopOptimizerCall | None = None,
     split: SplitMode | None = None,
@@ -1061,6 +1064,13 @@ def at(
             disjoint regions of the tensor and therefore do not need
             OverlapMap dep tracking. Note: ``deps=`` takes TaskIds, while
             ``no_dep_args=`` takes tensors — they describe different things.
+        dumps: Optional list literal of outer-scope tensor names to mark for
+            selective tensor dump on the synthesised kernel dispatch. The
+            scope-level selective-dump surface, symmetric with ``deps=``: the
+            outliner translates the captured-tensor entries into the dispatch's
+            ``dump_vars`` by Var identity. Equivalent to declaring the same
+            tensors with ``pl.dump_tag(t)`` before the scope; use ``dumps=``
+            when you want the dump targets listed explicitly at the scope.
         optimization: **Deprecated.** Use ``optimizations=[pl.auto_chunk]`` (or
             ``optimizations=[pl.auto_chunk, pl.split(mode)]``) instead.
         split: **Deprecated.** Use ``optimizations=[pl.split(mode)]`` instead.
@@ -1101,6 +1111,7 @@ def at(
         optimizations=optimizations,
         deps=deps,
         no_dep_args=no_dep_args,
+        dumps=dumps,
         optimization=optimization,
         split=split,
         name_hint=name_hint,

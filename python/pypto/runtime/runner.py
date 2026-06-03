@@ -91,10 +91,21 @@ class RunConfig:
             swimlane file is intentionally skipped because the simulator
             does not yet ship the task metadata the converter needs.
             Mirrors runtime's ``--enable-l2-swimlane`` flag.
-        enable_dump_tensor: Dump per-task tensor I/O into
+        enable_dump_tensor: Per-task tensor dump **level** written into
             ``<work_dir>/dfx_outputs/tensor_dump/``. Inspect with
             ``python -m simpler_setup.tools.dump_viewer``. Mirrors
-            ``--dump-tensor``.
+            ``--dump-tensor``:
+
+            * ``0`` / ``False`` — off (no dump).
+            * ``1`` / ``True`` — **partial**: only the tensors marked via the
+              DSL marker ``pl.dump_tag(t)`` (or ``pl.submit(..., dumps=[...])``).
+            * ``2`` — **full**: every task's tensor inputs and outputs.
+
+            Full dump on a large workload can saturate the host-side dump
+            collector (~42 MB/s drain rate) and get the AICPU killed by a STARS
+            op-execute timeout — prefer partial (level ``1``) plus
+            ``pl.dump_tag(t)`` to limit dump to specific tensors
+            (simpler#844 selective tensor dump).
         enable_pmu: AICore PMU event type. ``0`` disables collection;
             ``>0`` enables and selects the event (``2`` = PIPE_UTILIZATION,
             ``4`` = MEMORY — see ``runtime/docs/dfx/pmu-profiling.md``).
@@ -152,7 +163,7 @@ class RunConfig:
     codegen_only: bool = False
     pto_isa_commit: str | None = None
     enable_l2_swimlane: bool = False
-    enable_dump_tensor: bool = False
+    enable_dump_tensor: int = 0  # 0=off, 1=partial (dump_tag-marked), 2=full
     enable_pmu: int = 0
     enable_dep_gen: bool = False
     enable_scope_stats: bool = False
@@ -198,7 +209,7 @@ class RunConfig:
         """
         return (
             self.enable_l2_swimlane
-            or self.enable_dump_tensor
+            or self.enable_dump_tensor > 0
             or self.enable_pmu > 0
             or self.enable_dep_gen
             or self.enable_scope_stats
@@ -352,7 +363,7 @@ class _DfxOpts:
     """
 
     enable_l2_swimlane: bool = False
-    enable_dump_tensor: bool = False
+    enable_dump_tensor: int = 0  # 0=off, 1=partial, 2=full
     enable_pmu: int = 0
     enable_dep_gen: bool = False
     enable_scope_stats: bool = False
@@ -360,7 +371,7 @@ class _DfxOpts:
     def any(self) -> bool:
         return (
             self.enable_l2_swimlane
-            or self.enable_dump_tensor
+            or self.enable_dump_tensor > 0
             or self.enable_pmu > 0
             or self.enable_dep_gen
             or self.enable_scope_stats
@@ -617,13 +628,13 @@ def _collect_dfx_artifacts(
             f"  # --engine choices: dot | sfdp | fdp | neato | circo | twopi"
         )
 
-    if dfx.enable_dump_tensor and (dfx_dir / "tensor_dump" / "tensor_dump.json").exists():
+    if dfx.enable_dump_tensor > 0 and (dfx_dir / "tensor_dump" / "tensor_dump.json").exists():
         # ``dump_viewer`` is interactive; leave the artefact in place and
         # point the user at the inspection command.
         print(
             f"tensor_dump written to {dfx_dir / 'tensor_dump'} — inspect with: "
             f"python -m simpler_setup.tools.dump_viewer "
-            f"{dfx_dir / 'tensor_dump' / 'tensor_dump.json'}"
+            f"{dfx_dir / 'tensor_dump'}"
         )
 
     if dfx.enable_pmu > 0 and (dfx_dir / "pmu.csv").exists():

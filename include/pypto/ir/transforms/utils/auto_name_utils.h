@@ -232,13 +232,7 @@ inline std::string StripLegacyBaseName(const std::string& name) {
   return current;
 }
 
-inline std::string GetCompatibleBaseName(const std::string& name) {
-  ParsedName parsed = Parse(name);
-  if (parsed.has_auto_suffix) {
-    return parsed.base_name;
-  }
-  return parsed.base_name;
-}
+inline std::string GetCompatibleBaseName(const std::string& name) { return Parse(name).base_name; }
 
 inline std::string GetLegacyCompatibleBaseName(const std::string& name) {
   ParsedName parsed = Parse(name);
