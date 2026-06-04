@@ -285,5 +285,69 @@ def test_subscript_write_plain_target_distributed_source_slice():
     assert not isinstance(t, ir.DistributedTensorType)
 
 
+# ---------------------------------------------------------------------------
+# PR #1528 narrow-write semantics compose with DistributedTensor (issue #1672).
+# A source with ``static_shape`` padded for ISA alignment is accepted when
+# its ``valid_shape`` matches the destination slot. The check (via
+# ``_get_source_valid_shape``) uses ``isinstance(source_type, ir.TensorType)``
+# which matches ``DistributedTensorType`` via inheritance, and the target
+# side reads ``base_type.shape`` (inherited) — so the path works both ways.
+# ---------------------------------------------------------------------------
+
+
+def test_narrow_plain_source_into_distributed_target():
+    """Narrow plain Tensor source (static [1,32] / valid [1,16]) lands in a
+    16-wide slice of a DistributedTensor target (mirrors PR #1528 pattern
+    with the destination promoted to a window-bound view)."""
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            out: pl.Out[pl.Tensor[[1, 64], pl.FP32]],
+            data: pl.InOut[pld.DistributedTensor[[1, 64], pl.FP32]],
+        ) -> pl.Tensor[[1, 64], pl.FP32]:
+            local_buf = pl.create_tensor([1, 32], dtype=pl.FP32)
+            narrowed = pl.tensor.slice(local_buf, [1, 32], [0, 0], valid_shape=[1, 16])
+            data[0:1, 0:16] = narrowed
+            tile = pl.load(data, [0, 0], [1, 64])
+            return pl.store(tile, [0, 0], out)
+
+    func = _get_func(P, "kernel")
+    assembles = _collect_calls(func.body, "tensor.assemble")
+    assert len(assembles) == 1
+    assert isinstance(assembles[0].type, ir.DistributedTensorType)
+
+
+def test_narrow_distributed_source_into_plain_target():
+    """A DistributedTensor sliced with ``valid_shape=[1, 16]`` is itself
+    a narrow source, and writing it into a 16-wide slice of a plain Tensor
+    target also lands cleanly — exercises ``_get_source_valid_shape`` on
+    the DistributedTensorType path."""
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            dist_data: pl.InOut[pld.DistributedTensor[[1, 64], pl.FP32]],
+            out: pl.Out[pl.Tensor[[1, 64], pl.FP32]],
+            plain: pl.InOut[pl.Tensor[[1, 64], pl.FP32]],
+        ) -> pl.Tensor[[1, 64], pl.FP32]:
+            narrow_dist = pl.tensor.slice(dist_data, [1, 32], [0, 0], valid_shape=[1, 16])
+            plain[0:1, 0:16] = narrow_dist
+            tile = pl.load(plain, [0, 0], [1, 64])
+            return pl.store(tile, [0, 0], out)
+
+    func = _get_func(P, "kernel")
+    assembles = _collect_calls(func.body, "tensor.assemble")
+    assert len(assembles) == 1
+    # Plain target wins: result is plain TensorType, not DistributedTensorType.
+    t = assembles[0].type
+    assert isinstance(t, ir.TensorType)
+    assert not isinstance(t, ir.DistributedTensorType)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
