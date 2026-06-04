@@ -1293,6 +1293,8 @@ void BindIR(nb::module_& m) {
       .value("Hierarchy", ScopeKind::Hierarchy, "Distributed hierarchy scope (uses level/role)")
       .value("Spmd", ScopeKind::Spmd, "SPMD dispatch scope (core_num/sync_start)")
       .value("Runtime", ScopeKind::Runtime, "Runtime orchestration scope (PTO2_SCOPE wrapper)")
+      .value("CommDomain", ScopeKind::CommDomain,
+             "Comm-domain scope (with orch.allocate_domain(...) wrapper for host_orch window buffers)")
       .export_values();
 
   // SplitMode enum

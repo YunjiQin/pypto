@@ -2182,6 +2182,10 @@ class ScopeKind(enum.Enum):
     Runtime = 5
     """Runtime orchestration scope (PTO2_SCOPE wrapper, manual on/off)."""
 
+    CommDomain = 6
+    """Comm-domain scope (with orch.allocate_domain(...) wrapper for host_orch
+    window buffers)."""
+
 class SplitMode(enum.Enum):
     """Split mode for cross-core data transfer."""
 

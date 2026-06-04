@@ -1112,6 +1112,7 @@ class SSAConverter {
       return result;
     }
     if (auto runtime_scope = As<RuntimeScopeStmt>(op)) return rewrite(runtime_scope);
+    if (auto comm_domain = As<CommDomainScopeStmt>(op)) return rewrite(comm_domain);
     INTERNAL_UNREACHABLE_SPAN(op->span_) << "Unknown ScopeStmt subclass: " << op->TypeName();
     return op;
   }

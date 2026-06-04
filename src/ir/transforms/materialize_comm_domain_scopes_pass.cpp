@@ -358,12 +358,12 @@ FunctionPtr ProcessHostOrch(const FunctionPtr& func, const std::map<std::string,
     allocs_with_windows[w.alloc->ptr_var.get()].push_back(&w);
   }
   for (const auto& rec : collector.allocs) {
-    INTERNAL_CHECK(!allocs_with_windows[rec->ptr_var.get()].empty())
+    INTERNAL_CHECK_SPAN(!allocs_with_windows[rec->ptr_var.get()].empty(), rec->span)
         << "MaterializeCommDomainScopes: pld.tensor.alloc_window_buffer '" << rec->name
-        << "' has no pld.tensor.window materialisation (dead allocation) at " << rec->span.to_string();
-    INTERNAL_CHECK(!rec->seen.empty())
+        << "' has no pld.tensor.window materialisation (dead allocation)";
+    INTERNAL_CHECK_SPAN(!rec->seen.empty(), rec->span)
         << "MaterializeCommDomainScopes: pld.tensor.alloc_window_buffer '" << rec->name
-        << "' is not consumed by any chip_orch dispatch at " << rec->span.to_string();
+        << "' is not consumed by any chip_orch dispatch";
   }
 
   // Phase 4: construct WindowBuffer for each alloc. Final descriptor merging

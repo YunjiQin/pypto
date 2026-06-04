@@ -1019,13 +1019,28 @@ std::vector<ir::StmtPtr> TopLevelStmts(const ir::StmtPtr& body) {
   return {body};
 }
 
+// MaterializeCommDomainScopes wraps the host_orch body in a chain of
+// ``CommDomainScopeStmt`` (one per inferred comm domain, outer = first
+// declared). Alloc-hoisting needs to scan the original top-level
+// statements, not the scope chain itself — so peel any leading
+// CommDomainScopeStmts before delegating to TopLevelStmts. The chain is
+// always linear (no SeqStmts between scopes by construction), so a simple
+// while loop suffices.
+ir::StmtPtr UnwrapLeadingCommDomainScopes(const ir::StmtPtr& body) {
+  ir::StmtPtr cur = body;
+  while (auto scope = std::dynamic_pointer_cast<const ir::CommDomainScopeStmt>(cur)) {
+    cur = scope->body_;
+  }
+  return cur;
+}
+
 }  // namespace
 
 void DistributedCodegen::CollectHostOrchHoistableAllocs(const ir::FunctionPtr& host_orch) {
   hoisted_allocs_.clear();
   if (!host_orch->body_) return;
 
-  for (const auto& stmt : TopLevelStmts(host_orch->body_)) {
+  for (const auto& stmt : TopLevelStmts(UnwrapLeadingCommDomainScopes(host_orch->body_))) {
     if (IsTensorCreateAssign(stmt)) {
       auto assign = std::dynamic_pointer_cast<const ir::AssignStmt>(stmt);
       hoisted_allocs_.insert(assign.get());
@@ -1048,7 +1063,7 @@ void DistributedCodegen::EmitAllocIntermediatesFunction(const ir::FunctionPtr& h
     // unchanged. The subsequent EmitFunction(host_orch) call resets visitor
     // state (declared_vars_, current_func_, ...), so no save/restore needed.
     current_func_ = host_orch;
-    for (const auto& stmt : TopLevelStmts(host_orch->body_)) {
+    for (const auto& stmt : TopLevelStmts(UnwrapLeadingCommDomainScopes(host_orch->body_))) {
       auto assign = std::dynamic_pointer_cast<const ir::AssignStmt>(stmt);
       if (assign && hoisted_allocs_.count(assign.get())) {
         VisitStmt(stmt);

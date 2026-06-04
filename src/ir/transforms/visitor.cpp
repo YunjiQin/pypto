@@ -323,6 +323,11 @@ void IRVisitor::VisitStmt_(const RuntimeScopeStmtPtr& op) {
 
 void IRVisitor::VisitStmt_(const CommDomainScopeStmtPtr& op) {
   INTERNAL_CHECK_SPAN(op->body_, op->span_) << "CommDomainScopeStmt has null body";
+  VisitScopeAttrs(op);
+  for (size_t i = 0; i < op->slots_.size(); ++i) {
+    INTERNAL_CHECK_SPAN(op->slots_[i], op->span_) << "CommDomainScopeStmt has null slot at index " << i;
+    VisitExpr(op->slots_[i]);
+  }
   VisitStmt(op->body_);
 }
 

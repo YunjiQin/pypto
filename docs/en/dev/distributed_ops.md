@@ -222,10 +222,10 @@ The local-vs-remote split is intentional: a *local* operand (e.g. `get`'s
 
 ## Pipeline integration
 
-Window buffers and comm groups are collected by the
-[`MaterializeCommDomainScopes`](passes/36-materialize_comm_domain_scopes.md) pass, which populates
-`CommDomainScopeStmt wrappers in each host_orch body` and the per-window `WindowBuffer` records the runtime
-binds physical buffers to.
+Comm domains and their slot allocations are materialised by the
+[`MaterializeCommDomainScopes`](passes/36-materialize_comm_domain_scopes.md) pass, which wraps each
+host_orch body in nested `CommDomainScopeStmt` nodes (one per inferred comm domain) and produces the
+per-window `WindowBuffer` records that the runtime binds physical buffers to.
 
 ## Testing
 

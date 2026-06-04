@@ -1040,9 +1040,25 @@ StmtPtr IRMutator::VisitStmt_(const CommDomainScopeStmtPtr& op) {
   auto new_body = StmtFunctor<StmtPtr>::VisitStmt(op->body_);
   INTERNAL_CHECK_SPAN(new_body, op->span_) << "CommDomainScopeStmt body mutated to null";
 
-  if (new_body.get() != op->body_.get()) {
+  std::vector<WindowBufferPtr> new_slots;
+  new_slots.reserve(op->slots_.size());
+  bool slots_changed = false;
+  for (size_t i = 0; i < op->slots_.size(); ++i) {
+    INTERNAL_CHECK_SPAN(op->slots_[i], op->span_) << "CommDomainScopeStmt has null slot at index " << i;
+    auto remapped = ExprFunctor<ExprPtr>::VisitExpr(op->slots_[i]);
+    auto new_slot = As<WindowBuffer>(remapped);
+    INTERNAL_CHECK_SPAN(new_slot, op->span_)
+        << "CommDomainScopeStmt slot at index " << i << " mutated to non-WindowBuffer";
+    if (new_slot.get() != op->slots_[i].get()) slots_changed = true;
+    new_slots.push_back(std::move(new_slot));
+  }
+  auto [new_attrs, attrs_changed] = MutateScopeAttrs(op->attrs_);
+
+  if (new_body.get() != op->body_.get() || slots_changed || attrs_changed) {
     auto result = MutableCopy(op);
     result->body_ = std::move(new_body);
+    if (slots_changed) result->slots_ = std::move(new_slots);
+    if (attrs_changed) result->attrs_ = std::move(new_attrs);
     return result;
   }
   return op;

@@ -893,6 +893,47 @@ static IRNodePtr DeserializeRuntimeScopeStmt(const msgpack::object& fields_obj, 
                                             DeserializeScopeAttrs(fields_obj, ctx, zone));
 }
 
+// Deserialize CommDomainScopeStmt — synthesized by MaterializeCommDomainScopes,
+// wraps host_orch use sites of a comm domain's WindowBuffer slots.
+static IRNodePtr DeserializeCommDomainScopeStmt(const msgpack::object& fields_obj, msgpack::zone& zone,
+                                                DeserializerContext& ctx) {
+  auto span = ctx.DeserializeSpan(GET_FIELD_OBJ("span"));
+
+  std::vector<int64_t> devices;
+  auto devices_obj = GetOptionalFieldObj(fields_obj, "devices", ctx);
+  if (devices_obj.has_value() && devices_obj->type == msgpack::type::ARRAY) {
+    devices.reserve(devices_obj->via.array.size);
+    for (uint32_t i = 0; i < devices_obj->via.array.size; ++i) {
+      int64_t v = 0;
+      devices_obj->via.array.ptr[i].convert(v);
+      devices.push_back(v);
+    }
+  }
+
+  std::vector<WindowBufferPtr> slots;
+  auto slots_obj = GetOptionalFieldObj(fields_obj, "slots", ctx);
+  if (slots_obj.has_value() && slots_obj->type == msgpack::type::ARRAY) {
+    slots.reserve(slots_obj->via.array.size);
+    for (uint32_t i = 0; i < slots_obj->via.array.size; ++i) {
+      slots.push_back(std::static_pointer_cast<const WindowBuffer>(
+          ctx.DeserializeNode(slots_obj->via.array.ptr[i], zone)));
+    }
+  }
+
+  auto name_hint = DeserializeScopeNameHint(fields_obj, ctx);
+  auto body = std::static_pointer_cast<const Stmt>(ctx.DeserializeNode(GET_FIELD_OBJ("body"), zone));
+
+  std::vector<std::pair<std::string, std::any>> attrs;
+  auto attrs_opt = GetOptionalFieldObj(fields_obj, "attrs", ctx);
+  if (attrs_opt.has_value() && attrs_opt->type != msgpack::type::NIL) {
+    attrs = DeserializeKwargs(*attrs_opt, "attrs", ctx, zone);
+  }
+
+  return std::make_shared<CommDomainScopeStmt>(std::move(devices), std::move(slots), std::move(name_hint),
+                                               body, span, DeserializeLeadingComments(fields_obj),
+                                               std::move(attrs));
+}
+
 // Deserialize SeqStmts
 static IRNodePtr DeserializeSeqStmts(const msgpack::object& fields_obj, msgpack::zone& zone,
                                      DeserializerContext& ctx) {
@@ -1172,6 +1213,7 @@ static TypeRegistrar _cluster_scope_stmt_registrar("ClusterScopeStmt", Deseriali
 static TypeRegistrar _hierarchy_scope_stmt_registrar("HierarchyScopeStmt", DeserializeHierarchyScopeStmt);
 static TypeRegistrar _spmd_scope_stmt_registrar("SpmdScopeStmt", DeserializeSpmdScopeStmt);
 static TypeRegistrar _runtime_scope_stmt_registrar("RuntimeScopeStmt", DeserializeRuntimeScopeStmt);
+static TypeRegistrar _comm_domain_scope_stmt_registrar("CommDomainScopeStmt", DeserializeCommDomainScopeStmt);
 static TypeRegistrar _seq_stmts_registrar("SeqStmts", DeserializeSeqStmts);
 static TypeRegistrar _eval_stmt_registrar("EvalStmt", DeserializeEvalStmt);
 static TypeRegistrar _break_stmt_registrar("BreakStmt", DeserializeBreakStmt);

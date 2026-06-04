@@ -509,7 +509,7 @@ class DistributedTensorType : public TensorType {
   /// ``pld.DistributedTensor[[shape], dtype]``. Two DistributedTensorTypes with
   /// the same shape / dtype but different ``window_buffer_`` values are
   /// structurally distinct, so passes can tell apart slices of different
-  /// HCCL window buffer carved by a CommDomainScopeStmts.
+  /// HCCL window buffer carved by a CommDomainScopeStmt.
   std::optional<WindowBufferPtr> window_buffer_;
 
   DistributedTensorType(std::vector<ExprPtr> shape, DataType dtype)

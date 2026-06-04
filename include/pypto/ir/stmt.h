@@ -995,7 +995,7 @@ using RuntimeScopeStmtPtr = std::shared_ptr<const RuntimeScopeStmt>;
  * dispatch's distributed tensor argument back to the enclosing scope.
  *
  * Synthesized by the ``MaterializeCommDomainScopes`` pass (formerly
- * ``MaterializeCommDomainScopes``). The Python printer is transparent over this stmt
+ * ``CollectCommGroups``). The Python printer is transparent over this stmt
  * (descends into ``body_`` without emitting a ``with`` wrapper) — see the
  * pass doc for the round-trip contract.
  */
