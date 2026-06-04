@@ -228,5 +228,62 @@ def test_tensor_assemble_target_distributed_tensor_keeps_kind():
     assert isinstance(assembles[0].type, ir.DistributedTensorType)
 
 
+# ---------------------------------------------------------------------------
+# Subscript-write sugar (``dst[i:j, :] = src``) on a DistributedTensor target.
+# Lowers to ``tensor.assemble`` — accepts a plain Tensor source for local
+# stage-in into a window slice (issue #1672).
+# ---------------------------------------------------------------------------
+
+
+def test_subscript_write_distributed_target_plain_source():
+    """``dist_win[i:j, :] = plain_tensor_src`` lowers to ``tensor.assemble``
+    with a DistributedTensor target and a plain Tensor source. The parser's
+    kind check must accept the mixed kinds (both are tensor-shaped)."""
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            src: pl.Tensor[[1, 32], pl.FP32],
+            out: pl.Out[pl.Tensor[[1, 64], pl.FP32]],
+            data: pl.InOut[pld.DistributedTensor[[1, 64], pl.FP32]],
+        ) -> pl.Tensor[[1, 64], pl.FP32]:
+            data[0:1, 0:32] = src
+            tile = pl.load(data, [0, 0], [1, 64])
+            return pl.store(tile, [0, 0], out)
+
+    func = _get_func(P, "kernel")
+    assembles = _collect_calls(func.body, "tensor.assemble")
+    assert len(assembles) == 1
+    # Target's DistributedTensorType propagates onto the assemble result.
+    assert isinstance(assembles[0].type, ir.DistributedTensorType)
+
+
+def test_subscript_write_plain_target_distributed_source_slice():
+    """Reverse direction — plain Tensor target, DistributedTensor source slice."""
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            src_data: pl.InOut[pld.DistributedTensor[[1, 64], pl.FP32]],
+            out: pl.Out[pl.Tensor[[1, 64], pl.FP32]],
+            plain: pl.InOut[pl.Tensor[[1, 64], pl.FP32]],
+        ) -> pl.Tensor[[1, 64], pl.FP32]:
+            plain[0:1, 0:32] = src_data[0:1, 0:32]
+            tile = pl.load(plain, [0, 0], [1, 64])
+            return pl.store(tile, [0, 0], out)
+
+    func = _get_func(P, "kernel")
+    assembles = _collect_calls(func.body, "tensor.assemble")
+    assert len(assembles) == 1
+    # Plain target -> plain TensorType result, despite the DistributedTensor source.
+    t = assembles[0].type
+    assert isinstance(t, ir.TensorType)
+    assert not isinstance(t, ir.DistributedTensorType)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

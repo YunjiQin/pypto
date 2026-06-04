@@ -1607,12 +1607,21 @@ class ASTParser:
             self._parse_array_subscript_assignment(target, base_expr, var_name, value_node, span)
             return
 
+        # ``base_kind`` is the *kind* class (Tensor or Tile) — not the concrete
+        # subclass — so the source-type check below accepts any tensor-shaped
+        # sibling (``DistributedTensorType`` for tensor target, future tile
+        # subclasses for tile target). Without this, mixed-kind writes such as
+        # ``dist_win[i:j, :] = plain_tensor_src`` would be rejected even though
+        # the underlying ``tensor.assemble`` deducer accepts both via
+        # ``AsTensorTypeLike``.
         if isinstance(base_type, ir.TensorType):
             kind_name = "tensor"
             assemble_op = ir_op.tensor.assemble
+            base_kind: type = ir.TensorType
         elif isinstance(base_type, ir.TileType):
             kind_name = "tile"
             assemble_op = ir_op.tile.assemble
+            base_kind = ir.TileType
         else:
             raise ParserTypeError(
                 f"Subscript-write requires a Tensor, Tile, or Array target, got {type(base_type).__name__}",
@@ -1634,7 +1643,9 @@ class ASTParser:
 
         source_expr = self.parse_expression(value_node)
         source_type = source_expr.type
-        if not isinstance(source_type, type(base_type)):
+        # Union form gives pyright the narrowing it needs to use ``.shape`` below;
+        # ``base_kind`` is the runtime kind discriminator (Tensor vs Tile).
+        if not (isinstance(source_type, (ir.TensorType, ir.TileType)) and isinstance(source_type, base_kind)):
             raise ParserTypeError(
                 f"Subscript-write source must also be a {kind_name}, got {type(source_type).__name__}",
                 span=span,
