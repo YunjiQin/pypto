@@ -303,6 +303,17 @@ jobs:
           cd "$PTO_ISA_ROOT"
           git checkout 016396b57e2c17093f1194e6acd89bb112b0ab24
 
+      - name: Patch pto-isa TNOTIFY_IMPL (workaround for ptoas sync bug)
+        # ptoas can emit the TNOTIFY signal store before prior DDR traffic
+        # drains, intermittently breaking dist-system-tests EP cases. Inject
+        # a leading dsb(DSB_DDR) into TNOTIFY_IMPL until ptoas is fixed.
+        run: |
+          TNOTIFY="$PTO_ISA_ROOT/include/pto/comm/a2a3/TNotify.hpp"
+          [ "$(grep -c 'TNOTIFY: signal type must be int32_t' "$TNOTIFY")" = "1" ] \
+            || { echo "TNotify.hpp anchor missing or duplicated — patch needs update"; exit 1; }
+          sed -i '/TNOTIFY: signal type must be int32_t/a\    dsb(DSB_DDR);' "$TNOTIFY"
+          grep -n -B1 -A1 'dsb(DSB_DDR);' "$TNOTIFY"
+
       - name: Bootstrap conda + per-job venv + write activate.sh
         # Set up a per-job venv layered on conda py310 and generate
         # activate.sh so each later step enters the env with a single
