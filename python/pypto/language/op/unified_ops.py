@@ -78,7 +78,13 @@ from . import tile_ops as _tile
 # TypeVar
 # ---------------------------------------------------------------------------
 
-T = TypeVar("T", Tensor, Tile)
+# Bound (not constrained) so concrete subclasses propagate through ``T -> T``
+# signatures — ``pl.slice(dist_tensor, ...)`` should return ``DistributedTensor``,
+# not get downgraded to plain ``Tensor`` by a constrained ``TypeVar("T", Tensor,
+# Tile)``. Mixed-kind two-arg uses (e.g. ``pl.matmul(tensor, tile)``) are still
+# caught at runtime by each function's ``isinstance`` dispatch — the runtime
+# error is more informative than a constrained-TypeVar type-check failure.
+T = TypeVar("T", bound="Tensor | Tile")
 
 
 def _raise_type_dispatch_error(op_name: str, *args: object) -> NoReturn:

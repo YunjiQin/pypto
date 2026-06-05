@@ -349,5 +349,36 @@ def test_narrow_distributed_source_into_plain_target():
     assert not isinstance(t, ir.DistributedTensorType)
 
 
+# ---------------------------------------------------------------------------
+# Unified facade (``pl.slice`` / ``pl.fillpad`` / ``pl.reshape`` / ...) routes
+# DistributedTensor inputs to the tensor-side wrapper via ``isinstance``
+# dispatch; the IR Call's kind must survive that detour.
+# ---------------------------------------------------------------------------
+
+
+def test_unified_pl_slice_dispatches_to_distributed_tensor_kind():
+    """``pl.slice(dist_tensor, ...)`` (the unified facade in ``unified_ops``)
+    routes through ``isinstance(input, Tensor)`` → ``_tensor.slice`` and must
+    end up with a ``DistributedTensorType`` Call — equivalent to calling
+    ``pl.tensor.slice`` directly."""
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            out: pl.Out[pl.Tensor[[1, 32], pl.FP32]],
+            data: pl.InOut[pld.DistributedTensor[[1, 64], pl.FP32]],
+        ) -> pl.Tensor[[1, 32], pl.FP32]:
+            sub = pl.slice(data, [1, 32], [0, 0])
+            tile = pl.load(sub, [0, 0], [1, 32])
+            return pl.store(tile, [0, 0], out)
+
+    func = _get_func(P, "kernel")
+    slices = _collect_calls(func.body, "tensor.slice")
+    assert len(slices) == 1
+    assert isinstance(slices[0].type, ir.DistributedTensorType)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
