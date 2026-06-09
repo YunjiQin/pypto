@@ -10,6 +10,7 @@ This pass transforms IR with multiple assignments to the same variable into SSA 
 - **If statements**: Variables modified in one or both branches
 - **For loops**: Variables modified inside the loop body
 - **Mixed SSA/non-SSA**: Preserves existing SSA structure while converting non-SSA parts
+- **Idempotent**: Re-running on already-SSA IR produces SSA-equivalent IR with no use-before-def violations, including for Var refs embedded in dynamic Tile/Tensor type annotations (shape, valid_shape, stride). Every Var construction site that reads a type from an existing Var threads the type through `SubstType` so renamed refs stay consistent.
 
 **Requires**: `TypeChecked` property. `TypeChecked` is verified automatically at BASIC level once produced; use a `VerificationInstrument` via `PassContext` to validate required properties before this pass runs.
 

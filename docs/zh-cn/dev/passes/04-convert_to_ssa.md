@@ -10,6 +10,7 @@
 - **If 语句 (Statement)**：在一个或两个分支中修改的变量
 - **For 循环**：在循环体内修改的变量
 - **混合 SSA/非 SSA**：保留现有的 SSA 结构，同时转换非 SSA 部分
+- **幂等性**：在已 SSA 化的 IR 上再次运行本 Pass 仍产生 SSA 等价的 IR，且不会引入 use-before-def 违例 —— 这对嵌入在动态 Tile/Tensor 类型注解中的 Var 引用（shape、valid_shape、stride）同样成立。所有从已有 Var 中读取类型的构造点都会通过 `SubstType` 转译类型，使得被重命名的 Var 引用始终保持一致。
 
 **需要**：TypeChecked 属性 (Property)（需在运行本 Pass 之前已建立，可通过属性验证/`VerificationInstrument` 等机制检查）。
 

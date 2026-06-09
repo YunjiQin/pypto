@@ -449,17 +449,6 @@ class SSAConverter {
     }
   }
 
-  /// Register pre-existing return_vars from the original loop into cur_.
-  void RegisterExistingReturnVars(const std::vector<IterArgPtr>& ias, const std::vector<VarPtr>& rvs,
-                                  const std::unordered_map<const Var*, const Var*>& ia_to_source) {
-    for (size_t i = 0; i < ias.size() && i < rvs.size(); ++i) {
-      auto it = ia_to_source.find(ias[i].get());
-      if (it != ia_to_source.end()) {
-        cur_[it->second] = rvs[i];
-      }
-    }
-  }
-
   // ── Statement dispatch ─────────────────────────────────────────────
 
   StmtPtr ConvertStmt(const StmtPtr& s) {
@@ -541,8 +530,8 @@ class SSAConverter {
     std::vector<IterArgPtr> ias;
     std::unordered_map<const Var*, const Var*> ia_to_source;
     for (const auto& ia : op->iter_args_) {
-      auto new_ia =
-          std::make_shared<IterArg>(ia->name_hint_, ia->GetType(), SubstExpr(ia->initValue_), ia->span_);
+      auto new_ia = std::make_shared<IterArg>(ia->name_hint_, SubstType(ia->GetType()),
+                                              SubstExpr(ia->initValue_), ia->span_);
       ias.push_back(new_ia);
       // The original iter_arg IS the source variable for cur_ mapping
       ia_to_source[new_ia.get()] = ia.get();
@@ -599,14 +588,15 @@ class SSAConverter {
     std::vector<VarPtr> carried_rvs;
     for (const auto& key : carried) {
       auto init = before.at(key);
+      auto init_type = SubstType(init->GetType());
       int iv = NextVersion(key);
-      auto new_ia = std::make_shared<IterArg>(BuildAutoNamedVersion(key->name_hint_, "iter", iv),
-                                              init->GetType(), init, op->span_);
+      auto new_ia = std::make_shared<IterArg>(BuildAutoNamedVersion(key->name_hint_, "iter", iv), init_type,
+                                              init, op->span_);
       ias.push_back(new_ia);
       ia_to_source[new_ia.get()] = key;
       int rv = NextVersion(key);
-      carried_rvs.push_back(std::make_shared<Var>(BuildAutoNamedVersion(key->name_hint_, "rv", rv),
-                                                  init->GetType(), op->span_));
+      carried_rvs.push_back(
+          std::make_shared<Var>(BuildAutoNamedVersion(key->name_hint_, "rv", rv), init_type, op->span_));
     }
 
     // Create iter_args + return_vars for escaping variables (pre-registered)
@@ -614,7 +604,7 @@ class SSAConverter {
     for (const auto& key : escaping) {
       auto type_it = tc.types.find(key);
       if (type_it == tc.types.end()) continue;
-      auto type = type_it->second;
+      auto type = SubstType(type_it->second);
       auto init = FindInitValue(type, before);
       if (!init) {
         // Last resort: create a placeholder using any variable with matching type
@@ -634,7 +624,7 @@ class SSAConverter {
     // Version loop variable and register iter_args (including escaping)
     int lvv = NextVersion(lv_key);
     auto new_lv = std::make_shared<Var>(BuildAutoNamedVersion(lv_key->name_hint_, "idx", lvv),
-                                        op->loop_var_->GetType(), op->loop_var_->span_);
+                                        SubstType(op->loop_var_->GetType()), op->loop_var_->span_);
     cur_[lv_key] = new_lv;
     RegisterIterArgs(ias, ia_to_source);
     for (size_t i = 0; i < carried.size(); ++i) cur_[carried[i]] = ias[op->iter_args_.size() + i];
@@ -650,11 +640,25 @@ class SSAConverter {
     cur_ = before;
     for (size_t i = 0; i < carried.size(); ++i) cur_[carried[i]] = carried_rvs[i];
     for (size_t i = 0; i < escaping.size() && i < esc_rvs.size(); ++i) cur_[escaping[i]] = esc_rvs[i];
-    RegisterExistingReturnVars(ias, op->return_vars_, ia_to_source);
 
-    // Build return_vars in iter_arg order: existing + carried + escaping
+    // Build return_vars in iter_arg order: existing + carried + escaping.
+    // Existing return_vars are freshened when their type embeds renamed Vars
+    // (idempotence: re-running ConvertToSSA on already-SSA IR with dynamic
+    // shape/valid_shape Var refs must keep type-embedded refs consistent).
     std::vector<VarPtr> all_rvs;
-    for (const auto& rv : op->return_vars_) all_rvs.push_back(rv);
+    for (size_t i = 0; i < op->return_vars_.size(); ++i) {
+      const auto& rv = op->return_vars_[i];
+      auto new_type = SubstType(rv->GetType());
+      VarPtr eff_rv = (new_type.get() == rv->GetType().get())
+                          ? rv
+                          : std::make_shared<Var>(rv->name_hint_, new_type, rv->span_);
+      if (eff_rv.get() != rv.get()) cur_[rv.get()] = eff_rv;
+      if (i < ias.size()) {
+        auto it = ia_to_source.find(ias[i].get());
+        if (it != ia_to_source.end()) cur_[it->second] = eff_rv;
+      }
+      all_rvs.push_back(eff_rv);
+    }
     for (const auto& rv : carried_rvs) all_rvs.push_back(rv);
     for (const auto& rv : esc_rvs) all_rvs.push_back(rv);
 
@@ -693,8 +697,8 @@ class SSAConverter {
     std::vector<IterArgPtr> ias;
     std::unordered_map<const Var*, const Var*> ia_to_source;
     for (const auto& ia : op->iter_args_) {
-      auto new_ia =
-          std::make_shared<IterArg>(ia->name_hint_, ia->GetType(), SubstExpr(ia->initValue_), ia->span_);
+      auto new_ia = std::make_shared<IterArg>(ia->name_hint_, SubstType(ia->GetType()),
+                                              SubstExpr(ia->initValue_), ia->span_);
       ias.push_back(new_ia);
       ia_to_source[new_ia.get()] = ia.get();
     }
@@ -744,14 +748,15 @@ class SSAConverter {
     std::vector<VarPtr> carried_rvs;
     for (const auto& key : carried) {
       auto init = before.at(key);
+      auto init_type = SubstType(init->GetType());
       int iv = NextVersion(key);
-      auto new_ia = std::make_shared<IterArg>(BuildAutoNamedVersion(key->name_hint_, "iter", iv),
-                                              init->GetType(), init, op->span_);
+      auto new_ia = std::make_shared<IterArg>(BuildAutoNamedVersion(key->name_hint_, "iter", iv), init_type,
+                                              init, op->span_);
       ias.push_back(new_ia);
       ia_to_source[new_ia.get()] = key;
       int rv = NextVersion(key);
-      carried_rvs.push_back(std::make_shared<Var>(BuildAutoNamedVersion(key->name_hint_, "rv", rv),
-                                                  init->GetType(), op->span_));
+      carried_rvs.push_back(
+          std::make_shared<Var>(BuildAutoNamedVersion(key->name_hint_, "rv", rv), init_type, op->span_));
     }
 
     // Create iter_args + return_vars for escaping variables (pre-registered)
@@ -759,7 +764,7 @@ class SSAConverter {
     for (const auto& key : escaping) {
       auto type_it = tc.types.find(key);
       if (type_it == tc.types.end()) continue;
-      auto type = type_it->second;
+      auto type = SubstType(type_it->second);
       auto init = FindInitValue(type, before);
       if (!init) init = std::make_shared<Var>(key->name_hint_, type, op->span_);
       int iv = NextVersion(key);
@@ -786,11 +791,24 @@ class SSAConverter {
     cur_ = before;
     for (size_t i = 0; i < carried.size(); ++i) cur_[carried[i]] = carried_rvs[i];
     for (size_t i = 0; i < escaping.size() && i < esc_rvs.size(); ++i) cur_[escaping[i]] = esc_rvs[i];
-    RegisterExistingReturnVars(ias, op->return_vars_, ia_to_source);
 
-    // Build return_vars: existing + carried + escaping
+    // Build return_vars: existing + carried + escaping. Freshen existing rvs
+    // when their type embeds renamed Vars (idempotence — see ConvertFor for
+    // the same pattern).
     std::vector<VarPtr> all_rvs;
-    for (const auto& rv : op->return_vars_) all_rvs.push_back(rv);
+    for (size_t i = 0; i < op->return_vars_.size(); ++i) {
+      const auto& rv = op->return_vars_[i];
+      auto new_type = SubstType(rv->GetType());
+      VarPtr eff_rv = (new_type.get() == rv->GetType().get())
+                          ? rv
+                          : std::make_shared<Var>(rv->name_hint_, new_type, rv->span_);
+      if (eff_rv.get() != rv.get()) cur_[rv.get()] = eff_rv;
+      if (i < ias.size()) {
+        auto it = ia_to_source.find(ias[i].get());
+        if (it != ia_to_source.end()) cur_[it->second] = eff_rv;
+      }
+      all_rvs.push_back(eff_rv);
+    }
     for (const auto& rv : carried_rvs) all_rvs.push_back(rv);
     for (const auto& rv : esc_rvs) all_rvs.push_back(rv);
 
@@ -875,8 +893,8 @@ class SSAConverter {
       for (const auto& rv : op->return_vars_) {
         auto rv_key = rv.get();
         int v = NextVersion(rv_key);
-        auto nrv = std::make_shared<Var>(BuildAutoNamedVersion(rv_key->name_hint_, "rv", v), rv->GetType(),
-                                         rv->span_);
+        auto nrv = std::make_shared<Var>(BuildAutoNamedVersion(rv_key->name_hint_, "rv", v),
+                                         SubstType(rv->GetType()), rv->span_);
         return_vars.push_back(nrv);
         cur_[rv_key] = nrv;
       }
@@ -897,8 +915,8 @@ class SSAConverter {
       VarPtr tv = then_ver.count(key) ? then_ver.at(key) : before.at(key);
       VarPtr ev = else_ver.count(key) ? else_ver.at(key) : before.at(key);
       int pv = NextVersion(key);
-      auto phi =
-          std::make_shared<Var>(BuildAutoNamedVersion(key->name_hint_, "phi", pv), tv->GetType(), op->span_);
+      auto phi = std::make_shared<Var>(BuildAutoNamedVersion(key->name_hint_, "phi", pv),
+                                       SubstType(tv->GetType()), op->span_);
       return_vars.push_back(phi);
       then_yields.push_back(tv);
       else_yields.push_back(ev);
@@ -917,8 +935,8 @@ class SSAConverter {
       }
       if (!handled) {
         int v = NextVersion(rv_key);
-        auto nrv = std::make_shared<Var>(BuildAutoNamedVersion(rv_key->name_hint_, "rv", v), rv->GetType(),
-                                         rv->span_);
+        auto nrv = std::make_shared<Var>(BuildAutoNamedVersion(rv_key->name_hint_, "rv", v),
+                                         SubstType(rv->GetType()), rv->span_);
         return_vars.push_back(nrv);
         cur_[rv_key] = nrv;
       }

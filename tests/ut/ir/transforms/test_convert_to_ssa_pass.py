@@ -2335,5 +2335,102 @@ class TestScopeOutlineBoundary:
         passes.run_verifier(ps)(After)
 
 
+class TestIdempotence:
+    """ConvertToSSA must be idempotent: re-running on already-SSA IR must
+    not corrupt Var pointers embedded in dynamic-shape type annotations.
+
+    The pass doc (docs/en/dev/passes/04-convert_to_ssa.md) advertises
+    'Mixed SSA/non-SSA: Preserves existing SSA structure while converting
+    non-SSA parts' and 'Preservation: Keep existing SSA constructs
+    unchanged'. Dynamic Var refs inside Tile/Tensor type annotations
+    (e.g. valid_shape=[1, valid_len]) get renamed when the var's
+    AssignStmt is re-versioned, but the iter_arg / phi / return_var
+    construction sites previously copied old types verbatim, leaving
+    type-embedded Var refs dangling. This test pins the contract.
+    """
+
+    @staticmethod
+    def _verify_ssa(program):
+        ps = passes.IRPropertySet()
+        ps.insert(passes.IRProperty.SSAForm)
+        passes.run_verifier(ps)(program)
+
+    def test_rerun_on_if_with_dynamic_valid_shape(self):
+        """IfStmt phi var's type embeds a dynamic valid_shape Var. Re-running
+        ConvertToSSA must keep the phi's type-embedded Var ref consistent."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def repro(
+                self,
+                flag: pl.Scalar[pl.INDEX],
+                input: pl.Tensor[[1, 120], pl.FP32],
+                ctx_len: pl.Scalar[pl.INDEX],
+                out: pl.Out[pl.Tensor[[1, 120], pl.FP32]],
+            ) -> pl.Tensor[[1, 120], pl.FP32]:
+                valid_len: pl.Scalar[pl.INDEX] = ctx_len + 0
+                seed: pl.Tile[[1, 120], pl.FP32] = pl.tile.load(
+                    input,
+                    [0, 0],
+                    [1, 120],
+                    [1, valid_len],
+                    target_memory=pl.MemorySpace.Vec,
+                    transpose=False,
+                )
+                updated: pl.Tile[[1, 120], pl.FP32] = pl.tile.muls(seed, 1.0)
+                if flag == 0:
+                    result = seed
+                else:
+                    result = updated
+                final: pl.Tensor[[1, 120], pl.FP32] = pl.tile.store(result, [0, 0], out)
+                return final
+
+        Once = passes.convert_to_ssa()(Before)
+        self._verify_ssa(Once)  # sanity: first run is clean
+        Twice = passes.convert_to_ssa()(Once)
+        self._verify_ssa(Twice)  # the actual idempotence assertion
+
+    def test_rerun_on_for_loop_with_dynamic_valid_shape(self):
+        """ForStmt iter_arg / rv types embed a dynamic Var ref. Re-running
+        must subst those refs consistently."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def repro(
+                self,
+                ctx_len: pl.Scalar[pl.INDEX],
+                input: pl.Tensor[[1, 120], pl.FP32],
+                out: pl.Out[pl.Tensor[[1, 120], pl.FP32]],
+            ) -> pl.Tensor[[1, 120], pl.FP32]:
+                valid_len: pl.Scalar[pl.INDEX] = ctx_len + 0
+                acc: pl.Tile[[1, 120], pl.FP32] = pl.tile.load(
+                    input,
+                    [0, 0],
+                    [1, 120],
+                    [1, valid_len],
+                    target_memory=pl.MemorySpace.Vec,
+                    transpose=False,
+                )
+                for i in pl.range(4):
+                    t: pl.Tile[[1, 120], pl.FP32] = pl.tile.load(
+                        input,
+                        [0, 0],
+                        [1, 120],
+                        [1, valid_len],
+                        target_memory=pl.MemorySpace.Vec,
+                        transpose=False,
+                    )
+                    acc = pl.tile.add(acc, t)
+                final: pl.Tensor[[1, 120], pl.FP32] = pl.tile.store(acc, [0, 0], out)
+                return final
+
+        Once = passes.convert_to_ssa()(Before)
+        self._verify_ssa(Once)
+        Twice = passes.convert_to_ssa()(Once)
+        self._verify_ssa(Twice)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
