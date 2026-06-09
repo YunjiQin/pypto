@@ -235,8 +235,8 @@ class SSAConverter {
     std::vector<VarPtr> new_params;
     std::vector<ParamDirection> new_dirs;
     for (size_t i = 0; i < func->params_.size(); ++i) {
-      auto key = func->params_[i].get();
-      new_params.push_back(AllocVersion(key, func->params_[i]->GetType(), func->params_[i]->span_));
+      new_params.push_back(
+          AllocVersion(func->params_[i], func->params_[i]->GetType(), func->params_[i]->span_));
       new_dirs.push_back(func->param_directions_[i]);
     }
 
@@ -430,9 +430,58 @@ class SSAConverter {
 
   int NextVersion(const Var* key) { return ver_[key]++; }
 
-  VarPtr AllocVersion(const Var* key, const TypePtr& type, const Span& span) {
+  /// True if ``name`` is already in versioned auto-name form (e.g. ``x__ssa_v0``,
+  /// ``t__tmp_v1``, ``r__idx_v0``). Such names are produced by ConvertToSSA's
+  /// own LHS renaming and escape-promotion paths (``ssa`` / ``iter`` / ``rv`` /
+  /// ``phi`` / ``idx`` roles) as well as by upstream CSE / normalization passes
+  /// (``tmp`` role). On a second ConvertToSSA run we keep these at their
+  /// original pointer identity instead of re-minting, to avoid:
+  ///
+  ///   1. Stale cross-function references — an outlined Spmd function's
+  ///      ``core_num`` ExprPtr or a ``DistributedTensorType``'s
+  ///      ``window_buffer_`` field that the per-function ``cur_`` cannot reach.
+  ///   2. ``name_hint_`` collisions in downstream codegen that uses the raw
+  ///      name as a Python identifier (host_orch ``tensors[...]`` keys,
+  ///      ``CommBufferSpec(name=...)``) — re-versioning ``t__tmp_v1`` and
+  ///      ``t__tmp_v2`` would both produce ``name_hint_ = "t__ssa_v0"`` with
+  ///      distinct Var pointers, collapsing them into one Python slot.
+  ///
+  /// First-run user IR (vars without auto-name suffixes) is unaffected.
+  static bool IsAutoVersionedName(const std::string& name) {
+    auto parsed = auto_name::Parse(name);
+    return parsed.has_auto_suffix && parsed.version.has_value();
+  }
+
+  /// Allocate a fresh SSA version for ``original``. When ``original`` is
+  /// already SSA-named, preserve its pointer identity (idempotence) and
+  /// avoid minting a new Var with a colliding ``name_hint_``.
+  ///
+  /// Identity-preservation is critical for two downstream paths:
+  ///   1. Cross-function references — e.g. an outlined Spmd function's
+  ///      ``core_num`` attr ExprPtr or a ``DistributedTensorType``'s
+  ///      ``window_buffer_`` field — that hold the Var pointer directly
+  ///      and cannot be reached by per-function ``cur_`` substitution.
+  ///   2. Codegen paths that use ``name_hint_`` as a Python identifier
+  ///      (host_orch ``tensors[...]`` keys, ``CommBufferSpec(name=...)``)
+  ///      where two Vars with the same ``name_hint_`` collapse to the same
+  ///      slot.
+  VarPtr AllocVersion(const VarPtr& original, const TypePtr& type, const Span& span) {
+    auto key = original.get();
+    // Idempotence path: an auto-versioned Var (``foo__ssa_v0`` / ``foo__tmp_v1``
+    // / ``foo__idx_v0`` etc.) that has not been seen yet as a write site in
+    // this function is treated as already-SSA — keep its pointer identity.
+    // If we've already recorded a write through this Var pointer (e.g. an
+    // earlier AssignStmt LHS in straight-line code, or a control-flow pass
+    // emitted a multi-assigned auto-named temp), fall through to normal
+    // re-versioning so SSA's "exactly one def per Var" invariant holds.
+    bool already_seen = cur_.find(key) != cur_.end();
+    if (!already_seen && IsAutoVersionedName(original->name_hint_)) {
+      cur_[key] = original;
+      return original;
+    }
     int v = NextVersion(key);
-    auto var = std::make_shared<Var>(BuildAutoNamedVersion(key->name_hint_, "ssa", v), SubstType(type), span);
+    auto var =
+        std::make_shared<Var>(BuildAutoNamedVersion(original->name_hint_, "ssa", v), SubstType(type), span);
     cur_[key] = var;
     return var;
   }
@@ -484,8 +533,7 @@ class SSAConverter {
 
   StmtPtr ConvertAssign(const AssignStmtPtr& op) {
     auto val = SubstExpr(op->value_);
-    auto key = op->var_.get();
-    auto var = AllocVersion(key, op->var_->GetType(), op->var_->span_);
+    auto var = AllocVersion(op->var_, op->var_->GetType(), op->var_->span_);
     auto result = MutableCopy(op);
     result->var_ = var;
     result->value_ = val;
