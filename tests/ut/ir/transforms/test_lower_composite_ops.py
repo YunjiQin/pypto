@@ -540,21 +540,32 @@ def test_allreduce_is_decomposed_to_primitives():
 
 
 def test_allreduce_emits_for_and_if_control_flow():
-    """The 4-phase recipe emits three ForStmts (notify-loop, wait-loop,
-    reduce-loop) and three IfStmts (one inside each), matching the
-    hand-written reference in ``tests/st/distributed/test_l3_allreduce.py``.
+    """The recipe emits five ForStmts and five IfStmts:
 
-    This pins the structured control-flow shape so a refactor of the rule
-    that, say, folds notify+wait into one loop surfaces here."""
+    * Phase 2a (notify all peers) — for + if
+    * Phase 2b (wait on all peers) — for + if
+    * Phase 3  (reduce-load from all peers) — for + if
+    * Phase 3.5a (post-reduce re-notify) — for + if
+    * Phase 3.5b (post-reduce re-wait) — for + if
+
+    Phase 3.5 is a second cross-rank barrier inserted between Phase 3
+    (read peers via ``pld.tile.remote_load``) and Phase 4 (write reduced
+    value back into ``target``). Without it, a fast rank could overwrite
+    its slot while slower ranks are still reading the staged Phase-1 data
+    — a write-after-read race that manifests as off-by-N×peer drift on
+    slower ranks at P>=4.
+
+    This pins the structured control-flow shape so a refactor that
+    collapses or drops any of the loops surfaces here."""
     Before = _build_allreduce_before()
     After = passes.lower_composite_ops()(Before)
     collector = _StmtKindCollector()
     collector.visit_program(After)
 
-    assert collector.for_count == 3, (
-        f"expected 3 ForStmts (notify-loop, wait-loop, reduce-loop), got {collector.for_count}"
+    assert collector.for_count == 5, (
+        f"expected 5 ForStmts (notify, wait, reduce, re-notify, re-wait), got {collector.for_count}"
     )
-    assert collector.if_count == 3, f"expected 3 IfStmts (one per ForStmt body), got {collector.if_count}"
+    assert collector.if_count == 5, f"expected 5 IfStmts (one per ForStmt body), got {collector.if_count}"
 
 
 def test_allreduce_lowering_is_idempotent():

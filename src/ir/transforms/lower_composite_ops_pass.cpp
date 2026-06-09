@@ -457,18 +457,31 @@ ExprPtr LowerTensorAllReduceRule(const CallPtr& call, const std::vector<ExprPtr>
   // ---- Pre-build expressions shared across phases ----
   auto& reg = OpRegistry::GetInstance();
   auto ctx = b.Bind("ctx", reg.Create("pld.system.get_comm_ctx", {target}, {}, span), span);
-  auto nranks_val = b.Bind("nranks", reg.Create("pld.system.nranks", {ctx}, {}, span), span);
+  // nranks comes back as ScalarType(INT32) from pld.system.nranks; cast to
+  // INDEX so it can serve as the for-loop stop bound alongside INDEX-typed
+  // start/step constants — matches the parser's `pl.range(int)` convention
+  // (Python ints normalise to INDEX via `_to_make_tuple`/`_normalize_expr`).
+  auto nranks_i32 = b.Bind("nranks", reg.Create("pld.system.nranks", {ctx}, {}, span), span);
+  auto nranks_idx = b.Bind("nranks_idx", std::make_shared<Cast>(nranks_i32, DataType::INDEX, span), span);
   auto my_rank = b.Bind("my_rank", reg.Create("pld.system.rank", {ctx}, {}, span), span);
 
-  auto zero_i32 = std::make_shared<ConstInt>(0, DataType::INT32, span);
+  // Loop bounds: INDEX (must agree across start/stop/step). Notify's `value`
+  // and wait's `expected` are INT32 per the Python builder's int_dtype
+  // override — keep separate constants for those distinct slots. The second
+  // (post-reduce) barrier reuses the same signal cells; each peer notifies
+  // twice (once in Phase 2a, once after Phase 3) so the second wait checks
+  // `cell >= 2` rather than `cell >= 1`.
+  auto zero_idx = std::make_shared<ConstInt>(0, DataType::INDEX, span);
+  auto one_idx = std::make_shared<ConstInt>(1, DataType::INDEX, span);
   auto one_i32 = std::make_shared<ConstInt>(1, DataType::INT32, span);
+  auto two_i32 = std::make_shared<ConstInt>(2, DataType::INT32, span);
   auto zero_offsets = tile_conversion_utils::MakeZeroOffsets(ndim, span);
   auto shape_tuple = tile_conversion_utils::MakeShapeTuple(target_type->shape_, span);
   auto my_signal_offsets = MakeSignalOffsets(my_rank, span);
 
   // ---- Phase 2a: notify all peers ----
   b.EmitFor(
-      "peer", zero_i32, nranks_val, one_i32,
+      "peer", zero_idx, nranks_idx, one_idx,
       [&](LoweringBuilder& body, const VarPtr& peer) {
         body.EmitIf(
             body.NotEq(peer, my_rank, span),
@@ -484,7 +497,7 @@ ExprPtr LowerTensorAllReduceRule(const CallPtr& call, const std::vector<ExprPtr>
 
   // ---- Phase 2b: wait on every peer's signal slot ----
   b.EmitFor(
-      "src", zero_i32, nranks_val, one_i32,
+      "src", zero_idx, nranks_idx, one_idx,
       [&](LoweringBuilder& body, const VarPtr& src) {
         // signal_offsets = [src, 0] — must be built per-iteration since
         // src is the loop variable.
@@ -510,7 +523,7 @@ ExprPtr LowerTensorAllReduceRule(const CallPtr& call, const std::vector<ExprPtr>
                             span);
 
   auto acc_final = b.EmitForReduce(
-      "peer", zero_i32, nranks_val, one_i32, acc_initial,
+      "peer", zero_idx, nranks_idx, one_idx, acc_initial,
       [&](LoweringBuilder& body, const VarPtr& peer, const VarPtr& acc) {
         return body.EmitIfExpr(
             body.NotEq(peer, my_rank, span),
@@ -520,13 +533,55 @@ ExprPtr LowerTensorAllReduceRule(const CallPtr& call, const std::vector<ExprPtr>
                   OpRegistry::GetInstance().Create("pld.tile.remote_load",
                                                    {target, peer, zero_offsets, shape_tuple}, {}, span),
                   span);
-              return then_body.Add(acc, recv, span);
+              // Bind the add result so codegen sees a named tile buffer to
+              // write into (pto.tadd lowers to `ins(...) outs(<bound>)`);
+              // yielding a raw Call leaves outs() empty and MLIR rejects it.
+              return then_body.Bind("acc_next", then_body.Add(acc, recv, span), span);
             },
             [&](LoweringBuilder& /*else_body*/) -> ExprPtr {
               // peer == my_rank: pass acc through unchanged.
               return acc;
             },
             span);
+      },
+      span);
+
+  // ---- Phase 3.5: post-reduce barrier ----
+  // Phase 4 overwrites every rank's slot of ``target``; without this barrier,
+  // a fast rank could write its reduced value back to ``target`` while a slow
+  // rank is still in Phase 3 reading the original Phase-1 staged data from
+  // the same slot via ``pld.tile.remote_load`` — a write-after-read hazard
+  // that surfaces as wrong sums on slower ranks. Reuse the same signal cells:
+  // each peer atomic-adds 1 again, raising my cell from 1 to 2, so the wait
+  // checks ``cell >= 2``.
+  b.EmitFor(
+      "peer2", zero_idx, nranks_idx, one_idx,
+      [&](LoweringBuilder& body, const VarPtr& peer) {
+        body.EmitIf(
+            body.NotEq(peer, my_rank, span),
+            [&](LoweringBuilder& then_body) {
+              auto notify_call = OpRegistry::GetInstance().Create(
+                  "pld.system.notify", {signal, peer, my_signal_offsets, one_i32},
+                  {{"op", static_cast<int>(NotifyOp::kAtomicAdd)}}, span);
+              then_body.Bind("notify2_ret", notify_call, span);
+            },
+            /*else_fn=*/nullptr, span);
+      },
+      span);
+
+  b.EmitFor(
+      "src2", zero_idx, nranks_idx, one_idx,
+      [&](LoweringBuilder& body, const VarPtr& src) {
+        auto src_signal_offsets = MakeSignalOffsets(src, span);
+        body.EmitIf(
+            body.NotEq(src, my_rank, span),
+            [&](LoweringBuilder& then_body) {
+              auto wait_call =
+                  OpRegistry::GetInstance().Create("pld.system.wait", {signal, src_signal_offsets, two_i32},
+                                                   {{"cmp", static_cast<int>(WaitCmp::kGe)}}, span);
+              then_body.Bind("wait2_ret", wait_call, span);
+            },
+            /*else_fn=*/nullptr, span);
       },
       span);
 
