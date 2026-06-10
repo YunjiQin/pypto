@@ -818,7 +818,7 @@ static std::string MakeCiCodegenPTO(const std::string& pto_op_name, const CallPt
   if (!dst_type.empty()) {
     oss << " : " << dst_type;
   }
-  oss << ")" << " " << config_attr;
+  oss << ") " << config_attr;
   codegen.Emit(oss.str());
   return "";
 }
