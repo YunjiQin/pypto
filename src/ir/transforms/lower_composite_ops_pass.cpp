@@ -591,7 +591,7 @@ ExprPtr LowerTensorAllReduceRule(const CallPtr& call, const std::vector<ExprPtr>
             [&](LoweringBuilder& then_body) {
               auto wait_call =
                   OpRegistry::GetInstance().Create("pld.system.wait", {signal, src_signal_offsets, two_i32},
-                                                   {{"cmp", static_cast<int>(WaitCmp::kGe)}}, span);
+                                                   {{"cmp", static_cast<int>(WaitCmp::kEq)}}, span);
               then_body.Bind("wait2_ret", wait_call, span);
             },
             /*else_fn=*/nullptr, span);
