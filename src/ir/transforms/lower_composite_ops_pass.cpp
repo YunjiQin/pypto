@@ -469,22 +469,33 @@ ExprPtr LowerTensorAllReduceRule(const CallPtr& call, const std::vector<ExprPtr>
   // and wait's `expected` are INT32 per the Python builder's int_dtype
   // override — keep separate constants for those distinct slots.
   //
-  // Signal scheme: hybrid Set / AtomicAdd, both waits use ``WaitCmp::kEq``.
+  // Signal scheme: hybrid Set / AtomicAdd, both waits use ``WaitCmp::kGe``.
   // Phase 2a uses ``Set value=1`` (race-free: each cell has exactly one
-  // writer, the corresponding peer); Phase 2b waits for ``== 1``. Phase 3.5
+  // writer, the corresponding peer); Phase 2b waits for ``>= 1``. Phase 3.5
   // uses ``AtomicAdd 1`` for the post-reduce barrier (cell 1 → 2) with wait
-  // for ``== 2``. Within a single call the cell value is fully deterministic
-  // (0 → 1 → 2, monotonic, never decreased), so ``kEq`` matches the
-  // post-notify state exactly — equivalent to ``kGe`` but tighter and
-  // symmetric with Phase 2b.
+  // for ``>= 2``.
+  //
+  // ``kGe`` (not ``kEq``) is load-bearing. The cell is monotonically
+  // increasing within a single call, but the observer (the waiting rank)
+  // is NOT guaranteed to read each intermediate value: if a faster peer
+  // races ahead — e.g. rank A pauses between its own Phase 2a and 2b
+  // while rank B completes 2a, 2b, the full Phase 3 (remote loads,
+  // microseconds), and Phase 3.5a — then by the time A polls its
+  // cell[B], it has already been advanced from 1 (B's 2a Set) to 2
+  // (B's 3.5a AtomicAdd). ``kEq(==1)`` would never unblock; ``kGe(>=1)``
+  // does. The hand-written reference at
+  // ``tests/st/distributed/test_l3_allreduce.py`` uses ``Ge(1)`` for
+  // exactly this reason and survives the same race window.
   //
   // The cells end the call at 2, so the buffer is **not reusable** across
-  // multiple allreduce calls without per-call reallocation. The symmetric
-  // ``Set value=0`` reset path would let the buffer self-clear, but
-  // on-board ``TWAIT(==0)`` did not unblock reliably in our trials (P=4
-  // deadlocked on AICPU stream sync — see PTOAS issue #797). Until that
-  // runtime path is verified, callers needing back-to-back allreduces must
-  // allocate a fresh signal buffer per call.
+  // multiple allreduce calls without per-call reallocation — a stale ``2``
+  // would let the next call's ``Ge(1)`` Phase 2b pass before any peer
+  // notifies, breaking the barrier. The symmetric ``Set value=0`` reset
+  // path would let the buffer self-clear, but on-board ``TWAIT(==0)`` did
+  // not unblock reliably in our trials (P=4 deadlocked on AICPU stream
+  // sync — see PTOAS issue #797). Until that runtime path is verified,
+  // callers needing back-to-back allreduces must allocate a fresh signal
+  // buffer per call. The user-facing DSL docstring repeats this contract.
   auto zero_idx = std::make_shared<ConstInt>(0, DataType::INDEX, span);
   auto one_idx = std::make_shared<ConstInt>(1, DataType::INDEX, span);
   auto one_i32 = std::make_shared<ConstInt>(1, DataType::INT32, span);
@@ -509,7 +520,7 @@ ExprPtr LowerTensorAllReduceRule(const CallPtr& call, const std::vector<ExprPtr>
       },
       span);
 
-  // ---- Phase 2b: wait on every peer's signal slot (cell[src, 0] == 1) ----
+  // ---- Phase 2b: wait on every peer's signal slot (cell[src, 0] >= 1) ----
   b.EmitFor(
       "src", zero_idx, nranks_idx, one_idx,
       [&](LoweringBuilder& body, const VarPtr& src) {
@@ -521,7 +532,7 @@ ExprPtr LowerTensorAllReduceRule(const CallPtr& call, const std::vector<ExprPtr>
             [&](LoweringBuilder& then_body) {
               auto wait_call =
                   OpRegistry::GetInstance().Create("pld.system.wait", {signal, src_signal_offsets, one_i32},
-                                                   {{"cmp", static_cast<int>(WaitCmp::kEq)}}, span);
+                                                   {{"cmp", static_cast<int>(WaitCmp::kGe)}}, span);
               then_body.Bind("wait_ret", wait_call, span);
             },
             /*else_fn=*/nullptr, span);
@@ -560,7 +571,7 @@ ExprPtr LowerTensorAllReduceRule(const CallPtr& call, const std::vector<ExprPtr>
       },
       span);
 
-  // ---- Phase 3.5: post-reduce barrier (AtomicAdd 1 → wait == 2) ----
+  // ---- Phase 3.5: post-reduce barrier (AtomicAdd 1 → wait >= 2) ----
   // Phase 4 overwrites every rank's slot of ``target``; without this barrier,
   // a fast rank could write its reduced value back to ``target`` while a slow
   // rank is still in Phase 3 reading the original Phase-1 staged data from
@@ -568,11 +579,14 @@ ExprPtr LowerTensorAllReduceRule(const CallPtr& call, const std::vector<ExprPtr>
   // that surfaces as wrong sums on slower ranks.
   //
   // Reuse the same signal cells: each peer atomic-adds 1 again, raising my
-  // cell from 1 to 2, so the second wait checks ``cell == 2``. The cell
-  // value is deterministic within a single call (monotonic 0 → 1 → 2,
-  // never decreased), so ``kEq`` is equivalent to ``kGe`` but tighter and
-  // uniform with Phase 2b. The symmetric ``Set 0 / Eq 0`` reset path is
-  // left for a future runtime change (see PTOAS issue #797).
+  // cell from 1 to 2, so the second wait checks ``cell >= 2``. ``kGe`` (not
+  // ``kEq``) is required for the same race-window reason as Phase 2b: a
+  // faster peer can advance the cell past 2 before the slower rank gets
+  // around to polling — but since the buffer is single-shot per call and
+  // no peer adds more than ``+1`` here, the cell tops out at 2 and
+  // ``>= 2`` is both safe and tight. See the prelude comment block above
+  // and the hand-written reference at
+  // ``tests/st/distributed/test_l3_allreduce.py``.
   b.EmitFor(
       "peer2", zero_idx, nranks_idx, one_idx,
       [&](LoweringBuilder& body, const VarPtr& peer) {
@@ -597,7 +611,7 @@ ExprPtr LowerTensorAllReduceRule(const CallPtr& call, const std::vector<ExprPtr>
             [&](LoweringBuilder& then_body) {
               auto wait_call =
                   OpRegistry::GetInstance().Create("pld.system.wait", {signal, src_signal_offsets, two_i32},
-                                                   {{"cmp", static_cast<int>(WaitCmp::kEq)}}, span);
+                                                   {{"cmp", static_cast<int>(WaitCmp::kGe)}}, span);
               then_body.Bind("wait2_ret", wait_call, span);
             },
             /*else_fn=*/nullptr, span);

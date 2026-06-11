@@ -278,11 +278,24 @@ def allreduce(
     per rank); the host orchestrator allocates and zero-initialises it via
     :func:`alloc_window_buffer` + :func:`window`.
 
+    **Signal buffer is single-shot per call.** The lowering uses two
+    barrier waves on the same cells (Set 1 → wait ≥1, then AtomicAdd 1
+    → wait ≥2), so by the time the call returns every cell sits at
+    ``2`` rather than its initial ``0``. **Do not reuse the same signal
+    buffer for a back-to-back allreduce** — the second call's first
+    wait would pass immediately on the stale ``≥1``, breaking the
+    barrier and racing Phase 3 against the previous reduction's
+    Phase 4. Callers issuing multiple allreduces must allocate a fresh
+    signal buffer (``alloc_window_buffer`` + ``window``) for each
+    call. A self-resetting variant is blocked on a runtime fix —
+    PTOAS issue #797.
+
     Args:
         target: Window-bound :class:`pld.DistributedTensor` holding per-rank
             data. The C++ verifier refuses a plain :class:`pl.Tensor`.
         signal: Window-bound INT32 :class:`pld.DistributedTensor` whose shape
             is ``[nranks, 1]`` (or any shape providing one cell per rank).
+            Must be **freshly allocated for this call** (see warning above).
         op: :class:`pld.ReduceOp` selecting the reduction operator
             (keyword-only). Defaults to :attr:`pld.ReduceOp.Sum`. First-version
             lowering accepts only ``Sum``; ``Max`` / ``Min`` / ``Prod`` are

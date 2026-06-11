@@ -182,6 +182,14 @@ All constants are FP32 literals (the `k*` literals near the top of `src/ir/trans
 
 Running `LowerCompositeOps` twice produces identical IR after the first run: the recipe emits only primitive ops (`tile.muls`, `tile.adds`, `tile.add`, `tile.sub`, `tile.mul`, `tile.cast`) and the mutator only rewrites `tile.sin` / `tile.cos` `Call`s, so the second invocation visits the body and changes nothing. This is verified by `test_sin_lowering_is_idempotent` and `test_cos_lowering_is_idempotent` in `tests/ut/ir/transforms/test_lower_composite_ops.py`.
 
+## `pld.tensor.allreduce` — signal buffer is single-shot per call
+
+The allreduce rule decomposes one composite call into two cross-rank barriers reusing the same `signal` cells: Phase 2a `Set 1` + Phase 2b `wait ≥1`, then Phase 3.5a `AtomicAdd 1` + Phase 3.5b `wait ≥2`. By the time the call returns, every cell sits at `2` rather than its initial `0`.
+
+**Signal buffers must NOT be reused for back-to-back allreduce calls.** A stale `2` in any cell would let the next call's Phase 2b `wait ≥1` pass immediately on the leftover value, breaking the barrier and racing the next Phase 3 reads against the previous reduction's Phase 4 writes. Callers issuing multiple allreduces must allocate a fresh signal buffer (via `alloc_window_buffer` + `window`) for each call. The user-facing DSL docstring at `python/pypto/language/distributed/op/tensor_ops.py::allreduce` carries the same warning.
+
+`kGe` (not `kEq`) is the load-bearing choice for both wait predicates. The cell is monotonically increasing within a single call, but a slow rank's first poll may already see the cell past `1` if a faster peer has completed Phase 3 (microseconds-long remote loads) and started Phase 3.5a. `kEq(==1)` would then deadlock; `kGe(≥1)` does not. The hand-written reference at `tests/st/distributed/test_l3_allreduce.py` uses `Ge(1)` for the same reason. A self-resetting variant (Set 0 / Eq 0 at Phase 3.5) is blocked on PTOAS issue #797.
+
 ## Implementation Notes
 
 The mutator overrides `VisitStmt_(const AssignStmtPtr&)` rather than `VisitCall` because the decomposition splices ~33 statements per trig op into the surrounding sequence. Doing the splice from inside `VisitCall` would require returning multiple expressions, which `IRMutator` does not support; doing it from `VisitStmt_` lets `LowerSinCos` build a `vector<StmtPtr>` and return either a single bound `AssignStmt` or a fresh `SeqStmts`.
