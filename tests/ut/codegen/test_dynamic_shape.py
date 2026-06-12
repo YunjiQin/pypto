@@ -107,6 +107,54 @@ class AddKernelLoopDynamic:
         return loop_out
 
 
+@pl.program
+class AddKernelCompositeDim:
+    """Add kernel whose parameter shape carries a composite dim ``M * 2``."""
+
+    @pl.function(type=pl.FunctionType.InCore)
+    def add_kernel(
+        self,
+        a: pl.Tensor[[M * 2, N], pl.FP32],
+        b: pl.Tensor[[M * 2, N], pl.FP32],
+        output: pl.Tensor[[M * 2, N], pl.FP32],
+    ) -> pl.Tensor[[M * 2, N], pl.FP32]:
+        """The ``2`` factor appears only inside the parameter shape expression."""
+        a_tile = pl.load(a, [0, 0], [128, 128], target_memory=pl.MemorySpace.Vec)
+        b_tile = pl.load(b, [0, 0], [128, 128])
+        result = pl.add(a_tile, b_tile)
+        out = pl.store(result, [0, 0], output)
+        return out
+
+
+def test_add_kernel_composite_dim_constant_declared():
+    """A composite parameter dim ``M * 2`` declares its constant factor in MLIR.
+
+    Regression: constants emitted while rendering ``make_tensor_view`` were
+    appended to the constants section after it had already been flushed, so a
+    factor unique to a shape expression (the ``2`` in ``M * 2``) was used by
+    ``arith.muli`` without ever being declared — producing invalid MLIR that
+    references an undefined ``%c2_index``.
+    """
+    backend.reset_for_testing()
+    backend.set_backend_type(BackendType.Ascend910B)
+    func = AddKernelCompositeDim.get_function("add_kernel")
+    assert func is not None
+    program = ir.Program([func], "test_add_kernel_composite", ir.Span.unknown())
+    pm = PassManager.get_strategy(OptimizationStrategy.Default)
+    optimized = pm.run_passes(program)
+
+    gen = codegen.PTOCodegen()
+    mlir_code = gen.generate(optimized)
+
+    # The composite dim lowers to arith.muli M * 2 in the tensor view shape.
+    assert "arith.muli %arg3, %c2_index : index" in mlir_code
+    assert "shape = [%0, %arg4]" in mlir_code
+    # The constant factor must be declared, not just referenced.
+    assert "%c2_index = arith.constant 2 : index" in mlir_code
+    # The declaration must precede every use (constants section is first).
+    assert mlir_code.index("%c2_index = arith.constant") < mlir_code.index("arith.muli %arg3, %c2_index")
+
+
 def test_add_kernel_dynamic_shape_pto_codegen():
     """Test PTO codegen generates correct signature and tensor views for dynamic shapes."""
     backend.reset_for_testing()

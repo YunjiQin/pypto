@@ -754,11 +754,23 @@ void PTOCodegen::GenerateFunction(const FunctionPtr& func) {
   }
 
   std::string body_content = stream_.str();
+
+  // Render the tensor-view + extra-alloc prologue into its own buffer *before*
+  // flushing the constants section. These emitters call GetOrEmitConstant for
+  // values that may be unique to a shape/stride expression (e.g. the ``2`` in a
+  // composite parameter dim ``M * 2``); those constants must be appended to
+  // constants_section while it is still mutable, otherwise they reference an
+  // undeclared SSA value in the emitted MLIR.
+  stream_.str("");
+  stream_.clear();
+  EmitMakeTensorViews(func);
+  EmitExtraAllocTiles();
+  std::string prologue_content = stream_.str();
+
   stream_ = std::move(saved_stream);
 
   stream_ << fs_.constants_section.str();
-  EmitMakeTensorViews(func);
-  EmitExtraAllocTiles();
+  stream_ << prologue_content;
   stream_ << body_content;
   stream_ << GetIndent() << "return\n";
 
