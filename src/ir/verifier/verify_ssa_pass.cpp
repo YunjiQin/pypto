@@ -23,6 +23,7 @@
 #include "pypto/ir/function.h"
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/program.h"
+#include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/base/visitor.h"
@@ -123,10 +124,24 @@ class SSAVerifier : public IRVisitor {
     if (!type) return;
     if (auto tensor_type = As<TensorType>(type)) {
       for (const auto& dim : tensor_type->shape_) {
-        if (auto var = As<Var>(dim)) {
-          DefineVar(var);
-        }
+        RegisterShapeExprVars(dim);
       }
+    }
+  }
+
+  /**
+   * @brief Recursively register every Var leaf in a (possibly composite) shape
+   * dimension expression (e.g. `M * 2`, `M + N`), not just bare `Var` dims.
+   */
+  void RegisterShapeExprVars(const ExprPtr& dim) {
+    if (!dim) return;
+    if (auto var = As<Var>(dim)) {
+      DefineVar(var);
+    } else if (auto binary = As<BinaryExpr>(dim)) {
+      RegisterShapeExprVars(binary->left_);
+      RegisterShapeExprVars(binary->right_);
+    } else if (auto unary = As<UnaryExpr>(dim)) {
+      RegisterShapeExprVars(unary->operand_);
     }
   }
 

@@ -729,5 +729,87 @@ class TestValidScopePatterns:
         passes.run_verifier()(After)
 
 
+class TestCompositeShapeDimVerification:
+    """SSA verification of dynamic shape vars embedded in parameter types.
+
+    The verifier registers dynamic shape vars from parameter (and return)
+    TensorType shapes in the outermost scope. A composite dim such as ``M * 2``
+    is a ``BinaryExpr``, not a bare ``Var``, so the inner ``M`` must be
+    collected recursively — otherwise any reference to it (including the verifier
+    walking the parameter type itself) reports "used outside its defining scope".
+    """
+
+    def test_bare_var_param_shape_dim_passes(self):
+        """Baseline: a bare ``Var`` parameter shape dim verifies cleanly."""
+        m = pl.dynamic("M")
+        n = pl.dynamic("N")
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[m, n], pl.FP32],
+                output: pl.Tensor[[m, n], pl.FP32],
+            ) -> pl.Tensor[[m, n], pl.FP32]:
+                a_tile = pl.load(a, [0, 0], [128, 128])
+                out = pl.store(a_tile, [0, 0], output)
+                return out
+
+        After = passes.convert_to_ssa()(Before)
+        passes.run_verifier()(After)
+
+    def test_composite_param_shape_dim_passes(self):
+        """A composite parameter shape dim (``M * 2``) verifies cleanly.
+
+        The body uses only static bounds, so the inner ``M`` is referenced
+        solely by the parameter type — exercising the verifier's recursive
+        registration of the composite dim.
+        """
+        m = pl.dynamic("M")
+        n = pl.dynamic("N")
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[m * 2, n], pl.FP32],
+                output: pl.Tensor[[m * 2, n], pl.FP32],
+            ) -> pl.Tensor[[m * 2, n], pl.FP32]:
+                a_tile = pl.load(a, [0, 0], [128, 128])
+                out = pl.store(a_tile, [0, 0], output)
+                return out
+
+        After = passes.convert_to_ssa()(Before)
+        passes.run_verifier()(After)
+
+    def test_composite_param_shape_inner_var_used_in_body_passes(self):
+        """The inner var of a composite parameter dim is usable in the body.
+
+        ``M`` appears inside the composite param dim ``M * 2`` and is also
+        referenced directly in the body (as a ``valid_shapes`` bound). The
+        recursive registration makes ``M`` visible in the outermost scope, so
+        the body reference verifies cleanly.
+        """
+        m = pl.dynamic("M")
+        n = pl.dynamic("N")
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[m * 2, n], pl.FP32],
+                output: pl.Tensor[[m * 2, n], pl.FP32],
+            ) -> pl.Tensor[[m * 2, n], pl.FP32]:
+                a_tile = pl.load(a, [0, 0], [128, 128], valid_shapes=[m, n])
+                out = pl.store(a_tile, [0, 0], output)
+                return out
+
+        After = passes.convert_to_ssa()(Before)
+        passes.run_verifier()(After)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
