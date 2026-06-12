@@ -36,6 +36,11 @@ The codegen generates MLIR in the following fixed order:
 3. **Allocations**: `pto.alloc_tile` for all tile buffers (based on MemRef)
 4. **Operations**: Function body with load, compute, store operations
 
+The tensor-view and allocation prologue is rendered into a buffer *before* the
+constants block is finalized, so a constant that appears only inside a shape or
+stride expression — e.g. the `2` in a composite parameter dim `M * 2` — is still
+declared in the constants block before its use.
+
 ## Architecture
 
 ### Class Structure
@@ -221,7 +226,8 @@ For each `TensorType` parameter, the codegen generates:
 
 - Shape from `TensorType.shape_`
 - Strides computed as row-major: `[dim1, 1]` for 2D tensors
-- Constants (`%c32_index`, `%c1_index`) auto-generated
+- Constants (`%c32_index`, `%c1_index`) auto-generated, including any that appear only inside a composite shape/stride expression
+- Composite dims lower to arithmetic, e.g. `M * 2` → `arith.muli %M, %c2_index`
 - Tensor view type uses `?` for each dimension (e.g., `?x?xf32` for 2D)
 
 #### Layout Handling for 2D Tensors

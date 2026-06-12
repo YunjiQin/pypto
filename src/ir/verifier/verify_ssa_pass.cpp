@@ -129,10 +129,7 @@ class SSAVerifier : public IRVisitor {
     }
   }
 
-  /**
-   * @brief Recursively register every Var leaf in a (possibly composite) shape
-   * dimension expression (e.g. `M * 2`, `M + N`), not just bare `Var` dims.
-   */
+  /// Register every Var leaf in a (possibly composite) shape dim expression.
   void RegisterShapeExprVars(const ExprPtr& dim) {
     if (!dim) return;
     if (auto var = As<Var>(dim)) {
