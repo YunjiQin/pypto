@@ -3635,7 +3635,7 @@ class TestTileTransposeView:
     def test_transpose_view_rejects_1d(self):
         span = ir.Span.unknown()
         src = ir.Var("src", ir.TileType([16], DataType.FP32), span)
-        with pytest.raises(Exception, match="at least 2 dimensions"):
+        with pytest.raises(ValueError, match="at least 2 dimensions"):
             tile.transpose_view(src)
 
 
