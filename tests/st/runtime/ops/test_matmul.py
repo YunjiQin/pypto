@@ -796,6 +796,71 @@ class TestSharedKVMatmul(PTOTestCase):
         tensors["c_pv"][:] = torch.matmul(p, kv)
 
 
+class TestATransMatmul(PTOTestCase):
+    """``c = a^T @ b`` via a 2D ``a_trans=True`` matmul (issue #1776).
+
+    The LHS/Left cube operand loads in its NATURAL (NZ) orientation and is
+    reinterpreted by a zero-copy ``tile.transpose_view`` view (NZ<->ZN), exactly
+    mirroring the b_trans path but on the A operand. Only the b_trans view path
+    had numerical coverage; this validates that the A-operand NZ<->ZN duality is
+    numerically equivalent on real hardware.
+    """
+
+    __test__ = False
+
+    def __init__(self, m: int = 16, k: int = 64, n: int = 128, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+        self.M = m
+        self.K = k
+        self.N = n
+
+    def get_name(self) -> str:
+        return f"a_trans_matmul_{self.M}x{self.K}x{self.N}"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        M, K, N = self.M, self.K, self.N
+        return [
+            TensorSpec("a", [K, M], DataType.FP32, init_value=torch.randn),
+            TensorSpec("b", [K, N], DataType.FP32, init_value=torch.randn),
+            TensorSpec("c", [M, N], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        M, K, N = self.M, self.K, self.N
+
+        @pl.program
+        class ATransProgram:
+            @pl.function(type=pl.FunctionType.InCore)
+            def a_trans_mm(
+                self,
+                a: pl.Tensor[[K, M], pl.FP32],
+                b: pl.Tensor[[K, N], pl.FP32],
+                c: pl.Out[pl.Tensor[[M, N], pl.FP32]],
+            ) -> pl.Tensor[[M, N], pl.FP32]:
+                # a_trans=True: a loads natural (NZ) and is reinterpreted as its
+                # transpose via a zero-copy tile.transpose_view view (NZ<->ZN).
+                cm = pl.matmul(a, b, a_trans=True, out_dtype=pl.FP32)  # a^T @ b -> [M, N]
+                out_c = pl.assemble(c, cm, offset=[0, 0])
+                return out_c
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def orchestrator(
+                self,
+                a: pl.Tensor[[K, M], pl.FP32],
+                b: pl.Tensor[[K, N], pl.FP32],
+                c: pl.Out[pl.Tensor[[M, N], pl.FP32]],
+            ) -> pl.Tensor[[M, N], pl.FP32]:
+                out_c = self.a_trans_mm(a, b, c)
+                return out_c
+
+        return ATransProgram
+
+    def compute_expected(self, tensors, params=None):
+        a = tensors["a"].to(torch.float32)
+        b = tensors["b"].to(torch.float32)
+        tensors["c"][:] = torch.matmul(a.T, b)
+
+
 class TestMatmulOperations:
     """Test suite for matrix multiplication (matmul) operations."""
 
@@ -902,6 +967,18 @@ class TestMatmulOperations:
         """
         cfg = RunConfig(platform=platform, rtol=1e-3, atol=1e-3)
         result = test_runner.run(TestSharedKVMatmul(m=m, k=k, n=n, platform=platform, config=cfg))
+        assert result.passed, f"Test failed: {result.error}"
+
+    # --- a_trans NZ<->ZN view test (#1776) -------------------------------------
+
+    @pytest.mark.parametrize("platform", PLATFORMS)
+    @pytest.mark.parametrize("m,k,n", [(16, 64, 128), (16, 128, 64)])
+    def test_a_trans_matmul(self, test_runner, platform, m, k, n):
+        """2D a_trans=True matmul: the LHS loads natural and is reinterpreted by a
+        zero-copy NZ<->ZN view on the Left cube operand, mirroring the b_trans
+        view but on the A side (#1776). Validates a_trans view numerics."""
+        cfg = RunConfig(platform=platform, rtol=1e-3, atol=1e-3)
+        result = test_runner.run(TestATransMatmul(m=m, k=k, n=n, platform=platform, config=cfg))
         assert result.passed, f"Test failed: {result.error}"
 
 
