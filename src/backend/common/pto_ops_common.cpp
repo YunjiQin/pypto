@@ -3769,24 +3769,33 @@ void RegisterPTOOps(Backend& backend, const std::unordered_set<std::string>& exc
     CHECK(op->args_.size() == 2) << "Operation:[tile.reshape] requires 2 arguments (tile, shape), but got "
                                  << op->args_.size();
     std::string result_target = codegen.GetCurrentResultTarget();
-    std::string result_type = codegen.GetCurrentResultTileBufTypeStringFromTileType();
 
-    // With per-var alloc model, the result variable already has a pre-declared
-    // alloc_tile with the correct reshaped type and shared addr. If the types
-    // match, the reshape is a no-op at the PTO level.
+    // Derive the result type from the result var's TileType so a MemRef-less
+    // result (a zero-copy view over a tpop slot) still gets a type — the shared
+    // helper only returns one for alloc-backed results. Also note whether the
+    // result is alloc-backed: the reshape is a PTO-level no-op only then (the
+    // per-var alloc model pre-declared it with the reshaped type at a shared
+    // addr); a MemRef-less result has no alloc, so it must emit pto.treshape.
+    std::string result_type;
+    bool result_has_memref = false;
+    if (auto result_var = codegen.GetCurrentResultVar()) {
+      if (auto result_tile = ir::As<ir::TileType>(result_var->GetType())) {
+        result_type = codegen.GetTileBufTypeStringFromTileType(result_tile);
+        result_has_memref = result_tile->memref_.has_value();
+      }
+    }
     auto existing_type = codegen.GetSSATileBufType(result_target);
-    if (!existing_type.empty() && existing_type == result_type) {
+    if (result_has_memref && !existing_type.empty() && existing_type == result_type) {
       return std::string("");
     }
 
-    // Fallback: emit pto.treshape for cases without pre-declared alloc
+    // Fallback: emit pto.treshape. Derive the source type from its TileType so a
+    // MemRef-less source (a tpop result) still gets its `: src -> dst` annotation.
     std::string src = codegen.GetExprAsCode(op->args_[0]);
     std::string src_type;
     if (auto src_var = AsVarLike(op->args_[0])) {
       if (auto tile_type = ir::As<ir::TileType>(src_var->GetType())) {
-        if (tile_type->memref_.has_value()) {
-          src_type = codegen.GetTileBufTypeStringFromTileType(tile_type);
-        }
+        src_type = codegen.GetTileBufTypeStringFromTileType(tile_type);
       }
     }
 

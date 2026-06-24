@@ -377,6 +377,12 @@ class InitMemRefMutator : public IRMutator {
       if (As<TileType>(op->var_->GetType())) {
         auto result = ShareMemRefFrom(value_var, op, new_value);
         if (result) return result;
+        // The aliased tile is MemRef-less (e.g. a tpop result): the alias owns no
+        // buffer either, so it stays MemRef-less rather than getting a fresh,
+        // disconnected one.
+        if (!GetTypeMemRef(value_var->GetType()).has_value()) {
+          return MakeMemRefLessAssign(op, new_value);
+        }
       }
     }
 
@@ -649,10 +655,17 @@ class HasMemRefsVerifier : public IRVisitor {
   // tile MemRef) and any zero-copy view chained off such a result legitimately
   // carry no MemRef.
   [[nodiscard]] bool IsBufferLessByDesign(const AssignStmtPtr& op) const {
+    // A plain alias `a = b` of a buffer-less tile is itself buffer-less.
+    if (auto in = AsVarLike(op->value_); in && buffer_less_.count(in.get()) > 0) {
+      return true;
+    }
     auto call = std::dynamic_pointer_cast<const Call>(op->value_);
     if (!call || !call->op_) return false;
     if (call->op_->name_ == "tile.tpop_from_aic" || call->op_->name_ == "tile.tpop_from_aiv") return true;
-    if (IsViewOperation(call->op_->name_) && !call->args_.empty()) {
+    // A zero-copy view chained off a buffer-less tile stays buffer-less, except a
+    // data-permuting view (tile.transpose) — pto.ttrans needs a distinct buffer.
+    if (IsViewOperation(call->op_->name_) && !IsDataPermutingInheritOp(call->op_->name_) &&
+        !call->args_.empty()) {
       auto in = AsVarLike(call->args_[0]);
       if (in && buffer_less_.count(in.get()) > 0) {
         return true;

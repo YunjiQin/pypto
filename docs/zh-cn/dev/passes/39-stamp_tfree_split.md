@@ -35,8 +35,9 @@ t = tile.tpop_from_aic(split=1, id=2)
 system.tfree_to_aic(t, split=1, id=2)
 ```
 
-若某个 `tfree` 已携带一个与其 tpop 的 id 不一致的显式 `id`,pass 会报错(用户错误)——这与
-codegen 过去执行的一致性校验相同。
+若某个 `tfree` 已携带一个与其 tpop 的 id 不一致的显式 `id`,pass 会报错(用户错误)。它也会拒绝
+方向与来源 tpop 不匹配的 `tfree`(例如对 `tpop_from_aic` 的结果用 `tfree_to_aiv`),以及 tile 找
+不到来源 tpop 的 `tfree`。这些都是 codegen 过去执行的一致性校验。
 
 ## 为什么用一个靠后的统一 pass
 

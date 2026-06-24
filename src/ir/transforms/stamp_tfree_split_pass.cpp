@@ -69,8 +69,14 @@ class StampTfreeSplitMutator : public IRMutator {
     if (!call || !op_predicates::IsTFree(call) || call->args_.empty()) return base;
     auto tile = AsVarLike(call->args_[0]);
     if (!tile) return base;
+    // Fail fast on missing provenance: codegen reads split/id straight from the
+    // tfree op now, so a tfree with no traceable originating tpop would silently
+    // emit a default split rather than surface the malformed IR.
     auto it = tpop_info_.find(tile.get());
-    if (it == tpop_info_.end()) return base;
+    CHECK_SPAN(it != tpop_info_.end(), call->span_)
+        << call->op_->name_
+        << " requires its tile argument to come from a matching tile.tpop_from_ai{c,v}, "
+           "but no originating tpop was found";
     const auto& info = it->second;
 
     const std::string expected_tpop =

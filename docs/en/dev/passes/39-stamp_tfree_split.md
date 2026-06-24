@@ -40,8 +40,10 @@ system.tfree_to_aic(t, split=1, id=2)
 ```
 
 If a `tfree` already carries an explicit `id` that disagrees with its tpop's id,
-the pass raises (a user error) — this is the same consistency check that codegen
-used to perform.
+the pass raises (a user error). It also rejects a `tfree` whose direction does not
+match its originating tpop (e.g. `tfree_to_aiv` over a `tpop_from_aic` result),
+and a `tfree` whose tile has no traceable originating tpop. These are the same
+consistency checks codegen used to perform.
 
 ## Why a single late pass
 

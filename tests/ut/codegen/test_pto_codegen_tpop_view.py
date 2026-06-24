@@ -118,6 +118,14 @@ def test_pto_codegen_reshape_over_tpop_lowers_to_treshape():
         "a view over a tpop result must not allocate a buffer; got:\n" + consumer
     )
 
+    # Each treshape carries its `: src_type -> dst_type` annotation (the source is
+    # MemRef-less, so the type must come from the TileType, not the MemRef).
+    for line in consumer.splitlines():
+        if "pto.treshape" in line:
+            assert " : " in line and " -> " in line, (
+                "pto.treshape must carry its source/result type annotation; got:\n" + line
+            )
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
