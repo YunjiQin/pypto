@@ -383,7 +383,60 @@ class ChipWorker(Worker):
                 ``compiled.runtime_name`` != ``self.runtime``.
             RuntimeError: ChipWorker not initialized.
         """
-        self._require_initialized("run")
+        outputs, _timing = self._dispatch(compiled, args, config, op="run")
+        return outputs
+
+    def run_timed(
+        self,
+        compiled: CompiledProgram,
+        *args: CallArg,
+        config: RunConfig | None = None,
+    ) -> tuple[Any, Any]:
+        """Like :meth:`run`, but also return the dispatch ``RunTiming``.
+
+        Timing-returning sibling of :meth:`run` for the register-once +
+        rounds benchmark pattern (issue #1858): register the program once
+        (``worker.register(...)`` / first dispatch caches the cid), then call
+        this in a loop to read each launch's device time without re-paying
+        register/load. :meth:`run`'s tensor-return contract is unchanged —
+        timing is opt-in via this entry point.
+
+        Returns ``(outputs, timing)`` where *outputs* matches :meth:`run`
+        exactly (``None`` for in-place calls, a single ``torch.Tensor`` for
+        one-output return-style calls, or a tuple of tensors otherwise) and
+        *timing* is the simpler ``RunTiming`` (``host_wall_us`` /
+        ``device_wall_us``).
+
+        .. note::
+           This is L2 single-chip only — ``device_wall_us`` is the real on-NPU
+           orchestrator wall, ``0`` only on a runtime built without
+           ``PTO2_PROFILING``. L3+ ``DistributedWorker`` does not support
+           ``run_timed`` (the base :meth:`Worker.run_timed` raises).
+
+        Raises:
+            ValueError: ``compiled.platform`` != ``self.platform`` or
+                ``compiled.runtime_name`` != ``self.runtime``.
+            RuntimeError: ChipWorker not initialized.
+        """
+        return self._dispatch(compiled, args, config, op="run_timed")
+
+    def _dispatch(
+        self,
+        compiled: CompiledProgram,
+        args: tuple[CallArg, ...],
+        config: RunConfig | None,
+        *,
+        op: str,
+    ) -> tuple[Any, Any]:
+        """Shared dispatch core for :meth:`run` / :meth:`run_timed`.
+
+        Returns ``(outputs, timing)``: *outputs* follows :meth:`run`'s contract
+        and *timing* is the simpler ``RunTiming`` from :meth:`_run_chip`. The
+        only difference between the two public methods is whether they keep
+        *timing*. *op* is the calling method name, used so the
+        not-initialized error names the public entry point the caller used.
+        """
+        self._require_initialized(op)
         self._check_binding(compiled)
 
         # Import lazily to avoid a cycle: compiled_program imports from
@@ -399,7 +452,7 @@ class ChipWorker(Worker):
 
         orch_args, coerced, return_style = compiled.build_orch_args(*args)
         cfg = compiled.build_call_config(rc, dfx_dir=dfx_dir)
-        self._run_chip(compiled.chip_callable, orch_args, cfg)
+        timing = self._run_chip(compiled.chip_callable, orch_args, cfg)
 
         if dfx_dir is not None:
             from .runner import _collect_dfx_artifacts, _DfxOpts  # noqa: PLC0415
@@ -407,9 +460,9 @@ class ChipWorker(Worker):
             _collect_dfx_artifacts(dfx_dir, self.platform, _DfxOpts.from_run_config(rc))
 
         if not return_style:
-            return None
+            return None, timing
         outputs = [coerced[i] for i in compiled.output_indices]
-        return outputs[0] if len(outputs) == 1 else tuple(outputs)
+        return (outputs[0] if len(outputs) == 1 else tuple(outputs)), timing
 
     def register(self, compiled: CompiledProgram) -> RegistrationHandle:
         """Pre-register *compiled* on this ChipWorker. Returns a callable handle.
@@ -564,6 +617,20 @@ class RegistrationHandle:
                 "Re-register via worker.register(compiled) to get a fresh handle."
             )
         return self._worker.run(self._compiled, *args, config=config)
+
+    def run_timed(self, *args: Any, config: RunConfig | None = None) -> tuple[Any, Any]:
+        """Dispatch the bound program and return ``(outputs, RunTiming)``.
+
+        Timing-returning sibling of :meth:`__call__`; delegates to
+        :meth:`ChipWorker.run_timed`. The :meth:`__call__` tensor-return
+        contract stays intact — timing is opt-in here (issue #1858).
+        """
+        if self._closed:
+            raise RuntimeError(
+                "RegistrationHandle has been unregistered (or its parent Worker was closed). "
+                "Re-register via worker.register(compiled) to get a fresh handle."
+            )
+        return self._worker.run_timed(self._compiled, *args, config=config)
 
     def unregister(self) -> None:
         """Mark this handle closed. Idempotent.

@@ -73,6 +73,121 @@ def test_run_chip_forwards_impl_run_result():
 
 
 # ---------------------------------------------------------------------------
+# ChipWorker.run_timed / RegistrationHandle.run_timed — opt-in timing on the
+# register-once path (issue #1858). run() / __call__ keep returning outputs
+# only; run_timed surfaces the (outputs, RunTiming) pair without re-paying
+# register/load per launch.
+# ---------------------------------------------------------------------------
+
+
+def _bare_chip_worker(return_style: bool, *, run_chip_timing=_TIMING_SENTINEL):
+    """A ChipWorker with device setup bypassed and dispatch internals stubbed.
+
+    ``build_orch_args`` / ``build_call_config`` come off the *compiled* mock;
+    ``_run_chip`` is stubbed to return *run_chip_timing*. ``output_indices`` and
+    a single coerced tensor let the output-packing path run for return-style.
+    """
+    from pypto.runtime.worker import ChipWorker  # noqa: PLC0415
+
+    worker = ChipWorker.__new__(ChipWorker)  # bypass __init__/device setup
+    worker._initialized = True
+    worker._run_chip = MagicMock(name="_run_chip", return_value=run_chip_timing)
+    worker._check_binding = MagicMock(name="_check_binding")
+
+    sentinel_out = object()
+    compiled = MagicMock(name="CompiledProgram")
+    # build_orch_args -> (orch_args, coerced, return_style)
+    compiled.build_orch_args.return_value = (
+        MagicMock(name="orch_args"),
+        [sentinel_out],
+        return_style,
+    )
+    compiled.build_call_config.return_value = MagicMock(name="cfg")
+    compiled.output_indices = [0]
+    return worker, compiled, sentinel_out
+
+
+@requires_simpler
+def test_chip_worker_run_timed_returns_outputs_and_timing():
+    """``run_timed`` returns ``(outputs, timing)`` from the dispatch core."""
+    worker, compiled, sentinel_out = _bare_chip_worker(return_style=True)
+
+    outputs, timing = worker.run_timed(compiled, MagicMock(name="arg"))
+
+    assert outputs is sentinel_out  # single-output return-style → unwrapped
+    assert timing is _TIMING_SENTINEL
+    cast(MagicMock, worker._run_chip).assert_called_once()
+
+
+@requires_simpler
+def test_chip_worker_run_unchanged_after_refactor():
+    """Regression: ``run`` still returns outputs only (not a tuple)."""
+    worker, compiled, sentinel_out = _bare_chip_worker(return_style=True)
+
+    result = worker.run(compiled, MagicMock(name="arg"))
+
+    assert result is sentinel_out  # not a (outputs, timing) tuple
+
+
+@requires_simpler
+def test_chip_worker_run_timed_in_place_returns_none_outputs():
+    """In-place call (no return-style) yields ``(None, timing)``."""
+    worker, compiled, _ = _bare_chip_worker(return_style=False)
+
+    outputs, timing = worker.run_timed(compiled, MagicMock(name="arg"))
+
+    assert outputs is None
+    assert timing is _TIMING_SENTINEL
+
+
+@requires_simpler
+def test_registration_handle_run_timed_forwards():
+    """``RegistrationHandle.run_timed`` forwards to ``worker.run_timed``."""
+    from pypto.runtime.worker import RegistrationHandle  # noqa: PLC0415
+
+    handle = RegistrationHandle.__new__(RegistrationHandle)  # bypass __init__
+    handle._closed = False
+    handle._compiled = MagicMock(name="compiled")
+    sentinel_out = object()
+    handle._worker = MagicMock(name="worker")
+    handle._worker.run_timed.return_value = (sentinel_out, _TIMING_SENTINEL)
+    handle._worker.run.return_value = sentinel_out
+
+    outputs, timing = handle.run_timed(MagicMock(name="arg"))
+    assert outputs is sentinel_out
+    assert timing is _TIMING_SENTINEL
+    handle._worker.run_timed.assert_called_once()
+
+    # __call__ contract unchanged — outputs only.
+    assert handle(MagicMock(name="arg")) is sentinel_out
+
+
+@requires_simpler
+def test_registration_handle_run_timed_closed_raises():
+    """A closed handle rejects ``run_timed`` (same guard as ``__call__``)."""
+    from pypto.runtime.worker import RegistrationHandle  # noqa: PLC0415
+
+    handle = RegistrationHandle.__new__(RegistrationHandle)
+    handle._closed = True
+    handle._worker = MagicMock(name="worker")
+    handle._compiled = MagicMock(name="compiled")
+
+    with pytest.raises(RuntimeError, match="unregistered"):
+        handle.run_timed(MagicMock(name="arg"))
+    handle._worker.run_timed.assert_not_called()
+
+
+@requires_simpler
+def test_base_worker_run_timed_raises_for_unsupported_level():
+    """The ``Worker`` ABC default ``run_timed`` raises (L3 has no device wall)."""
+    from pypto.runtime.distributed_runner import DistributedWorker  # noqa: PLC0415
+
+    rt = DistributedWorker.__new__(DistributedWorker)  # bypass __init__
+    with pytest.raises(NotImplementedError, match="ChipWorker"):
+        rt.run_timed(MagicMock(name="compiled"))
+
+
+# ---------------------------------------------------------------------------
 # execute_on_device — returns the RunTiming on both dispatch paths
 # ---------------------------------------------------------------------------
 
