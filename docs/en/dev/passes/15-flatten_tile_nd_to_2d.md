@@ -55,24 +55,41 @@ Per-statement handling:
 | `tile.create`/`tile.full` (>2D) | Rebuild with flattened 2D shape directly |
 | `tile.sum`/`tile.max`/`tile.min` (>2D) | Remap axis to 1 (last axis of 2D) |
 | `tile.transpose` | Sole owner of `pto.ttrans` scratch materialization. Arrives 3-arg (input, axis1, axis2). **2D**: create one scratch tile (shape = SOURCE page, in the input's memory space) and emit the codegen-ready 4-arg `tile.transpose(in, a1, a2, scratch)`. **>2D** (last-two-axes swap): unroll into per-batch 2D transposes, each a 4-arg form with scratch sliced from a flat `[batch*A, B]` pool, assembled into the merged 2D output. A batch-axis swap is a user error |
-| `tile.batch_matmul` | Expand to per-batch 2D `tile.matmul`, honoring batch broadcast and any operand-side transpose carried in the producer `tile.load(target_memory=Mat, transpose=True)` |
+| `tile.batch_matmul` | Expand to per-batch 2D `tile.matmul`, honoring batch broadcast. A b_trans/a_trans operand arrives as a zero-copy `tile.transpose_view` over a natural load (no transpose-at-load, no copy); the tile-level op carries no transpose semantic. Each operand is handled identically (see operand handling below) |
 | `tile.batch_matmul_acc` | Expand to per-batch 2D `tile.matmul_acc`, slicing the (already-flattened) accumulator per batch index. Memory-space decisions on the accumulator (Vec/Acc round-trips, retargetable producer promotion of an upstream `tile.create`, TileView refresh) are deferred to `InferTileMemorySpace` (pass 17) — flatten emits no inline `tile.move` |
 | Other tile ops (>2D) | Substitute vars, re-create with 2D types |
 | 1D/2D tile ops | Unchanged |
 
-**Operand-load re-emission and dead-load elimination.** For a Mat-memory
-operand (`tile.load(target_memory=Mat)`), the per-batch expansion re-emits a
-fresh 2D load from the original tensor with batch-adjusted offsets rather than
-slicing the rank>2 source tile. That leaves the original full-batch `tile.load`
-dead, so the pass skips emitting it. A load is skip-eligible when **every** use
-is a `tile.batch_matmul[_acc]` operand — including an operand shared across
-multiple matmuls (e.g. the activation `X` feeding both the gate `X@W1` and up
-`X@W3` matmuls of a SwiGLU FFN, `use_count > 1`). Leaving such a shared load
-behind would emit a wasted MTE2 load that survives to the generated matmul
-kernel and reuses a live weight buffer, serializing it on the load pipeline.
-Uses are counted **recursively** (including nested `If`/`For`/`While`/`Scope`
-bodies): a load also consumed inside a nested block is never skipped, since a
-nested non-batch-matmul consumer still needs it.
+**Unified operand handling — whole-fit slice vs. per-batch load.** Every
+batch_matmul operand (lhs or rhs, transposed or not, load- or move-sourced) is
+treated identically. A capacity gate (`BatchOperandsWholeFit`) decides per matmul
+whether both operands' whole tiles fit Mat (L1) together:
+
+- **whole_fits (default):** the operand is brought whole into Mat once and
+  per-batch **sliced** — a row slice for a plain (row-batched `[B*rows, cols]`)
+  operand, a column slice for a `tile.transpose_view` (column-batched
+  `[K, B*N]`) operand. A natural Mat load of a 3D `[B, N, K]` tensor (batch > 1)
+  collapses its source window to 2D `[B*N, K]` so the hardware ND2NZ path sees a
+  2-dim GlobalTensor; codegen emits a matching 2D `make_tensor_view`. A broadcast
+  operand reuses its single page.
+- **!whole_fits (large operands, load-sourced):** the whole tile would overflow
+  L1, so the operand is **loaded per batch** from its underlying natural
+  `tile.load` (a per-batch `[1, .., X, Y]` window → 2D `[X, Y]`), with a per-batch
+  `tile.transpose_view` when transposed. The dead whole load/view is then dropped.
+
+**Dead-load elimination (!fit only).** When `!whole_fits` re-emits per-batch
+loads, the original whole load/view becomes dead and the pass drops it. A chain
+is drop-eligible when **every** use is a `tile.batch_matmul[_acc]` operand (the
+chain `tile.load → tile.transpose_view` is walked back), and it is dropped only
+when **every** consuming matmul is `!fit` — a chain shared with any fit matmul
+stays whole. Uses are counted **recursively** (including nested
+`If`/`For`/`While`/`Scope` bodies) so a load also consumed in a nested block is
+never dropped. The capacity gate is backend-gated: with no backend configured
+(most unit tests) it always reports fit, keeping the simpler whole+slice path.
+
+> The per-batch V2C move case (a move-sourced operand that does not fit L1) is a
+> deferred follow-up; such an operand currently stays on the whole-slice path,
+> correct only while the moved tile fits the fixed cross-core ring.
 
 ## Example
 

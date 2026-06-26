@@ -208,13 +208,9 @@ std::vector<TypePtr> FindYieldTypes(const std::vector<StmtPtr>& stmts) {
  * @brief Resolved consumer memory space requirement for a variable.
  */
 struct ConsumerSpaceReq {
-  MemorySpace space;       ///< Required memory space
-  bool transpose = false;  ///< Bake transpose into the consumer-driven load.
-                           ///< Only set for ND (batch_matmul) b_trans operands: those
-                           ///< take the legacy transpose-at-load path. A 2D tile.matmul
-                           ///< b_trans operand keeps transpose=false here and is
-                           ///< reinterpreted by a zero-copy tile.transpose_view view in
-                           ///< BridgeInputSpaces instead (issue #1776).
+  MemorySpace space;  ///< Required memory space. The consumer-driven load is always
+                      ///< natural; a transposed (b_trans/a_trans) operand is realised
+                      ///< by a zero-copy tile.transpose_view in BridgeInputSpaces.
 };
 
 /**
@@ -297,30 +293,19 @@ class ConsumerSpaceCollector : public IRVisitor {
       return;
     }
 
-    // An operand of rank > 2 makes this matmul lower to tile.batch_matmul (ND),
-    // which keeps the legacy transpose-at-load path; a 2D tile.matmul instead
-    // uses a zero-copy tile.transpose_view view added in BridgeInputSpaces (#1776).
-    // So a consumer-driven load bakes the transpose ONLY for the ND case.
-    bool consumer_is_nd = false;
-    for (const auto& a : call->args_) {
-      if (auto tt = As<TensorType>(a->GetType()); tt && tt->shape_.size() > 2) {
-        consumer_is_nd = true;
-        break;
-      }
-    }
+    // Both 2D tile.matmul and ND tile.batch_matmul realise a transposed operand
+    // as a zero-copy tile.transpose_view added in BridgeInputSpaces (issues #1776
+    // / ND extension): the consumer-driven load is ALWAYS natural, and the view
+    // supplies the transpose. (No more transpose-at-load baking.)
     for (const auto& [idx, req] : entry->input_reqs) {
       if (idx >= call->args_.size()) continue;
       if (auto var = As<Var>(call->args_[idx])) {
-        const bool want_transpose = req.trans_kwarg ? call->GetKwarg<bool>(*req.trans_kwarg, false) : false;
-        // 2D matmul: natural load (transpose=false), transpose_view compensates later.
-        // ND batch_matmul: bake the transpose into the load (legacy), no view.
-        const bool transpose = want_transpose && consumer_is_nd;
         // Prioritize non-Vec spaces: if an existing requirement is the default Vec but this
         // consumer needs a specialized space (Mat/Left/Right/Acc/Bias), override it so the
         // load-like producer can emit the specialized space directly.
-        auto [it, inserted] = consumer_reqs_.try_emplace(var.get(), ConsumerSpaceReq{req.space, transpose});
+        auto [it, inserted] = consumer_reqs_.try_emplace(var.get(), ConsumerSpaceReq{req.space});
         if (!inserted && it->second.space == MemorySpace::Vec && req.space != MemorySpace::Vec) {
-          it->second = ConsumerSpaceReq{req.space, transpose};
+          it->second = ConsumerSpaceReq{req.space};
         }
       }
     }
@@ -641,11 +626,10 @@ class TensorToTileMutator : public TypePropagatingMutator {
     const auto& offset_arg = call->args_[2];
     ExprPtr valid_shapes = (call->args_.size() == 4) ? call->args_[3] : shape_arg;
 
-    // req.transpose is set only for ND (batch_matmul) b_trans operands (legacy
-    // transpose-at-load); 2D matmul operands load natural here and get a
-    // zero-copy tile.transpose_view view at the matmul site instead (issue #1776).
+    // The consumer-driven load is always natural; a transposed (b_trans/a_trans)
+    // operand gets a zero-copy tile.transpose_view at the matmul site instead.
     std::vector<std::pair<std::string, std::any>> load_kwargs = {{"target_memory", req.space},
-                                                                 {"transpose", req.transpose}};
+                                                                 {"transpose", false}};
     auto load_call = op_registry_.Create("tile.load", {input, offset_arg, shape_arg, valid_shapes},
                                          load_kwargs, call->span_);
 
@@ -668,18 +652,12 @@ class TensorToTileMutator : public TypePropagatingMutator {
     std::vector<StmtPtr> stmts;
 
     // An operand of rank > 2 means this matmul lowers to tile.batch_matmul, not
-    // tile.matmul (see the rank dispatch in op_conversion_registry.cpp). The
-    // zero-copy transpose_view rework targets 2D tile.matmul only (issue #1776);
-    // batch_matmul keeps the legacy transpose-at-load path.
-    bool is_nd = false;
-    for (const auto& a : args) {
-      if (auto tt = As<TensorType>(a->GetType())) {
-        if (tt->shape_.size() > 2) is_nd = true;
-      } else if (auto tl = As<TileType>(a->GetType())) {
-        if (tl->shape_.size() > 2) is_nd = true;
-      }
-      if (is_nd) break;
-    }
+    // tile.matmul (see the rank dispatch in op_conversion_registry.cpp).
+    //
+    // Both 2D tile.matmul AND ND tile.batch_matmul realise a transposed operand
+    // as a zero-copy tile.transpose_view over ONE natural load/move (issues #1776
+    // / ND extension). FlattenTileNdTo2D slices the whole transposed view per
+    // batch; the tile-level (batch_)matmul carries no transpose semantic.
 
     // Emit a `tile.load` of `arg` (TensorType) into `space`, append its AssignStmt,
     // and return the bound load Var.
@@ -735,26 +713,19 @@ class TensorToTileMutator : public TypePropagatingMutator {
     for (size_t idx : sorted_indices) {
       const auto& req = input_reqs.at(idx);
       if (idx >= args.size()) continue;
-      const bool want_transpose = req.trans_kwarg ? call->GetKwarg<bool>(*req.trans_kwarg, false) : false;
+      const bool use_view = req.trans_kwarg ? call->GetKwarg<bool>(*req.trans_kwarg, false) : false;
       auto tensor_type = As<TensorType>(args[idx]->GetType());
 
-      // 2D tile.matmul realises a transposed Mat operand as a zero-copy
-      // tile.transpose_view over ONE natural load (issue #1776). ND
-      // (batch_matmul) keeps the legacy transpose-at-load path for GM operands.
-      const bool use_view = want_transpose && !is_nd;
-
       if (tensor_type) {
-        // GM operand: 2D loads natural then views; ND bakes the transpose into
-        // the load. (no transpose -> natural load, passed through.)
-        auto loaded =
-            emit_load(args[idx], tensor_type, req.space, /*transpose=*/want_transpose && is_nd, idx);
+        // GM operand: load NATURAL (2D and ND alike), then reinterpret as its
+        // transpose with a zero-copy view when b_trans/a_trans.
+        auto loaded = emit_load(args[idx], tensor_type, req.space, /*transpose=*/false, idx);
         args[idx] = use_view ? emit_view(loaded) : loaded;
         continue;
       }
 
-      // Tile operand. Only the 2D view path rewrites a transposed tile operand
-      // here; ND tile operands are left untouched (out of scope for now). A
-      // non-transposed operand also passes through.
+      // Tile operand. Only a transposed operand needs rewriting; a non-transposed
+      // tile passes through.
       if (!use_view) continue;
       auto var = As<Var>(args[idx]);
       if (!var) continue;  // non-Var tile expr: leave as-is

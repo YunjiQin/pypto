@@ -1457,6 +1457,28 @@ static std::string MakeTileLoadCodegenPTO(const CallPtr& op, codegen::CodegenBas
   std::string tensor_view_type = codegen.GetTensorViewTypeString(tensor_type.get());
   std::string tile_buf_type = codegen.GetCurrentResultTileBufTypeString();
 
+  // When FlattenTileNdTo2D collapsed a natural ND load's source window to 2D
+  // (the load shapes/offsets rank dropped below the param's declared rank), the
+  // shared param tensor_view is still ND, but the hardware ND2NZ path needs a
+  // 2-dim GlobalTensor. Emit a fresh 2D contiguous tensor_view (``[prod(leading),
+  // last]`` with strides ``[last, 1]``) over the same base pointer and use it for
+  // the partition below. Valid because the flatten collapse only fires when the
+  // inner window dims span the full contiguous tensor extent.
+  if (ndim < tensor_type->shape_.size()) {
+    auto shape_codes = GetSizeCodes(shapes_tuple->elements_, codegen);
+    INTERNAL_CHECK_SPAN(ndim == 2 && shape_codes.size() == 2, op->span_)
+        << "tile.load 2D source-window collapse expects a 2D window, got rank " << ndim;
+    std::string one = codegen.GetOrEmitConstant(static_cast<int64_t>(1), DataType::INDEX);
+    std::string view2d = codegen.NewNamedTemp(tensor->name_hint_ + "_view2d");
+    std::ostringstream mtv;
+    mtv << view2d << " = pto.make_tensor_view " << codegen.GetVarName(tensor) << ", shape = ["
+        << shape_codes[0] << ", " << shape_codes[1] << "], strides = [" << shape_codes[1] << ", " << one
+        << "] {layout = #pto.layout<nd>}: !pto.tensor_view<?x?x" << dtype_str << ">";
+    codegen.Emit(mtv.str());
+    tensor_view = view2d;
+    tensor_view_type = "!pto.tensor_view<?x?x" + dtype_str + ">";
+  }
+
   // RFC #1300 P7: the IR's offsets / shapes / valid_shapes are already in
   // canonical coordinates (matching the source TensorType's shape). There is
   // no implicit dn_swap here — ``LowerTransposeLoadParamLayout`` (P6) is

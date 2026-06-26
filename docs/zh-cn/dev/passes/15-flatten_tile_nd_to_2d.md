@@ -54,21 +54,35 @@ program_2d = flatten_pass(program)
 | `tile.create`/`tile.full`（>2D） | 直接使用展平的 2D 形状重建 |
 | `tile.sum`/`tile.max`/`tile.min`（>2D） | 将 axis 映射为 1（2D 的最后轴） |
 | `tile.transpose` | `pto.ttrans` scratch 物化的唯一归属。进入时为 3-arg（input, axis1, axis2）。**2D**：创建一块 scratch tile（shape = 源页，位于输入所在 memory），产出 codegen-ready 的 4-arg `tile.transpose(in, a1, a2, scratch)`。**>2D**（末两轴交换）：展开为逐 batch 的 2D transpose，每个都是 4-arg 形态，scratch 从扁平 `[batch*A, B]` 池中切片，再 assemble 进合并后的 2D 输出。交换 batch 轴属用户错误 |
-| `tile.batch_matmul` | 展开为逐 batch 的 2D `tile.matmul`，处理 batch broadcast；operand 的 transpose 通过生产侧 `tile.load(target_memory=Mat, transpose=True)` 携带 |
+| `tile.batch_matmul` | 展开为逐 batch 的 2D `tile.matmul`，处理 batch broadcast。b_trans/a_trans 操作数以一个零拷贝 `tile.transpose_view`（覆盖在自然 load 之上）出现（不再 transpose-at-load、不搬数据）；tile 级算子本身无 transpose 语义。每个操作数处理方式一致（见下方操作数处理） |
 | `tile.batch_matmul_acc` | 展开为逐 batch 的 2D `tile.matmul_acc`，按 batch 索引切分（已展平的）累加器。累加器上的内存空间决策（Vec/Acc 来回搬运、上游 `tile.create` 的可重定向生产者改写、TileView 刷新）交由 `InferTileMemorySpace`（pass 17）负责 —— 本 pass 不再发射任何 `tile.move` |
 | 其他 Tile 操作（>2D） | 替换变量，使用 2D 类型重新创建 |
 | 1D/2D Tile 操作 | 不变 |
 
-**操作数 load 重新发射与死 load 消除。** 对于 Mat 内存的操作数
-（`tile.load(target_memory=Mat)`），逐 batch 展开会从原始张量按 batch 调整偏移后
-重新发射一个全新的 2D load，而不是对 rank>2 的源 tile 做切分。这样原始的全 batch
-`tile.load` 就变成死代码，因此 pass 跳过发射它。当一个 load 的**每一处**使用都是
-`tile.batch_matmul[_acc]` 的操作数时即可跳过 —— 包括被多个 matmul 共享的操作数
-（例如 SwiGLU FFN 中同时喂给 gate `X@W1` 与 up `X@W3` 两个 matmul 的激活 `X`，
-`use_count > 1`）。若保留这种共享 load，会在生成的 matmul kernel 中发射一次多余的
-MTE2 load，并复用一个仍存活的权重 buffer，从而在 load 流水线上对其造成串行化。
-使用次数按**递归**统计（含嵌套的 `If`/`For`/`While`/`Scope` 体）：若某个 load 还在
-嵌套块内被使用，则绝不跳过 —— 嵌套块中的非 batch-matmul 消费者仍然需要它。
+**统一的操作数处理 —— 整块切片 vs 逐 batch load。** 每个 batch_matmul 操作数
+（lhs 或 rhs、转置与否、来自 load 或 move）处理方式完全一致。容量门
+（`BatchOperandsWholeFit`）按 matmul 判定两个操作数的整块 tile 能否一起放进
+Mat（L1）：
+
+- **whole_fits（默认）**：操作数整块进 Mat 一次，再按 batch **切片** —— 普通
+  （行批 `[B*rows, cols]`）操作数行切，`tile.transpose_view`（列批 `[K, B*N]`）
+  操作数列切。3D `[B, N, K]` 张量（batch > 1）的自然 Mat load 会把源窗口塌成 2D
+  `[B*N, K]`，让硬件 ND2NZ 路径看到 2 维 GlobalTensor；codegen 同步发射 2D
+  `make_tensor_view`。广播操作数复用其单页。
+- **!whole_fits（大操作数，load 来源）**：整块会撑爆 L1，故从底层自然 `tile.load`
+  **逐 batch load**（每 batch `[1, .., X, Y]` 窗口 → 2D `[X, Y]`），转置时再加逐
+  batch `tile.transpose_view`。随后丢弃死掉的整块 load/view。
+
+**死 load 消除（仅 !fit）。** 当 `!whole_fits` 逐 batch 重发 load 时，原始整块
+load/view 变为死代码并被丢弃。一条链（`tile.load → tile.transpose_view`，会向上
+回溯）在其**每一处**使用都是 `tile.batch_matmul[_acc]` 操作数时才可丢弃，且仅当其
+**所有**消费 matmul 都为 `!fit` 时才丢（与任一 fit matmul 共享的链保持整块）。
+使用次数按**递归**统计（含嵌套的 `If`/`For`/`While`/`Scope` 体），故嵌套块内也被
+使用的 load 绝不丢弃。容量门按后端门控：无后端配置（多数单测）时恒判为 fit，保留
+更简单的整块+切片路径。
+
+> 逐 batch 的 V2C move（move 来源且放不下 L1 的操作数）是后续待办；此类操作数目前
+> 仍走整块切片路径，仅在被搬运的整块 tile 放得下固定跨核 ring 时正确。
 
 ## 示例
 
