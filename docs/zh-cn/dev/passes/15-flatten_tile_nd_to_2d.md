@@ -66,9 +66,10 @@ Mat（L1）：
 
 - **whole_fits（默认）**：操作数整块进 Mat 一次，再按 batch **切片** —— 普通
   （行批 `[B*rows, cols]`）操作数行切，`tile.transpose_view`（列批 `[K, B*N]`）
-  操作数列切。3D `[B, N, K]` 张量（batch > 1）的自然 Mat load 会把源窗口塌成 2D
-  `[B*N, K]`，让硬件 ND2NZ 路径看到 2 维 GlobalTensor；codegen 同步发射 2D
-  `make_tensor_view`。广播操作数复用其单页。
+  操作数列切。3D `[B, N, K]` 张量的自然 Mat load 在此**保留 ND 源窗口**；硬件
+  ND2NZ「2 维 GlobalTensor」塌成 `[B*N, K]` 的处理由 `tile.load` codegen 负责
+  —— 当 load 结果为 NZ Mat tile 时触发，并在那里发射 2D `make_tensor_view`，故本
+  pass 只把 load 的**结果 tile** 展平为 2D。广播操作数复用其单页。
 - **!whole_fits（大操作数，load 来源）**：整块会撑爆 L1，故从底层自然 `tile.load`
   **逐 batch load**（每 batch `[1, .., X, Y]` 窗口 → 2D `[X, Y]`），转置时再加逐
   batch `tile.transpose_view`。随后丢弃死掉的整块 load/view。

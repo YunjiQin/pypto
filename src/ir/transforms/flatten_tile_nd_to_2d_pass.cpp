@@ -168,37 +168,6 @@ ExprPtr MakeCanonicalIndexAdd(const ExprPtr& lhs, const ExprPtr& rhs, const Span
   return MakeAdd(lhs, rhs, span);
 }
 
-/// Build a canonical index multiply, folding ConstInt cases (0/1 identities and
-/// const*const) to keep merged offsets in clean ConstInt form.
-ExprPtr MakeCanonicalIndexMul(const ExprPtr& lhs, const ExprPtr& rhs, const Span& span) {
-  auto lc = As<ConstInt>(lhs);
-  auto rc = As<ConstInt>(rhs);
-  if (lc && rc) return std::make_shared<ConstInt>(lc->value_ * rc->value_, DataType::INDEX, span);
-  if ((lc && lc->value_ == 0) || (rc && rc->value_ == 0)) {
-    return std::make_shared<ConstInt>(0, DataType::INDEX, span);
-  }
-  if (lc && lc->value_ == 1) return rhs;
-  if (rc && rc->value_ == 1) return lhs;
-  return MakeMul(lhs, rhs, span);
-}
-
-/// Collapse an ND source-window offset ``[o0, .., o_{n-1}]`` into its 2D form
-/// ``[row, last]`` using the source tensor's leading dims as a mixed-radix
-/// stride: ``row = (((o0 * d1) + o1) * d2 + o2) ... + o_{n-2}``, ``last =
-/// o_{n-1}``. This matches the row-major flatten of a contiguous ``[d0, .., d_{n-1}]``
-/// tensor to ``[d0*..*d_{n-2}, d_{n-1}]`` and lets a natural ND ``tile.load``
-/// present a 2-dim GlobalTensor to the hardware ND2NZ path (which rejects rank>2).
-std::vector<ExprPtr> ComputeMergedOffsets(const std::vector<ExprPtr>& offsets,
-                                          const std::vector<ExprPtr>& tensor_dims, const Span& span) {
-  INTERNAL_CHECK(offsets.size() >= 2 && tensor_dims.size() == offsets.size())
-      << "FlattenTileNdTo2D: offset/tensor rank mismatch while collapsing ND load window";
-  ExprPtr row = offsets[0];
-  for (size_t i = 1; i + 1 < offsets.size(); ++i) {
-    row = MakeCanonicalIndexAdd(MakeCanonicalIndexMul(row, tensor_dims[i], span), offsets[i], span);
-  }
-  return {row, offsets.back()};
-}
-
 /// Mat (L1) byte budget for the whole-tile batch_matmul slicing path. Returns the
 /// backend's Mat size when a backend is configured (codegen / ST); otherwise
 /// SIZE_MAX so passes run without a backend (most unit tests) always take the fit
@@ -1955,58 +1924,10 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
         auto flat_tile_type = std::make_shared<TileType>(flat_shape_exprs, result_tile->dtype_, std::nullopt,
                                                          flat_tile_view, result_tile->memory_space_);
 
-        // A natural Mat load must present a 2-dim GlobalTensor: the hardware
-        // ND2NZ path rejects rank>2 source windows (only all-1 leading dims
-        // collapse implicitly). Collapse the [.., n, k] window to [prod(leading),
-        // k] when a leading batch dim exceeds 1 AND every inner dim spans the full
-        // tensor extent (so the merged leading rows are contiguous). Guards:
-        //  * Mat target only — Vec/other-space ND loads are plain ND (no fractal),
-        //    so a rank>2 window loads fine; leaving them untouched avoids
-        //    perturbing every ND elementwise/reduce flatten.
-        //  * non-transpose only — transposed loads keep their ND window for the
-        //    DN addressing path.
-        const bool is_transpose_load = call->GetKwarg<bool>("transpose", false);
-        const bool is_mat_target =
-            call->GetKwarg<MemorySpace>("target_memory", MemorySpace::DDR) == MemorySpace::Mat;
-        if (!is_transpose_load && is_mat_target && sub_args.size() >= 4) {
-          auto tensor_type = As<TensorType>(sub_args[0]->GetType());
-          auto offsets_tuple = As<MakeTuple>(sub_args[1]);
-          auto shape_tuple = As<MakeTuple>(sub_args[2]);
-          auto valid_tuple = As<MakeTuple>(sub_args[3]);
-          const size_t rank = result_tile->shape_.size();
-          if (tensor_type && offsets_tuple && shape_tuple && valid_tuple &&
-              tensor_type->shape_.size() == rank && offsets_tuple->elements_.size() == rank &&
-              shape_tuple->elements_.size() == rank && valid_tuple->elements_.size() == rank) {
-            bool inner_full = true;
-            for (size_t i = 1; i < rank && inner_full; ++i) {
-              auto ws = As<ConstInt>(shape_tuple->elements_[i]);
-              auto ts = As<ConstInt>(tensor_type->shape_[i]);
-              inner_full = ws && ts && ws->value_ == ts->value_;
-            }
-            // Only collapse when a leading batch dim actually exceeds 1. A window
-            // whose leading dims are all static 1 (e.g. [1, N, K], the batch-1 /
-            // per-batch path) already loads as a 2-dim GlobalTensor since the unit
-            // dims collapse implicitly, so leaving it untouched avoids needlessly
-            // perturbing the IR. A dynamic leading dim is collapsed conservatively.
-            bool needs_collapse = false;
-            for (size_t i = 0; i + 2 < rank; ++i) {
-              auto bs = As<ConstInt>(shape_tuple->elements_[i]);
-              if (!bs || bs->value_ != 1) {
-                needs_collapse = true;
-                break;
-              }
-            }
-            if (inner_full && needs_collapse) {
-              sub_args[1] = std::make_shared<MakeTuple>(
-                  ComputeMergedOffsets(offsets_tuple->elements_, tensor_type->shape_, span), span);
-              sub_args[2] =
-                  std::make_shared<MakeTuple>(ComputeMergedValidShape(shape_tuple->elements_, span), span);
-              sub_args[3] =
-                  std::make_shared<MakeTuple>(ComputeMergedValidShape(valid_tuple->elements_, span), span);
-            }
-          }
-        }
-
+        // The rank>2 source window is preserved as-is for codegen. A natural Mat
+        // load lowers to ND2NZ, which requires a 2-dim GlobalTensor — that
+        // collapse is owned by the tile.load codegen (it triggers on the NZ result
+        // tile), so flatten only needs to flatten the RESULT tile to 2D here.
         auto flat_call =
             std::make_shared<Call>(call->op_, sub_args, call->kwargs_, flat_tile_type, call->span_);
         auto flat_var = std::make_shared<Var>(assign->var_->name_hint_, flat_tile_type, assign->var_->span_);

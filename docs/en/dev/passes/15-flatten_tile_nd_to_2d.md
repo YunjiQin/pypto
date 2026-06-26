@@ -68,10 +68,12 @@ whether both operands' whole tiles fit Mat (L1) together:
 - **whole_fits (default):** the operand is brought whole into Mat once and
   per-batch **sliced** — a row slice for a plain (row-batched `[B*rows, cols]`)
   operand, a column slice for a `tile.transpose_view` (column-batched
-  `[K, B*N]`) operand. A natural Mat load of a 3D `[B, N, K]` tensor (batch > 1)
-  collapses its source window to 2D `[B*N, K]` so the hardware ND2NZ path sees a
-  2-dim GlobalTensor; codegen emits a matching 2D `make_tensor_view`. A broadcast
-  operand reuses its single page.
+  `[K, B*N]`) operand. A natural Mat load of a 3D `[B, N, K]` tensor keeps its ND
+  source window here; the hardware ND2NZ "2-dim GlobalTensor" collapse to
+  `[B*N, K]` is owned by the `tile.load` codegen — it fires when the load's result
+  is an NZ Mat tile and emits the 2D `make_tensor_view` there — so this pass only
+  flattens the load's **result tile** to 2D. A broadcast operand reuses its single
+  page.
 - **!whole_fits (large operands, load-sourced):** the whole tile would overflow
   L1, so the operand is **loaded per batch** from its underlying natural
   `tile.load` (a per-batch `[1, .., X, Y]` window → 2D `[X, Y]`), with a per-batch

@@ -1460,10 +1460,20 @@ class TestFlattenTileNdTo2DBatchMatmul:
                 out_0: pl.Out[pl.Tensor[[2, 3, 16, 64], pl.FP16]],
             ) -> pl.Tensor[[2, 3, 16, 64], pl.FP16]:
                 lhs_tile: pl.Tile[[32, 128], pl.FP16, pl.Mem.Mat] = pl.load(
-                    lhs, [0, 0], [32, 128], [32, 128], target_memory=pl.Mem.Mat, transpose=False
+                    lhs,
+                    [0, 0, 0, 0],
+                    [2, 1, 16, 128],
+                    [2, 1, 16, 128],
+                    target_memory=pl.Mem.Mat,
+                    transpose=False,
                 )
                 rhs_tile: pl.Tile[[384, 64], pl.FP16, pl.Mem.Mat] = pl.load(
-                    rhs, [0, 0], [384, 64], [384, 64], target_memory=pl.Mem.Mat, transpose=False
+                    rhs,
+                    [0, 0, 0, 0],
+                    [1, 3, 128, 64],
+                    [1, 3, 128, 64],
+                    target_memory=pl.Mem.Mat,
+                    transpose=False,
                 )
                 lhs_slice_0: pl.Tile[[16, 128], pl.FP16, pl.Mem.Mat] = pl.tile.slice(
                     lhs_tile, [16, 128], [0, 0]
@@ -1597,7 +1607,7 @@ class TestFlattenTileNdTo2DBatchMatmul:
                 out_0: pl.Out[pl.Tensor[[2, 16, 64], pl.FP16]],
             ) -> pl.Tensor[[2, 16, 64], pl.FP16]:
                 lhs_tile: pl.Tile[[256, 16], pl.FP16, pl.Mem.Mat] = pl.load(
-                    lhs, [0, 0], [256, 16], [256, 16], target_memory=pl.Mem.Mat, transpose=False
+                    lhs, [0, 0, 0], [2, 128, 16], [2, 128, 16], target_memory=pl.Mem.Mat, transpose=False
                 )
                 lhs_view: pl.Tile[
                     [16, 256],
@@ -1606,7 +1616,7 @@ class TestFlattenTileNdTo2DBatchMatmul:
                     pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.col_major),
                 ] = pl.tile.transpose_view(lhs_tile)
                 rhs_tile: pl.Tile[[128, 128], pl.FP16, pl.Mem.Mat] = pl.load(
-                    rhs, [0, 0], [128, 128], [128, 128], target_memory=pl.Mem.Mat, transpose=False
+                    rhs, [0, 0, 0], [2, 64, 128], [2, 64, 128], target_memory=pl.Mem.Mat, transpose=False
                 )
                 rhs_view: pl.Tile[
                     [128, 128],
@@ -1674,10 +1684,10 @@ class TestFlattenTileNdTo2DBatchMatmul:
                 "rhs_transpose": False,
                 "expected_op_seq": ["tile.load", "tile.load"]
                 + ["tile.slice", "tile.slice", "tile.matmul", "tile.store"] * 2,
-                "expected_lhs_load_offsets": [[0, 0]],
-                "expected_rhs_load_offsets": [[0, 0]],
-                "expected_lhs_load_shapes": [[32, 128]],
-                "expected_rhs_load_shapes": [[256, 64]],
+                "expected_lhs_load_offsets": [[0, 0, 0]],
+                "expected_rhs_load_offsets": [[0, 0, 0]],
+                "expected_lhs_load_shapes": [[2, 16, 128]],
+                "expected_rhs_load_shapes": [[2, 128, 64]],
                 "expected_lhs_slice_offsets": [[0, 0], [16, 0]],
                 "expected_rhs_slice_offsets": [[0, 0], [128, 0]],
                 "expected_lhs_slice_shapes": [[16, 128], [16, 128]],
@@ -1907,7 +1917,7 @@ class TestFlattenTileNdTo2DBatchMatmul:
                 out_0: pl.Out[pl.Tensor[[2, 16, 64], pl.FP16]],
             ) -> pl.Tensor[[2, 16, 64], pl.FP16]:
                 lhs_tile: pl.Tile[[256, 16], pl.FP16, pl.Mem.Mat] = pl.load(
-                    lhs, [0, 0], [256, 16], [256, 16], target_memory=pl.Mem.Mat, transpose=False
+                    lhs, [0, 0, 0], [2, 128, 16], [2, 128, 16], target_memory=pl.Mem.Mat, transpose=False
                 )
                 lhs_view: pl.Tile[
                     [16, 256],
@@ -1916,7 +1926,7 @@ class TestFlattenTileNdTo2DBatchMatmul:
                     pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.col_major),
                 ] = pl.tile.transpose_view(lhs_tile)
                 rhs_tile: pl.Tile[[256, 64], pl.FP16, pl.Mem.Mat] = pl.load(
-                    rhs, [0, 0], [256, 64], [256, 64], target_memory=pl.Mem.Mat, transpose=False
+                    rhs, [0, 0, 0], [2, 128, 64], [2, 128, 64], target_memory=pl.Mem.Mat, transpose=False
                 )
                 lhs_slice_0: pl.Tile[
                     [16, 128],

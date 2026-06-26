@@ -1457,39 +1457,88 @@ static std::string MakeTileLoadCodegenPTO(const CallPtr& op, codegen::CodegenBas
   std::string tensor_view_type = codegen.GetTensorViewTypeString(tensor_type.get());
   std::string tile_buf_type = codegen.GetCurrentResultTileBufTypeString();
 
-  // When FlattenTileNdTo2D collapsed a natural ND load's source window to 2D
-  // (the load shapes/offsets rank dropped below the param's declared rank), the
-  // shared param tensor_view is still ND, but the hardware ND2NZ path needs a
-  // 2-dim GlobalTensor. Emit a fresh 2D contiguous tensor_view (``[prod(leading),
-  // last]`` with strides ``[last, 1]``) over the same base pointer and use it for
-  // the partition below. Valid because the flatten collapse only fires when the
-  // inner window dims span the full contiguous tensor extent.
-  if (ndim < tensor_type->shape_.size()) {
-    auto shape_codes = GetSizeCodes(shapes_tuple->elements_, codegen);
-    INTERNAL_CHECK_SPAN(ndim == 2 && shape_codes.size() == 2, op->span_)
-        << "tile.load 2D source-window collapse expects a 2D window, got rank " << ndim;
-    std::string one = codegen.GetOrEmitConstant(static_cast<int64_t>(1), DataType::INDEX);
-    std::string view2d = codegen.NewNamedTemp(tensor->name_hint_ + "_view2d");
-    std::ostringstream mtv;
-    mtv << view2d << " = pto.make_tensor_view " << codegen.GetVarName(tensor) << ", shape = ["
-        << shape_codes[0] << ", " << shape_codes[1] << "], strides = [" << shape_codes[1] << ", " << one
-        << "] {layout = #pto.layout<nd>}: !pto.tensor_view<?x?x" << dtype_str << ">";
-    codegen.Emit(mtv.str());
-    tensor_view = view2d;
-    tensor_view_type = "!pto.tensor_view<?x?x" + dtype_str + ">";
-  }
-
   // RFC #1300 P7: the IR's offsets / shapes / valid_shapes are already in
   // canonical coordinates (matching the source TensorType's shape). There is
   // no implicit dn_swap here — ``LowerTransposeLoadParamLayout`` (P6) is
   // responsible for ensuring all coordinate systems match before codegen.
-  const auto& valid_elems = valid_shapes_tuple->elements_;
-  const auto& offset_elems = offsets_tuple->elements_;
+  std::vector<std::string> partition_dims = GetDimStrings(valid_shapes_tuple->elements_);
+  std::vector<std::string> offset_codes = GetIndexOffsetCodes(offsets_tuple->elements_, codegen);
+  std::vector<std::string> size_codes = GetSizeCodes(valid_shapes_tuple->elements_, codegen);
 
-  std::string partition_type = MakePartitionTensorViewType(GetDimStrings(valid_elems), dtype_str);
-  std::string partition_view = EmitPartitionViewPTO(
-      tensor->name_hint_, tensor_view, tensor_view_type, partition_type,
-      GetIndexOffsetCodes(offset_elems, codegen), GetSizeCodes(valid_elems, codegen), codegen);
+  // ND2NZ constraint: a natural Mat load fills an NZ tile (the implicit Mat view,
+  // blayout=col_major / slayout=row_major), and the hardware ND2NZ path requires a
+  // 2-dim GlobalTensor. When such an NZ load has a rank>2 source window, collapse
+  // the contiguous leading dims to 2D — emit a fresh 2D tensor_view ([prod(leading
+  // window dims), last] with strides [last, 1]) over the same base pointer and a
+  // matching 2D partition (offset folded mixed-radix over the source tensor dims).
+  // Transposed (DN) Mat loads keep their ND window for DN addressing; Vec/other
+  // loads are plain ND and are not NZ.
+  auto result_tile_type = ir::As<ir::TileType>(op->GetType());
+  bool is_nz_mat_load = false;
+  if (result_tile_type && result_tile_type->memory_space_ == ir::MemorySpace::Mat) {
+    const auto rv = ir::tile_view_semantics::GetEffectiveTileView(*result_tile_type);
+    is_nz_mat_load = rv.blayout == ir::TileLayout::col_major && rv.slayout == ir::TileLayout::row_major;
+  }
+  if (is_nz_mat_load && ndim > 2) {
+    const ir::Span& span = op->span_;
+    // ConstInt-folding index arithmetic: a static window (the common matmul case)
+    // folds to clean constants, while a dynamic dim/offset/valid stays symbolic and
+    // is materialized by GetSizeCodes / GetIndexOffsetCodes (arith.muli/addi) below
+    // — the same constant-or-symbol handling the function-parameter make_tensor_view
+    // uses, so this path is not limited to static-shape tensors.
+    auto idx = [&](int64_t v) -> ir::ExprPtr {
+      return std::make_shared<ir::ConstInt>(v, DataType::INDEX, span);
+    };
+    auto fold_mul = [&](const ir::ExprPtr& a, const ir::ExprPtr& b) -> ir::ExprPtr {
+      auto ca = ir::As<ir::ConstInt>(a);
+      auto cb = ir::As<ir::ConstInt>(b);
+      if (ca && cb) return idx(ca->value_ * cb->value_);
+      if (ca && ca->value_ == 1) return b;
+      if (cb && cb->value_ == 1) return a;
+      return ir::MakeMul(a, b, span);
+    };
+    auto fold_add = [&](const ir::ExprPtr& a, const ir::ExprPtr& b) -> ir::ExprPtr {
+      auto ca = ir::As<ir::ConstInt>(a);
+      auto cb = ir::As<ir::ConstInt>(b);
+      if (ca && cb) return idx(ca->value_ + cb->value_);
+      if (ca && ca->value_ == 0) return b;
+      if (cb && cb->value_ == 0) return a;
+      return ir::MakeAdd(a, b, span);
+    };
+
+    // make_tensor_view describes the collapsed SOURCE TENSOR: [prod(tensor leading
+    // dims), tensor_last] with a contiguous row stride [tensor_last, 1] — the
+    // tensor's real row stride, so a window narrower than the last dim (e.g. a
+    // K-slice) still strides by the full tensor width. The partition then slices the
+    // window's VALID region; its offset folds mixed-radix over the tensor dims.
+    ir::ExprPtr tensor_rows = tensor_type->shape_[0];
+    ir::ExprPtr valid_rows = valid_shapes_tuple->elements_[0];
+    ir::ExprPtr row_offset = offsets_tuple->elements_[0];
+    for (size_t i = 1; i + 1 < ndim; ++i) {
+      tensor_rows = fold_mul(tensor_rows, tensor_type->shape_[i]);
+      valid_rows = fold_mul(valid_rows, valid_shapes_tuple->elements_[i]);
+      row_offset = fold_add(fold_mul(row_offset, tensor_type->shape_[i]), offsets_tuple->elements_[i]);
+    }
+    const ir::ExprPtr tensor_cols = tensor_type->shape_.back();
+
+    const std::vector<std::string> view_shape = GetSizeCodes({tensor_rows, tensor_cols}, codegen);
+    const std::string one = codegen.GetOrEmitConstant(static_cast<int64_t>(1), DataType::INDEX);
+    const std::string view2d = codegen.NewNamedTemp(tensor->name_hint_ + "_view2d");
+    std::ostringstream mtv;
+    mtv << view2d << " = pto.make_tensor_view " << codegen.GetVarName(tensor) << ", shape = ["
+        << view_shape[0] << ", " << view_shape[1] << "], strides = [" << view_shape[1] << ", " << one
+        << "] {layout = #pto.layout<nd>}: !pto.tensor_view<?x?x" << dtype_str << ">";
+    codegen.Emit(mtv.str());
+    tensor_view = view2d;
+    tensor_view_type = "!pto.tensor_view<?x?x" + dtype_str + ">";
+    partition_dims = {"?", "?"};
+    offset_codes = GetIndexOffsetCodes({row_offset, offsets_tuple->elements_.back()}, codegen);
+    size_codes = GetSizeCodes({valid_rows, valid_shapes_tuple->elements_.back()}, codegen);
+  }
+
+  std::string partition_type = MakePartitionTensorViewType(partition_dims, dtype_str);
+  std::string partition_view = EmitPartitionViewPTO(tensor->name_hint_, tensor_view, tensor_view_type,
+                                                    partition_type, offset_codes, size_codes, codegen);
 
   std::ostringstream tload_line;
   tload_line << "pto.tload ins(" << partition_view << " : " << partition_type << ") outs(";
