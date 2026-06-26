@@ -363,8 +363,11 @@ def load(
         valid_shapes: Valid shape of the tile in each dimension. When provided, sets
             TileView.valid_shape in the output TileType. When omitted, shapes is used
             as valid_shape. Uses the same coordinate convention as shapes.
-        transpose: Whether to transpose the tile during load (default: False).
-            Only supported when target_memory is MemorySpace.Mat (L1).
+        transpose: **Deprecated, will be removed.** Transpose the tile during load
+            (only on MemorySpace.Mat). The load-time transpose is superseded by a
+            zero-copy ``tile.transpose_view``: pass ``b_trans=True`` / ``a_trans=True``
+            to ``pl.matmul`` for matmul operands, or load natural and apply
+            ``pl.tile.transpose_view(...)``.
 
     Returns:
         Tile wrapping the load operation
@@ -372,10 +375,16 @@ def load(
     Example:
         >>> # 2D load
         >>> tile = load(tensor, offsets=[0, 0], shapes=[32, 32])
-        >>> # 2D load with transpose to L1 (tensor is [N, K], output tile is [K, N])
-        >>> tile = load(tensor, offsets=[0, 0], shapes=[N, K],
-        ...             target_memory=pl.MemorySpace.Mat, transpose=True)
     """
+    if transpose:
+        warnings.warn(
+            "load(..., transpose=True) is deprecated and will be removed. The "
+            "load-time transpose is replaced by a zero-copy tile.transpose_view: "
+            "use pl.matmul(..., b_trans=True/a_trans=True) for matmul operands, or "
+            "load natural and apply pl.tile.transpose_view(...).",
+            DeprecationWarning,
+            stacklevel=2,
+        )
     if valid_shapes is None:
         valid_shapes = shapes
     call_expr = _ir_ops.load(
