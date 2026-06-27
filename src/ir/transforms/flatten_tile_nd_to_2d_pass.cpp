@@ -41,6 +41,7 @@
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
+#include "pypto/ir/transforms/utils/tile_conversion_utils.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/type_inference.h"
@@ -594,14 +595,13 @@ ExprPtr PeelSafeBatchReshape(const ExprPtr& operand_expr, const AssignDefMap& de
 }
 
 /// Whether a natural `tile.load`'s whole source window collapses to a contiguous
-/// 2D row axis (the precondition the codegen ND2NZ collapse enforces). Scanning
-/// the row dims [0, ndim-1) from outermost in: any number of leading singleton
-/// (valid==1) dims, then at most one partial "boundary" dim, after which every
-/// dim must span its full tensor extent. A non-contiguous whole load (a partial
-/// middle dim under a non-singleton outer dim, e.g. a multi-batch slice that also
-/// cuts the matrix-row dim) cannot be legalized as one 2D ND2NZ load, so the
-/// operand must instead be re-emitted per batch (ExtractBatchPage !fit path).
-/// Returns true (keep whole) when the load is absent / 2D / dynamic-shaped.
+/// 2D row axis (the precondition the codegen ND2NZ collapse enforces). A
+/// non-contiguous whole load (a partial middle dim under a non-singleton outer
+/// dim, e.g. a multi-batch slice that also cuts the matrix-row dim) cannot be
+/// legalized as one 2D ND2NZ load, so the operand must instead be re-emitted per
+/// batch (ExtractBatchPage !fit path). Returns true (keep whole) when the load is
+/// absent / 2D / dynamic-shaped. The contiguity rule itself is shared with the
+/// codegen guard via `IsRowMajorCollapseContiguous`, so routing and guard agree.
 bool WholeLoadContiguous(const CallPtr& base_load) {
   if (!base_load || base_load->args_.size() < 4) return true;
   auto tensor_type = As<TensorType>(base_load->args_[0]->GetType());
@@ -609,17 +609,16 @@ bool WholeLoadContiguous(const CallPtr& base_load) {
   if (!tensor_type || !valid) return true;
   const size_t ndim = valid->elements_.size();
   if (ndim <= 2 || tensor_type->shape_.size() != ndim) return true;
-  bool past_boundary = false;
-  for (size_t i = 0; i + 1 < ndim; ++i) {
-    const bool is_full = AreExprsEqual(valid->elements_[i], tensor_type->shape_[i]);
-    if (past_boundary) {
-      if (!is_full) return false;
-      continue;
-    }
-    auto vi = As<ConstInt>(valid->elements_[i]);
-    if (!(vi && vi->value_ == 1)) past_boundary = true;
-  }
-  return true;
+  return tile_conversion_utils::IsRowMajorCollapseContiguous(valid->elements_, tensor_type->shape_);
+}
+
+/// The per-operand whole-vs-per-batch routing decision, shared by LowerBatchMatmul,
+/// LowerBatchMatmulAcc, and the dead-load drop pre-scan so all three stay in sync:
+/// keep this operand whole only when both operands' whole tiles fit Mat together
+/// (the joint `capacity_fits` gate) AND its whole load collapses contiguously;
+/// otherwise it is re-emitted per batch.
+bool KeepOperandWhole(bool capacity_fits, const CallPtr& base_load) {
+  return capacity_fits && WholeLoadContiguous(base_load);
 }
 
 /// Trace a batch_matmul operand var to its underlying natural `tile.load` (through
@@ -885,8 +884,8 @@ BatchMatmulResult LowerBatchMatmul(const AssignStmtPtr& assign, const CallPtr& c
   // partial matrix-row dim) is re-emitted per batch — each per-batch page is a
   // [1, X, Y] window that collapses cleanly — instead of erroring in codegen.
   const bool capacity_fits = BatchOperandsWholeFit(lhs_info.original_type, rhs_info.original_type);
-  lhs_info.whole_fits = capacity_fits && WholeLoadContiguous(lhs_info.base_load);
-  rhs_info.whole_fits = capacity_fits && WholeLoadContiguous(rhs_info.base_load);
+  lhs_info.whole_fits = KeepOperandWhole(capacity_fits, lhs_info.base_load);
+  rhs_info.whole_fits = KeepOperandWhole(capacity_fits, rhs_info.base_load);
   auto orig_result_type = As<TileType>(call->GetType());
   CHECK(orig_result_type) << "FlattenTileNdTo2D: tile.batch_matmul expects TileType result";
 
@@ -918,9 +917,11 @@ BatchMatmulResult LowerBatchMatmul(const AssignStmtPtr& assign, const CallPtr& c
   int64_t rhs_rows = rhs_dims[rhs_dims.size() - 2];
   int64_t rhs_cols = rhs_dims.back();
 
-  CHECK(lhs_cols == rhs_rows)
-      << "FlattenTileNdTo2D: tile.batch_matmul requires matching inner dimensions, but got " << lhs_cols
-      << " and " << rhs_rows;
+  // K-match is validated user-facing at op construction (DeduceTileBatchMatMulType);
+  // a mismatch here would be a compiler bug in an earlier pass.
+  INTERNAL_CHECK_SPAN(lhs_cols == rhs_rows, span)
+      << "Internal error: tile.batch_matmul inner dimensions must match, but got " << lhs_cols << " and "
+      << rhs_rows;
 
   // Detect direct-store fusion opportunity.
   auto direct_store = DetectDirectStore(stmts, stmt_index, assign->var_);
@@ -1153,8 +1154,8 @@ BatchMatmulAccResult LowerBatchMatmulAcc(const AssignStmtPtr& assign, const Call
   // partial matrix-row dim) is re-emitted per batch — each per-batch page is a
   // [1, X, Y] window that collapses cleanly — instead of erroring in codegen.
   const bool capacity_fits = BatchOperandsWholeFit(lhs_info.original_type, rhs_info.original_type);
-  lhs_info.whole_fits = capacity_fits && WholeLoadContiguous(lhs_info.base_load);
-  rhs_info.whole_fits = capacity_fits && WholeLoadContiguous(rhs_info.base_load);
+  lhs_info.whole_fits = KeepOperandWhole(capacity_fits, lhs_info.base_load);
+  rhs_info.whole_fits = KeepOperandWhole(capacity_fits, rhs_info.base_load);
 
   // Extract original (pre-flatten) static dimensions for batch + matrix axes.
   auto lhs_dims = ToStaticDims(lhs_info.original_type->shape_, "tile.batch_matmul_acc lhs");
@@ -1184,8 +1185,11 @@ BatchMatmulAccResult LowerBatchMatmulAcc(const AssignStmtPtr& assign, const Call
   int64_t rhs_rows = rhs_dims[rhs_dims.size() - 2];
   int64_t rhs_cols = rhs_dims.back();
 
-  CHECK(lhs_cols == rhs_rows) << "FlattenTileNdTo2D: tile.batch_matmul_acc requires matching K, got "
-                              << lhs_cols << " and " << rhs_rows;
+  // K-match is validated user-facing at op construction (DeduceTileBatchMatMulAccType);
+  // a mismatch here would be a compiler bug in an earlier pass.
+  INTERNAL_CHECK_SPAN(lhs_cols == rhs_rows, span)
+      << "Internal error: tile.batch_matmul_acc inner dimensions must match, got " << lhs_cols << " and "
+      << rhs_rows;
 
   // Sanity check on flat acc shape: should be [batch_count*M, N].
   auto acc_rows_const = As<ConstInt>(acc_type->shape_[0]);
@@ -1675,9 +1679,9 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
       const bool capacity_fits = BatchOperandsWholeFit(As<TileType>(c->args_[lhs_i]->GetType()),
                                                        As<TileType>(c->args_[rhs_i]->GetType()));
       const bool lhs_fits =
-          capacity_fits && WholeLoadContiguous(TraceOperandBaseLoad(c->args_[lhs_i], stmt_def_map));
+          KeepOperandWhole(capacity_fits, TraceOperandBaseLoad(c->args_[lhs_i], stmt_def_map));
       const bool rhs_fits =
-          capacity_fits && WholeLoadContiguous(TraceOperandBaseLoad(c->args_[rhs_i], stmt_def_map));
+          KeepOperandWhole(capacity_fits, TraceOperandBaseLoad(c->args_[rhs_i], stmt_def_map));
       if (auto lv = As<Var>(c->args_[lhs_i])) MarkChain(lv.get(), lhs_fits);
       if (auto rv = As<Var>(c->args_[rhs_i])) MarkChain(rv.get(), rhs_fits);
     }

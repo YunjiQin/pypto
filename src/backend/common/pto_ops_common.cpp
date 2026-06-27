@@ -47,6 +47,7 @@
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
+#include "pypto/ir/transforms/utils/tile_conversion_utils.h"
 #include "pypto/ir/type.h"
 
 namespace pypto {
@@ -1481,29 +1482,19 @@ static std::string MakeTileLoadCodegenPTO(const CallPtr& op, codegen::CodegenBas
   }
   if (is_nz_mat_load && ndim > 2) {
     const ir::Span& span = op->span_;
-    // The leading-dim collapse folds the row dims [0, ndim-1) into one axis with
-    // a contiguous row stride, so it is sound only when the valid sub-box of
-    // those dims is contiguous in row-major order. Scanning the row dims from
-    // outermost in: any number of leading singleton (extent-1) dims, then at most
-    // one partial "boundary" dim, after which every dim must span its full tensor
-    // extent. (A whole load, a batch sub-range, and batch-1 M/N tiling all
-    // satisfy this; only a partial dim *under a non-singleton outer dim* — e.g.
-    // tiling M/N with batch>1 — would make the rows non-contiguous.) Offsets do
-    // not affect contiguity — they fold into row_offset — so they are not checked.
-    bool past_boundary = false;
-    for (size_t i = 0; i + 1 < ndim; ++i) {
-      const bool is_full = ir::AreExprsEqual(valid_shapes_tuple->elements_[i], tensor_type->shape_[i]);
-      if (past_boundary) {
-        INTERNAL_CHECK_SPAN(is_full, span)
-            << "tile.load NZ 2D source-window collapse: row dim " << i
-            << " is a partial sub-range under a non-singleton outer dim, so the flattened rows are "
-               "not contiguous (the collapse cannot legalize this to a 2D ND2NZ load)";
-        continue;
-      }
-      auto val_i = ir::As<ir::ConstInt>(valid_shapes_tuple->elements_[i]);
-      const bool is_singleton = val_i && val_i->value_ == 1;
-      if (!is_singleton) past_boundary = true;
-    }
+    // The leading-dim collapse folds the row dims [0, ndim-1) into one axis with a
+    // contiguous row stride, so it is sound only when the valid sub-box of those
+    // dims is contiguous in row-major order (see IsRowMajorCollapseContiguous —
+    // the shared rule that FlattenTileNdTo2D uses to route non-contiguous operands
+    // to a per-batch load, so this guard should never fire on a batch_matmul
+    // operand). A partial middle dim under a non-singleton outer dim (e.g. a
+    // multi-batch slice that also cuts the matrix-row dim) is non-contiguous.
+    INTERNAL_CHECK_SPAN(ir::tile_conversion_utils::IsRowMajorCollapseContiguous(valid_shapes_tuple->elements_,
+                                                                                tensor_type->shape_),
+                        span)
+        << "tile.load NZ 2D source-window collapse: the valid sub-box of the leading dims is not "
+           "contiguous in row-major order (a partial middle dim under a non-singleton outer dim), so "
+           "the collapse cannot legalize this to a 2D ND2NZ load";
     // ConstInt-folding index arithmetic: a static window (the common matmul case)
     // folds to clean constants, while a dynamic dim/offset/valid stays symbolic and
     // is materialized by GetSizeCodes / GetIndexOffsetCodes (arith.muli/addi) below
