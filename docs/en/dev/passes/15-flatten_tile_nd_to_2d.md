@@ -62,10 +62,12 @@ Per-statement handling:
 
 **Unified operand handling — whole-fit slice vs. per-batch load.** Every
 batch_matmul operand (lhs or rhs, transposed or not, load- or move-sourced) is
-treated identically. A capacity gate (`BatchOperandsWholeFit`) decides per matmul
-whether both operands' whole tiles fit Mat (L1) together:
+treated identically. The routing is decided **per operand**: keep the whole tile
+only when the operands' whole tiles fit Mat (L1) together (`BatchOperandsWholeFit`,
+a capacity gate) **and** this operand's whole load collapses contiguously
+(`WholeLoadContiguous`); otherwise re-emit it per batch.
 
-- **whole_fits (default):** the operand is brought whole into Mat once and
+- **whole (default):** the operand is brought whole into Mat once and
   per-batch **sliced** — a row slice for a plain (row-batched `[B*rows, cols]`)
   operand, a column slice for a `tile.transpose_view` (column-batched
   `[K, B*N]`) operand. A natural Mat load of a 3D `[B, N, K]` tensor keeps its ND
@@ -74,20 +76,31 @@ whether both operands' whole tiles fit Mat (L1) together:
   is an NZ Mat tile and emits the 2D `make_tensor_view` there — so this pass only
   flattens the load's **result tile** to 2D. A broadcast operand reuses its single
   page.
-- **!whole_fits (large operands, load-sourced):** the whole tile would overflow
-  L1, so the operand is **loaded per batch** from its underlying natural
-  `tile.load` (a per-batch `[1, .., X, Y]` window → 2D `[X, Y]`), with a per-batch
-  `tile.transpose_view` when transposed. The dead whole load/view is then dropped.
+- **per batch** (the whole tile would overflow L1, **or** the whole load is
+  non-contiguous): re-emit the operand from its underlying natural `tile.load`
+  one batch at a time (a per-batch `[1, .., X, Y]` window → 2D `[X, Y]`, using the
+  load's own window dims so a partial sub-tile re-emits correctly), with a
+  per-batch `tile.transpose_view` when transposed. The dead whole load/view is
+  then dropped.
+  - *Non-contiguous* means a multi-batch load that also partially slices the
+    matrix-row (middle) dim — e.g. `[2, K0<K, N]` from `[2, K, N]`. Flattened to
+    `[2*K, N]` such a window has gaps between batches, so it cannot be one 2D
+    ND2NZ load; per batch each page is `[1, K0, N]` (contiguous) and collapses
+    cleanly. This routing keeps the codegen contiguity guard from ever firing on
+    a batch_matmul operand.
 
-**Dead-load elimination (!fit only).** When `!whole_fits` re-emits per-batch
-loads, the original whole load/view becomes dead and the pass drops it. A chain
-is drop-eligible when **every** use is a `tile.batch_matmul[_acc]` operand (the
-chain `tile.load → tile.transpose_view` is walked back), and it is dropped only
-when **every** consuming matmul is `!fit` — a chain shared with any fit matmul
-stays whole. Uses are counted **recursively** (including nested
-`If`/`For`/`While`/`Scope` bodies) so a load also consumed in a nested block is
-never dropped. The capacity gate is backend-gated: with no backend configured
-(most unit tests) it always reports fit, keeping the simpler whole+slice path.
+**Dead-load elimination (per-batch only).** When an operand re-emits per-batch
+loads (capacity !fit or non-contiguous), the original whole load/view becomes
+dead and the pass drops it. The drop pre-scan applies the **same per-operand
+routing** as `LowerBatchMatmul`, so a non-contiguous operand's chain is recognized
+as per-batch here too. A chain is drop-eligible when **every** use is a
+`tile.batch_matmul[_acc]` operand (the chain `tile.load → tile.transpose_view` is
+walked back), and it is dropped only when **every** consuming matmul routes it
+per-batch — a chain shared with any whole-kept matmul stays whole. Uses are
+counted **recursively** (including nested `If`/`For`/`While`/`Scope` bodies) so a
+load also consumed in a nested block is never dropped. The capacity gate is
+backend-gated (no backend → reports fit), but the contiguity check is not, so the
+non-contiguous routing fires in unit tests too.
 
 > The per-batch V2C move case (a move-sourced operand that does not fit L1) is a
 > deferred follow-up; such an operand currently stays on the whole-slice path,

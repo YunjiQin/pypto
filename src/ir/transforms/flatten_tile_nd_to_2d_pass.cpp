@@ -593,6 +593,47 @@ ExprPtr PeelSafeBatchReshape(const ExprPtr& operand_expr, const AssignDefMap& de
   }
 }
 
+/// Whether a natural `tile.load`'s whole source window collapses to a contiguous
+/// 2D row axis (the precondition the codegen ND2NZ collapse enforces). Scanning
+/// the row dims [0, ndim-1) from outermost in: any number of leading singleton
+/// (valid==1) dims, then at most one partial "boundary" dim, after which every
+/// dim must span its full tensor extent. A non-contiguous whole load (a partial
+/// middle dim under a non-singleton outer dim, e.g. a multi-batch slice that also
+/// cuts the matrix-row dim) cannot be legalized as one 2D ND2NZ load, so the
+/// operand must instead be re-emitted per batch (ExtractBatchPage !fit path).
+/// Returns true (keep whole) when the load is absent / 2D / dynamic-shaped.
+bool WholeLoadContiguous(const CallPtr& base_load) {
+  if (!base_load || base_load->args_.size() < 4) return true;
+  auto tensor_type = As<TensorType>(base_load->args_[0]->GetType());
+  auto valid = As<MakeTuple>(base_load->args_[3]);
+  if (!tensor_type || !valid) return true;
+  const size_t ndim = valid->elements_.size();
+  if (ndim <= 2 || tensor_type->shape_.size() != ndim) return true;
+  bool past_boundary = false;
+  for (size_t i = 0; i + 1 < ndim; ++i) {
+    const bool is_full = AreExprsEqual(valid->elements_[i], tensor_type->shape_[i]);
+    if (past_boundary) {
+      if (!is_full) return false;
+      continue;
+    }
+    auto vi = As<ConstInt>(valid->elements_[i]);
+    if (!(vi && vi->value_ == 1)) past_boundary = true;
+  }
+  return true;
+}
+
+/// Trace a batch_matmul operand var to its underlying natural `tile.load` (through
+/// safe batch reshape wrappers and a tile.transpose_view), mirroring
+/// NormalizeBatchMatmulOperand's base_load resolution. Used by the drop pre-scan
+/// to apply the same whole-vs-per-batch routing decision as LowerBatchMatmul.
+CallPtr TraceOperandBaseLoad(const ExprPtr& operand_expr, const AssignDefMap& def_map) {
+  ExprPtr base = PeelSafeBatchReshape(operand_expr, def_map);
+  if (auto tv = ResolveBatchOperandCall(base, def_map, "tile.transpose_view")) {
+    if (!tv->args_.empty()) base = tv->args_[0];
+  }
+  return ResolveBatchOperandCall(base, def_map, "tile.load");
+}
+
 /// Normalize one batch_matmul operand:
 ///  - peel safe batch-only tile.reshape wrappers that only reinterpret batch dims
 ///  - recognize a tile.transpose_view operand (the canonical b_trans/a_trans form):
@@ -708,11 +749,19 @@ BatchPageResult ExtractBatchPage(const BatchOperandInfo& info, const std::vector
     auto load_tensor = info.base_load->args_[0];
     auto load_tensor_type = As<TensorType>(load_tensor->GetType());
     auto base_offsets = As<MakeTuple>(info.base_load->args_[1]);
-    INTERNAL_CHECK_SPAN(load_tensor_type && base_offsets && load_tensor_type->shape_.size() >= 2, span)
+    auto base_shapes = As<MakeTuple>(info.base_load->args_[2]);
+    INTERNAL_CHECK_SPAN(load_tensor_type && base_offsets && base_shapes &&
+                            load_tensor_type->shape_.size() >= 2 &&
+                            base_shapes->elements_.size() == load_tensor_type->shape_.size(),
+                        span)
         << "FlattenTileNdTo2D: !fit per-batch load expects a tensor-backed tile.load with rank >= 2";
-    const size_t tensor_rank = load_tensor_type->shape_.size();
-    auto x_dim = As<ConstInt>(load_tensor_type->shape_[tensor_rank - 2]);
-    auto y_dim = As<ConstInt>(load_tensor_type->shape_.back());
+    // Use the load's WINDOW matrix dims (the actual sliced tile), not the source
+    // tensor's full trailing dims — they differ when the operand is a partial
+    // sub-tile of a larger tensor (e.g. a multi-batch slice that also cuts the
+    // matrix-row dim, the non-contiguous case routed here).
+    const size_t win_rank = base_shapes->elements_.size();
+    auto x_dim = As<ConstInt>(base_shapes->elements_[win_rank - 2]);
+    auto y_dim = As<ConstInt>(base_shapes->elements_.back());
     INTERNAL_CHECK_SPAN(x_dim && y_dim, span)
         << "FlattenTileNdTo2D: !fit per-batch load needs static trailing dims";
 
@@ -830,9 +879,14 @@ BatchMatmulResult LowerBatchMatmul(const AssignStmtPtr& assign, const CallPtr& c
   // Normalize operands.
   auto lhs_info = NormalizeBatchMatmulOperand(call->args_[0], "lhs", def_map, ctx);
   auto rhs_info = NormalizeBatchMatmulOperand(call->args_[1], "rhs", def_map, ctx);
-  const bool whole_fits = BatchOperandsWholeFit(lhs_info.original_type, rhs_info.original_type);
-  lhs_info.whole_fits = whole_fits;
-  rhs_info.whole_fits = whole_fits;
+  // Route each operand to whole-slice vs per-batch independently: keep whole only
+  // when the operands' whole tiles fit Mat together (capacity) AND this operand's
+  // whole load collapses contiguously. A non-contiguous whole load (multi-batch +
+  // partial matrix-row dim) is re-emitted per batch — each per-batch page is a
+  // [1, X, Y] window that collapses cleanly — instead of erroring in codegen.
+  const bool capacity_fits = BatchOperandsWholeFit(lhs_info.original_type, rhs_info.original_type);
+  lhs_info.whole_fits = capacity_fits && WholeLoadContiguous(lhs_info.base_load);
+  rhs_info.whole_fits = capacity_fits && WholeLoadContiguous(rhs_info.base_load);
   auto orig_result_type = As<TileType>(call->GetType());
   CHECK(orig_result_type) << "FlattenTileNdTo2D: tile.batch_matmul expects TileType result";
 
@@ -1093,9 +1147,14 @@ BatchMatmulAccResult LowerBatchMatmulAcc(const AssignStmtPtr& assign, const Call
   // Normalize lhs/rhs operands (peel safe reshape, flag tile.transpose_view).
   auto lhs_info = NormalizeBatchMatmulOperand(call->args_[1], "lhs", def_map, ctx);
   auto rhs_info = NormalizeBatchMatmulOperand(call->args_[2], "rhs", def_map, ctx);
-  const bool whole_fits = BatchOperandsWholeFit(lhs_info.original_type, rhs_info.original_type);
-  lhs_info.whole_fits = whole_fits;
-  rhs_info.whole_fits = whole_fits;
+  // Route each operand to whole-slice vs per-batch independently: keep whole only
+  // when the operands' whole tiles fit Mat together (capacity) AND this operand's
+  // whole load collapses contiguously. A non-contiguous whole load (multi-batch +
+  // partial matrix-row dim) is re-emitted per batch — each per-batch page is a
+  // [1, X, Y] window that collapses cleanly — instead of erroring in codegen.
+  const bool capacity_fits = BatchOperandsWholeFit(lhs_info.original_type, rhs_info.original_type);
+  lhs_info.whole_fits = capacity_fits && WholeLoadContiguous(lhs_info.base_load);
+  rhs_info.whole_fits = capacity_fits && WholeLoadContiguous(rhs_info.base_load);
 
   // Extract original (pre-flatten) static dimensions for batch + matrix axes.
   auto lhs_dims = ToStaticDims(lhs_info.original_type->shape_, "tile.batch_matmul_acc lhs");
@@ -1609,10 +1668,18 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
       const size_t lhs_i = is_bmm ? 0 : 1;
       const size_t rhs_i = is_bmm ? 1 : 2;
       if (rhs_i >= c->args_.size()) continue;
-      const bool fits = BatchOperandsWholeFit(As<TileType>(c->args_[lhs_i]->GetType()),
-                                              As<TileType>(c->args_[rhs_i]->GetType()));
-      if (auto lv = As<Var>(c->args_[lhs_i])) MarkChain(lv.get(), fits);
-      if (auto rv = As<Var>(c->args_[rhs_i])) MarkChain(rv.get(), fits);
+      // Mirror LowerBatchMatmul's per-operand routing so a non-contiguous whole
+      // load (which goes per-batch) is also recognized as !fit here and its dead
+      // whole chain is dropped (otherwise it would survive to codegen and trip the
+      // ND2NZ contiguity guard).
+      const bool capacity_fits = BatchOperandsWholeFit(As<TileType>(c->args_[lhs_i]->GetType()),
+                                                       As<TileType>(c->args_[rhs_i]->GetType()));
+      const bool lhs_fits =
+          capacity_fits && WholeLoadContiguous(TraceOperandBaseLoad(c->args_[lhs_i], stmt_def_map));
+      const bool rhs_fits =
+          capacity_fits && WholeLoadContiguous(TraceOperandBaseLoad(c->args_[rhs_i], stmt_def_map));
+      if (auto lv = As<Var>(c->args_[lhs_i])) MarkChain(lv.get(), lhs_fits);
+      if (auto rv = As<Var>(c->args_[rhs_i])) MarkChain(rv.get(), rhs_fits);
     }
     for (const auto* v : batch_matmul_only_vars) {
       if (any_notfit.count(v) != 0 && any_fit.count(v) == 0) not_fit_drop_vars.insert(v);

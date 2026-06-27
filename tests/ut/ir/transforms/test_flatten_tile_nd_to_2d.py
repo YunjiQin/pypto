@@ -1545,6 +1545,91 @@ class TestFlattenTileNdTo2DBatchMatmul:
         assert expected_func is not None
         ir.assert_structural_equal(after_func, expected_func)
 
+    def test_batch_matmul_noncontiguous_operand_reemits_per_batch_load(self):
+        """A multi-batch operand whose load also cuts the matrix-row dim is
+        non-contiguous when flattened, so it is re-emitted per batch (a ``[1, X, Y]``
+        window per batch) rather than kept as one non-collapsible whole load.
+
+        ``rhs`` loads ``[2, 2, 5]`` (K=2) from ``rhs_src [2, 4, 5]`` (K_full=4): batch=2
+        and the middle K dim is partially sliced, so the flattened rows are not
+        contiguous (a ``[2*K, N]`` whole load would read across the K gap). It must
+        become two per-batch ``[1, 2, 5]`` loads at offsets ``[0,0,0]`` / ``[1,0,0]``;
+        the contiguous ``lhs`` (``[2, 3, 2]``, full) stays a single whole load.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                lhs: pl.Tensor[[2, 3, 2], pl.FP16],
+                rhs_src: pl.Tensor[[2, 4, 5], pl.FP16],
+                out_0: pl.Out[pl.Tensor[[2, 3, 5], pl.FP16]],
+            ) -> pl.Tensor[[2, 3, 5], pl.FP16]:
+                lhs_tile: pl.Tile[[2, 3, 2], pl.FP16] = pl.load(
+                    lhs, [0, 0, 0], [2, 3, 2], target_memory=pl.MemorySpace.Mat
+                )
+                rhs_tile: pl.Tile[[2, 2, 5], pl.FP16] = pl.load(
+                    rhs_src, [0, 0, 0], [2, 2, 5], target_memory=pl.MemorySpace.Mat
+                )
+                out_tile: pl.Tile[[2, 3, 5], pl.FP32] = pl.tile.batch_matmul(lhs_tile, rhs_tile)
+                out_0 = pl.store(out_tile, [0, 0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(
+                self,
+                lhs: pl.Tensor[[2, 3, 2], pl.FP16],
+                rhs_src: pl.Tensor[[2, 4, 5], pl.FP16],
+            ) -> pl.Tensor[[2, 3, 5], pl.FP16]:
+                out_0 = pl.create_tensor([2, 3, 5], dtype=pl.FP16)
+                y = self.main_incore_0(lhs, rhs_src, out_0)
+                return y
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                lhs: pl.Tensor[[2, 3, 2], pl.FP16],
+                rhs_src: pl.Tensor[[2, 4, 5], pl.FP16],
+                out_0: pl.Out[pl.Tensor[[2, 3, 5], pl.FP16]],
+            ) -> pl.Tensor[[2, 3, 5], pl.FP16]:
+                # lhs (contiguous, [2,3,2] -> [6,2]) kept whole and row-sliced per batch;
+                # rhs (non-contiguous: B=2 + partial K) re-emitted as per-batch [1,2,5] loads.
+                lhs_tile: pl.Tile[[6, 2], pl.FP16, pl.Mem.Mat] = pl.load(
+                    lhs, [0, 0, 0], [2, 3, 2], [2, 3, 2], target_memory=pl.Mem.Mat, transpose=False
+                )
+                lhs_slice_0: pl.Tile[[3, 2], pl.FP16, pl.Mem.Mat] = pl.tile.slice(lhs_tile, [3, 2], [0, 0])
+                rhs_pbload_0: pl.Tile[[2, 5], pl.FP16, pl.Mem.Mat] = pl.load(
+                    rhs_src, [0, 0, 0], [1, 2, 5], [1, 2, 5], target_memory=pl.Mem.Mat, transpose=False
+                )
+                matmul_0 = pl.tile.matmul(lhs_slice_0, rhs_pbload_0)
+                out_0_0 = pl.store(matmul_0, [0, 0, 0], out_0, shapes=[1, 3, 5])
+
+                lhs_slice_1: pl.Tile[[3, 2], pl.FP16, pl.Mem.Mat] = pl.tile.slice(lhs_tile, [3, 2], [3, 0])
+                rhs_pbload_1: pl.Tile[[2, 5], pl.FP16, pl.Mem.Mat] = pl.load(
+                    rhs_src, [1, 0, 0], [1, 2, 5], [1, 2, 5], target_memory=pl.Mem.Mat, transpose=False
+                )
+                matmul_1 = pl.tile.matmul(lhs_slice_1, rhs_pbload_1)
+                out_0_1 = pl.store(matmul_1, [1, 0, 0], out_0_0, shapes=[1, 3, 5])
+                return out_0_1
+
+            @pl.function
+            def main(
+                self,
+                lhs: pl.Tensor[[2, 3, 2], pl.FP16],
+                rhs_src: pl.Tensor[[2, 4, 5], pl.FP16],
+            ) -> pl.Tensor[[2, 3, 5], pl.FP16]:
+                out_0 = pl.create_tensor([2, 3, 5], dtype=pl.FP16)
+                y = self.main_incore_0(lhs, rhs_src, out_0)
+                return y
+
+        after_func = self._flattened_incore(Before)
+        expected_func = Expected.get_function("main_incore_0")
+        assert expected_func is not None
+        ir.assert_structural_equal(after_func, expected_func)
+
     def test_batch_matmul_both_operands_trans_view_unrolls_per_batch_column_slice(self):
         """Both operands transposed (natural load + ``tile.transpose_view``) unroll per
         batch via column slices of each kept whole-batch view — no per-batch transpose op.

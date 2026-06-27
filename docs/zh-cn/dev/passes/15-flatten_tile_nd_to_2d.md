@@ -60,27 +60,34 @@ program_2d = flatten_pass(program)
 | 1D/2D Tile 操作 | 不变 |
 
 **统一的操作数处理 —— 整块切片 vs 逐 batch load。** 每个 batch_matmul 操作数
-（lhs 或 rhs、转置与否、来自 load 或 move）处理方式完全一致。容量门
-（`BatchOperandsWholeFit`）按 matmul 判定两个操作数的整块 tile 能否一起放进
-Mat（L1）：
+（lhs 或 rhs、转置与否、来自 load 或 move）处理方式完全一致。路由**按操作数**判定：
+仅当两个操作数的整块 tile 能一起放进 Mat（L1）（`BatchOperandsWholeFit` 容量门）
+**且**该操作数的整块 load 连续可塌（`WholeLoadContiguous`）时才保留整块，否则逐
+batch 重发。
 
-- **whole_fits（默认）**：操作数整块进 Mat 一次，再按 batch **切片** —— 普通
+- **整块（默认）**：操作数整块进 Mat 一次，再按 batch **切片** —— 普通
   （行批 `[B*rows, cols]`）操作数行切，`tile.transpose_view`（列批 `[K, B*N]`）
   操作数列切。3D `[B, N, K]` 张量的自然 Mat load 在此**保留 ND 源窗口**；硬件
   ND2NZ「2 维 GlobalTensor」塌成 `[B*N, K]` 的处理由 `tile.load` codegen 负责
   —— 当 load 结果为 NZ Mat tile 时触发，并在那里发射 2D `make_tensor_view`，故本
   pass 只把 load 的**结果 tile** 展平为 2D。广播操作数复用其单页。
-- **!whole_fits（大操作数，load 来源）**：整块会撑爆 L1，故从底层自然 `tile.load`
-  **逐 batch load**（每 batch `[1, .., X, Y]` 窗口 → 2D `[X, Y]`），转置时再加逐
-  batch `tile.transpose_view`。随后丢弃死掉的整块 load/view。
+- **逐 batch**（整块会撑爆 L1，**或**整块 load 非连续）：从底层自然 `tile.load`
+  **逐 batch 重发**（每 batch `[1, .., X, Y]` 窗口 → 2D `[X, Y]`，用 load 自身的
+  窗口维度，故部分子 tile 也能正确重发），转置时再加逐 batch
+  `tile.transpose_view`。随后丢弃死掉的整块 load/view。
+  - *非连续* 指既切多 batch、又部分切矩阵行（中间）维的 load —— 如从 `[2, K, N]`
+    切 `[2, K0<K, N]`。展平成 `[2*K, N]` 后各 batch 间有空洞，无法做成单个 2D
+    ND2NZ load；逐 batch 后每块是 `[1, K0, N]`（连续），可正常塌。此路由保证
+    codegen 的连续性守卫**永不**对 batch_matmul 操作数触发。
 
-**死 load 消除（仅 !fit）。** 当 `!whole_fits` 逐 batch 重发 load 时，原始整块
-load/view 变为死代码并被丢弃。一条链（`tile.load → tile.transpose_view`，会向上
-回溯）在其**每一处**使用都是 `tile.batch_matmul[_acc]` 操作数时才可丢弃，且仅当其
-**所有**消费 matmul 都为 `!fit` 时才丢（与任一 fit matmul 共享的链保持整块）。
-使用次数按**递归**统计（含嵌套的 `If`/`For`/`While`/`Scope` 体），故嵌套块内也被
-使用的 load 绝不丢弃。容量门按后端门控：无后端配置（多数单测）时恒判为 fit，保留
-更简单的整块+切片路径。
+**死 load 消除（仅逐 batch）。** 当操作数逐 batch 重发（容量 !fit 或非连续）时，
+原始整块 load/view 变为死代码并被丢弃。丢弃 pre-scan 采用与 `LowerBatchMatmul`
+**相同的按操作数路由**，故非连续操作数的链在此也被识别为逐 batch。一条链
+（`tile.load → tile.transpose_view`，会向上回溯）在其**每一处**使用都是
+`tile.batch_matmul[_acc]` 操作数时才可丢弃，且仅当其**所有**消费 matmul 都把它判为
+逐 batch 时才丢（与任一保留整块的 matmul 共享的链保持整块）。使用次数按**递归**统计
+（含嵌套的 `If`/`For`/`While`/`Scope` 体）。容量门按后端门控（无后端 → 判 fit），
+但连续性检查不门控，故非连续路由在单测里也会触发。
 
 > 逐 batch 的 V2C move（move 来源且放不下 L1 的操作数）是后续待办；此类操作数目前
 > 仍走整块切片路径，仅在被搬运的整块 tile 放得下固定跨核 ring 时正确。
