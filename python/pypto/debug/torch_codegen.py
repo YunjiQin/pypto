@@ -620,10 +620,7 @@ def _kw_dtype(kw: dict[str, Any]) -> str:
 
 def _handle_tile_load(a: list[str], kw: dict[str, Any]) -> str:
     # args: [tensor, offsets_tuple, shapes_tuple, valid_shapes_tuple]
-    expr = f"_tile_load({a[0]}, {a[1]}, {a[2]}, {a[3]})"
-    if kw.get("transpose"):
-        expr += ".mT"
-    return expr
+    return f"_tile_load({a[0]}, {a[1]}, {a[2]}, {a[3]})"
 
 
 def _handle_tile_store(a: list[str], kw: dict[str, Any]) -> str:
@@ -933,6 +930,8 @@ def _register_ops() -> None:  # noqa: PLR0915
         # reshape / transpose / slice / concat
         m[f"{prefix}.reshape"] = lambda a, _kw: f"{a[0]}.reshape({a[1]})"
         m[f"{prefix}.transpose"] = lambda a, _kw: f"{a[0]}.transpose({a[1]}, {a[2]})"
+        # transpose_view: zero-copy reinterpret swapping the trailing two dims.
+        m[f"{prefix}.transpose_view"] = lambda a, _kw: f"{a[0]}.mT"
         m[f"{prefix}.concat"] = lambda a, _kw: f"torch.cat([{a[0]}, {a[1]}], dim=-1)"
 
         # fillpad
