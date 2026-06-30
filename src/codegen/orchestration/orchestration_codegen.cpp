@@ -85,6 +85,25 @@ namespace {
 
 constexpr const char* kDualAivDispatchAttr = "dual_aiv_dispatch";
 
+// Runtime ArgDirection name for an orchestration-entry param direction. The
+// orchestration entry exposes ``ir::ParamDirection`` (3 values), distinct from
+// the per-kernel call-site ``ArgDirection`` path handled by
+// ``OrchestrationStmtCodegen::ArgDirectionToRuntimeName``; both encode the same
+// runtime "IN"/"OUT"/"INOUT" tokens, so keep this converter named and greppable
+// as that helper's sibling rather than inlined.
+const char* ParamDirectionToRuntimeName(ir::ParamDirection dir) {
+  switch (dir) {
+    case ir::ParamDirection::In:
+      return "IN";
+    case ir::ParamDirection::Out:
+      return "OUT";
+    case ir::ParamDirection::InOut:
+      return "INOUT";
+  }
+  INTERNAL_CHECK(false) << "Internal error: unexpected ParamDirection value";
+  return "";
+}
+
 // MaterializeRuntimeScopes wraps the orchestration function body and each
 // ForStmt / IfStmt branch body in an AUTO ``RuntimeScopeStmt`` so codegen emits
 // ``PTO2_SCOPE()`` 1:1 from the IR. The structural analyses below inspect those
@@ -3768,13 +3787,25 @@ OrchestrationResult GenerateOrchestration(const ir::ProgramPtr& program, const i
   // kernel dispatch (matching the trailing ``!pto.ptr<i64>`` args appended
   // by PTOCodegen for DistributedTensor params).
   std::vector<std::string> dist_tensor_param_names;
-  for (const auto& var : func->params_) {
+  // Per-tensor runtime ArgDirection names in orch_args tensor order. Built in
+  // the same param loop that assigns orch_index, so entry index `i` (used by
+  // orch_args.tensor(i) at codegen and bind_callable_to_runtime_impl at
+  // runtime) lines up 1:1 with orchestration_signature[i]. Scalars are skipped
+  // exactly as they are excluded from the tensor index — mirroring the
+  // per-kernel RecordKernelSignature contract.
+  std::vector<std::string> orchestration_signature;
+  CHECK(func->params_.size() == func->param_directions_.size())
+      << "Orchestration function '" << func->name_ << "' has " << func->params_.size() << " params but "
+      << func->param_directions_.size() << " param directions";
+  for (size_t param_idx = 0; param_idx < func->params_.size(); ++param_idx) {
+    const auto& var = func->params_[param_idx];
     std::string emit_name = GetSSABaseName(var->name_hint_);
     emit_name_map[var.get()] = emit_name;
     param_name_set.insert(emit_name);
     if (AsTensorTypeLike(var->GetType())) {
       param_name_to_orch_index[emit_name] = tensor_param_count;
       tensor_param_count++;
+      orchestration_signature.emplace_back(ParamDirectionToRuntimeName(func->param_directions_[param_idx]));
       if (As<DistributedTensorType>(var->GetType())) {
         dist_tensor_param_names.push_back(emit_name);
       }
@@ -3865,7 +3896,7 @@ OrchestrationResult GenerateOrchestration(const ir::ProgramPtr& program, const i
   oss << "}  // extern \"C\"\n";
 
   return OrchestrationResult{oss.str(), std::move(func_name_to_id), std::move(func_name_to_core_type),
-                             std::move(func_name_to_signature)};
+                             std::move(func_name_to_signature), std::move(orchestration_signature)};
 }
 
 }  // namespace codegen
