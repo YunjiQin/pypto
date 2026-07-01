@@ -83,15 +83,13 @@ class Worker(ABC):
       reclaimed.
     """
 
-    #: Noun used in the ``worker_id != 0`` error message; subclasses override.
-    _WORKER_KIND: str = "worker"
-
     def __init__(self) -> None:
         # Subclasses MUST call ``super().__init__()`` so this set exists before
         # any ``alloc_tensor`` call. Tracks DeviceTensors allocated via
         # ``alloc_tensor`` so ``_close_owned_tensors`` can release any the
-        # caller forgot.
-        self._owned_tensors: set[int] = set()
+        # caller forgot. Keyed by ``(worker_id, data_ptr)`` so buffers allocated
+        # on a non-default worker are freed against the correct worker.
+        self._owned_tensors: set[tuple[int, int]] = set()
 
     # ------------------------------------------------------------------
     # Memory primitives — implemented per subclass.
@@ -183,23 +181,18 @@ class Worker(ABC):
         before the exception propagates so callers never observe a leaked
         pointer.
 
-        The returned :class:`DeviceTensor` is tracked by this Worker: if the
-        caller does not :meth:`free_tensor` it before ``close()``, the
-        subclass's ``close()`` (via :meth:`_close_owned_tensors`) reclaims it.
+        The returned :class:`DeviceTensor` is tracked by this Worker keyed by
+        ``(worker_id, data_ptr)``: if the caller does not :meth:`free_tensor` it
+        before ``close()``, the subclass's ``close()`` (via
+        :meth:`_close_owned_tensors`) reclaims it against the same worker.
+        Because a :class:`DeviceTensor` does not itself carry its worker scope,
+        a caller that allocates on a non-default worker MUST pass the same
+        ``worker_id`` to :meth:`free_tensor`.
 
         Returns:
             A :class:`DeviceTensor` referencing the allocated buffer.
         """
         self._require_ready("alloc_tensor")
-        # DeviceTensor only carries (data_ptr, shape, dtype) — no worker_id.
-        # Until the handle encodes worker scope, restrict the convenience helpers
-        # to the default worker so free_tensor cannot silently free a different
-        # worker's pointer.
-        if worker_id != 0:
-            raise ValueError(
-                f"{type(self).__name__}.alloc_tensor currently only supports worker_id=0. "
-                f"Use malloc/copy_to directly if you need a different {self._WORKER_KIND}."
-            )
         t = alloc_device_tensor(
             malloc=lambda nbytes: self.malloc(nbytes, worker_id=worker_id),
             copy_to=lambda dst, src, nbytes: self.copy_to(dst, src, nbytes, worker_id=worker_id),
@@ -209,34 +202,31 @@ class Worker(ABC):
             init=init,
             init_prep=self._prepare_init,
         )
-        self._owned_tensors.add(t.data_ptr)
+        self._owned_tensors.add((worker_id, t.data_ptr))
         return t
 
     def free_tensor(self, t: DeviceTensor, *, worker_id: int = 0) -> None:
         """Release a buffer previously returned by :meth:`alloc_tensor`.
 
         Untracks *t* from this Worker's owned-set, then frees the underlying
-        pointer. Idempotent: if *t* is no longer tracked (e.g. because
-        ``_close_owned_tensors`` ran first, or because the caller already
-        called ``free_tensor`` on this tensor), this is a no-op — the
-        underlying ``free`` is NOT called a second time. This protects
-        against a double-free at the C++ layer, and against a post-close
-        ``RuntimeError`` when the caller's explicit cleanup races with
-        auto-free.
+        pointer against *worker_id* (which MUST match the ``worker_id`` used to
+        allocate *t* — a :class:`DeviceTensor` does not carry its worker scope).
+        Idempotent: if ``(worker_id, t.data_ptr)`` is no longer tracked (e.g.
+        because ``_close_owned_tensors`` ran first, or because the caller already
+        called ``free_tensor`` on this tensor), this is a no-op — the underlying
+        ``free`` is NOT called a second time. This protects against a double-free
+        at the C++ layer, and against a post-close ``RuntimeError`` when the
+        caller's explicit cleanup races with auto-free.
         """
-        if worker_id != 0:
-            raise ValueError(
-                f"{type(self).__name__}.free_tensor currently only supports worker_id=0. "
-                f"Use free directly if you need a different {self._WORKER_KIND}."
-            )
+        key = (worker_id, t.data_ptr)
         # Discard rather than ``remove`` so a double-call doesn't raise. If
-        # the ptr was already discarded by a prior free_tensor or by
+        # the key was already discarded by a prior free_tensor or by
         # _close_owned_tensors, skip the underlying free — that path either
         # already ran or no longer accepts calls (subclass ``_require_ready``
         # may now reject post-close).
-        if t.data_ptr not in self._owned_tensors:
+        if key not in self._owned_tensors:
             return
-        self._owned_tensors.discard(t.data_ptr)
+        self._owned_tensors.discard(key)
         self.free(t.data_ptr, worker_id=worker_id)
 
     def _close_owned_tensors(self) -> None:
@@ -251,13 +241,14 @@ class Worker(ABC):
         # close()) don't double-iterate.
         leaked = self._owned_tensors
         self._owned_tensors = set()
-        for ptr in leaked:
+        for worker_id, ptr in leaked:
             try:
-                self.free(ptr, worker_id=0)
+                self.free(ptr, worker_id=worker_id)
             except Exception:
                 _log.warning(
-                    "%s._close_owned_tensors: free(ptr=0x%x) failed; leaking",
+                    "%s._close_owned_tensors: free(worker_id=%d, ptr=0x%x) failed; leaking",
                     type(self).__name__,
+                    worker_id,
                     ptr,
                     exc_info=True,
                 )
