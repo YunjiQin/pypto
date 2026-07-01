@@ -40,6 +40,7 @@ import pytest
 import torch
 from pypto import ir
 from pypto.ir.distributed_compiled_program import DistributedConfig
+from pypto.runtime import StackedDeviceTensor
 
 N_RANKS = 2
 DIM = 128
@@ -147,6 +148,7 @@ def _run_stacked(test_config, device_ids, program, worker_ids):
 
     with compiled.prepare() as rt:
         weight = rt.alloc_stacked_tensor(host_b, worker_ids=worker_ids)
+        assert isinstance(weight, StackedDeviceTensor)  # fail fast if the API contract changes
         # Prove residency: scribble over the upload source. A kernel that re-read
         # host memory would now compute a + 0 instead of a + b.
         host_b.zero_()

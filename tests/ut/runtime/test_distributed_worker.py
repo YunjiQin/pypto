@@ -373,6 +373,16 @@ class TestAllocStackedTensor:
             rt.alloc_stacked_tensor(host, worker_ids=[0, 5])
         rt.close()
 
+    def test_empty_leading_dim_rejected(self, patched_setup):
+        # B == 0 must fail cleanly (before any malloc), not build an empty
+        # StackedDeviceTensor that IndexErrors on .dtype / __repr__.
+        rt = DistributedWorker(self._compiled_2cards())
+        host = torch.zeros(0, 4, 4, dtype=torch.float32).share_memory_()
+        with pytest.raises(ValueError, match="at least one shard"):
+            rt.alloc_stacked_tensor(host)
+        patched_setup["worker"]._orch.malloc.assert_not_called()
+        rt.close()
+
     def test_worker_ids_length_mismatch_rejected(self, patched_setup):
         rt = DistributedWorker(self._compiled_2cards())
         host = torch.zeros(2, 4, 4, dtype=torch.float32).share_memory_()

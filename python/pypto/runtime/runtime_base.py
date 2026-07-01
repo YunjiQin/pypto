@@ -211,20 +211,30 @@ class Worker(ABC):
         Untracks *t* from this Worker's owned-set, then frees the underlying
         pointer against *worker_id* (which MUST match the ``worker_id`` used to
         allocate *t* — a :class:`DeviceTensor` does not carry its worker scope).
-        Idempotent: if ``(worker_id, t.data_ptr)`` is no longer tracked (e.g.
-        because ``_close_owned_tensors`` ran first, or because the caller already
-        called ``free_tensor`` on this tensor), this is a no-op — the underlying
-        ``free`` is NOT called a second time. This protects against a double-free
-        at the C++ layer, and against a post-close ``RuntimeError`` when the
-        caller's explicit cleanup races with auto-free.
+        Idempotent for a genuine double-free: if ``t.data_ptr`` is no longer
+        tracked under *any* worker (e.g. ``_close_owned_tensors`` ran first, or
+        the caller already freed it), this is a no-op — the underlying ``free``
+        is NOT called a second time. This protects against a double-free at the
+        C++ layer, and against a post-close ``RuntimeError`` when explicit
+        cleanup races with auto-free.
+
+        Raises:
+            ValueError: if ``t.data_ptr`` is still tracked but under a different
+                ``worker_id`` — silently no-oping there would leak the buffer
+                until ``close()``, so the mismatched-worker contract bug is
+                surfaced instead.
         """
         key = (worker_id, t.data_ptr)
-        # Discard rather than ``remove`` so a double-call doesn't raise. If
-        # the key was already discarded by a prior free_tensor or by
-        # _close_owned_tensors, skip the underlying free — that path either
-        # already ran or no longer accepts calls (subclass ``_require_ready``
-        # may now reject post-close).
         if key not in self._owned_tensors:
+            # A missing exact key is only idempotent if this ptr is no longer
+            # owned at all. If it is still tracked under another worker_id, the
+            # caller passed the wrong worker — surface it rather than leak.
+            owners = sorted(w for w, ptr in self._owned_tensors if ptr == t.data_ptr)
+            if owners:
+                raise ValueError(
+                    f"free_tensor(..., worker_id={worker_id}) does not match the owning worker for "
+                    f"ptr=0x{t.data_ptr:x} (allocated on worker(s) {owners}); pass the same worker_id."
+                )
             return
         self._owned_tensors.discard(key)
         self.free(t.data_ptr, worker_id=worker_id)

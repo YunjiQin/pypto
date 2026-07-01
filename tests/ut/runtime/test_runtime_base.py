@@ -177,6 +177,30 @@ def test_nonzero_worker_id_allocates_tracks_and_frees_against_that_worker():
     assert (t.data_ptr, 3) in h.free_calls
 
 
+def test_free_tensor_wrong_worker_id_raises_instead_of_leaking():
+    """Freeing a still-owned ptr with the wrong worker_id surfaces the contract
+    bug rather than silently no-oping (which would leak until close())."""
+    h = FakeHandle()
+    t = h.alloc_tensor((4,), torch.float32, worker_id=3)
+    with pytest.raises(ValueError, match="does not match the owning worker"):
+        h.free_tensor(t, worker_id=0)  # wrong worker id
+    # Still tracked (not leaked-and-forgotten) and never freed.
+    assert (3, t.data_ptr) in h._owned_tensors
+    assert h.freed == []
+    # The correct worker_id still frees it.
+    h.free_tensor(t, worker_id=3)
+    assert h.freed == [t.data_ptr]
+
+
+def test_free_tensor_genuine_double_free_is_still_noop():
+    """A second free of a fully-released ptr is an idempotent no-op (no raise)."""
+    h = FakeHandle()
+    t = h.alloc_tensor((4,), torch.float32, worker_id=2)
+    h.free_tensor(t, worker_id=2)
+    h.free_tensor(t, worker_id=2)  # ptr no longer owned under any worker -> no-op
+    assert h.freed == [t.data_ptr]  # freed exactly once
+
+
 def test_close_frees_multi_worker_tensors_against_their_workers():
     """_close_owned_tensors releases each leaked buffer against its own worker."""
     h = FakeHandle()

@@ -152,6 +152,11 @@ class TestStackedDeviceTensorConstruction:
         with pytest.raises(ValueError, match="rank >= 2"):
             StackedDeviceTensor([DeviceTensor(0x1000, (4,), torch.float32)], (1,), (0,))
 
+    def test_empty_leading_dim_raises(self):
+        # B == 0 would leave shards empty; .dtype/.__repr__ would IndexError.
+        with pytest.raises(ValueError, match="at least one shard"):
+            StackedDeviceTensor([], (0, 4, 5), ())
+
 
 class TestStackedDeviceTensorIndexing:
     def test_int_index_returns_shard(self):
@@ -166,6 +171,23 @@ class TestStackedDeviceTensorIndexing:
         s = StackedDeviceTensor(sh, (3, 4, 5), (0, 1, 2))
         assert s[1, 0:4, 0:5] is sh[1]
         assert s[1, :, :] is sh[1]
+
+    def test_ellipsis_index_returns_shard(self):
+        # The documented whole-shard form x[i, ...] must behave like x[i].
+        sh = _shards(3)
+        s = StackedDeviceTensor(sh, (3, 4, 5), (0, 1, 2))
+        assert s[1, ...] is sh[1]
+        assert s[2, ...] is sh[2]
+
+    def test_ellipsis_with_leading_full_slice(self):
+        sh = _shards(3)
+        s = StackedDeviceTensor(sh, (3, 4, 5), (0, 1, 2))
+        assert s[1, 0:4, ...] is sh[1]
+
+    def test_multiple_ellipsis_rejected(self):
+        s = StackedDeviceTensor(_shards(3), (3, 4, 5), (0, 1, 2))
+        with pytest.raises(IndexError, match="at most one Ellipsis"):
+            _ = s[0, ..., ...]
 
     def test_partial_tail_slice_rejected(self):
         s = StackedDeviceTensor(_shards(3), (3, 4, 5), (0, 1, 2))

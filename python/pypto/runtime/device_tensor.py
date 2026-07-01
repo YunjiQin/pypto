@@ -123,6 +123,10 @@ class StackedDeviceTensor:
         if len(full_t) < 2:
             raise ValueError(f"StackedDeviceTensor.full_shape must have rank >= 2, got {full_t}")
         b = full_t[0]
+        if b < 1:
+            raise ValueError(
+                f"StackedDeviceTensor needs at least one shard in the leading dim, got full_shape {full_t}"
+            )
         tail = full_t[1:]
         if len(shards_t) != b:
             raise ValueError(
@@ -158,10 +162,11 @@ class StackedDeviceTensor:
     def __getitem__(self, idx: int | slice | tuple) -> DeviceTensor:
         """Return shard ``i`` for a leading-index ``i`` or ``(i, <full slices>)``.
 
-        The generated ``host_orch`` emits either ``x[r]`` or ``x[r, 0:N, 0:M]``;
-        both resolve to shard ``r``. Any non-whole-shard trailing slice is
-        rejected loudly — a stacked tensor only supports whole-shard slicing on
-        the leading dimension.
+        The generated ``host_orch`` emits either ``x[r]`` or ``x[r, 0:N, 0:M]``,
+        and callers may use the ``x[r, ...]`` (Ellipsis) whole-shard form; all
+        resolve to shard ``r``. Any non-whole-shard trailing slice is rejected
+        loudly — a stacked tensor only supports whole-shard slicing on the
+        leading dimension.
         """
         if isinstance(idx, tuple):
             if not idx:
@@ -174,6 +179,17 @@ class StackedDeviceTensor:
         if not 0 <= rank < len(self.shards):
             raise IndexError(f"shard index {rank} out of range [0, {len(self.shards)})")
         tail = self.full_shape[1:]
+        # Expand a single Ellipsis into full slices so each trailing index maps
+        # to a concrete shard axis; ``x[i, ...]`` is the documented whole-shard
+        # form and must behave like ``x[i]``.
+        if any(s is Ellipsis for s in rest):
+            if sum(s is Ellipsis for s in rest) > 1:
+                raise IndexError("StackedDeviceTensor index accepts at most one Ellipsis")
+            e = rest.index(Ellipsis)
+            n_fill = len(tail) - (len(rest) - 1)
+            if n_fill < 0:
+                raise IndexError(f"too many indices for StackedDeviceTensor of shape {self.full_shape}")
+            rest = rest[:e] + tuple(slice(None) for _ in range(n_fill)) + rest[e + 1 :]
         if len(rest) > len(tail):
             raise IndexError(f"too many indices for StackedDeviceTensor of shape {self.full_shape}")
         for axis, s in enumerate(rest):

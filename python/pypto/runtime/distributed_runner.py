@@ -1146,6 +1146,11 @@ class DistributedWorker(Worker):
                 f"alloc_stacked_tensor needs a [B, *tail] tensor (rank >= 2), got shape {tuple(host.shape)}"
             )
         b = int(host.shape[0])
+        if b < 1:
+            raise ValueError(
+                f"alloc_stacked_tensor needs at least one shard in the leading dim, "
+                f"got shape {tuple(host.shape)}"
+            )
         world = len(self.dc.device_ids)
         ids = list(range(b)) if worker_ids is None else [int(w) for w in worker_ids]
         if len(ids) != b:
