@@ -649,7 +649,7 @@ def _dispatch(
 
 def execute_distributed(
     compiled: DistributedCompiledProgram,
-    coerced_args: list[torch.Tensor | DeviceTensor],
+    coerced_args: list[torch.Tensor | DeviceTensor | StackedDeviceTensor],
     config: RunConfig | None = None,
 ) -> None:
     """Execute a distributed compiled program once via simpler Worker(level=3).
@@ -694,9 +694,12 @@ def execute_distributed(
     # be in shared memory before the fork; DeviceTensor inputs are device
     # pointers forwarded at submit time and need no pre-fork shared memory.
     param_infos, _, _ = compiled._get_metadata()
-    tensors: dict[str, torch.Tensor | DeviceTensor] = {}
+    tensors: dict[str, torch.Tensor | DeviceTensor | StackedDeviceTensor] = {}
     for info, arg in zip(param_infos, coerced_args, strict=True):
-        if isinstance(arg, DeviceTensor):
+        # Worker-resident inputs (a DeviceTensor, or a StackedDeviceTensor whose
+        # per-rank shards are each DeviceTensors) are device pointers forwarded
+        # at submit time — no pre-fork shared memory needed.
+        if isinstance(arg, (DeviceTensor, StackedDeviceTensor)):
             tensors[info.name] = arg
             continue
         if not arg.is_shared():
@@ -785,12 +788,18 @@ def execute_distributed(
 
 def execute_distributed_compiled(
     output_dir: str | Path,
-    args: Sequence[torch.Tensor | DeviceTensor | ctypes._SimpleCData],
+    args: Sequence[torch.Tensor | DeviceTensor | StackedDeviceTensor | ctypes._SimpleCData],
     config: RunConfig | None = None,
     *,
     platform: str | None = None,
     distributed_config: DistributedConfig | None = None,
-) -> torch.Tensor | DeviceTensor | tuple[torch.Tensor | DeviceTensor, ...] | None:
+) -> (
+    torch.Tensor
+    | DeviceTensor
+    | StackedDeviceTensor
+    | tuple[torch.Tensor | DeviceTensor | StackedDeviceTensor, ...]
+    | None
+):
     """Reconstruct a distributed program from ``output_dir`` and run it once.
 
     The distributed counterpart of :func:`pypto.runtime.execute_compiled`: it

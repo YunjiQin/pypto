@@ -41,11 +41,12 @@ from pypto.pypto_core.ir import (
 from pypto.runtime.device_tensor import DeviceTensor, StackedDeviceTensor
 
 # Type alias for arguments accepted by CompiledProgram.__call__().
-# Tensor params accept ``torch.Tensor`` (host) or :class:`DeviceTensor`
-# (worker-resident — skips H2D/D2H, see ``pypto.runtime.DeviceTensor``).
+# Tensor params accept ``torch.Tensor`` (host), :class:`DeviceTensor`
+# (worker-resident — skips H2D/D2H, see ``pypto.runtime.DeviceTensor``), or, for
+# distributed programs, a :class:`StackedDeviceTensor` (per-card resident shards).
 # Scalar params accept Python primitives or ctypes scalars (which are
 # coerced to the correct ctypes type internally).
-CallArg = torch.Tensor | DeviceTensor | int | float | bool | ctypes._SimpleCData
+CallArg = torch.Tensor | DeviceTensor | StackedDeviceTensor | int | float | bool | ctypes._SimpleCData
 
 # IR DataType -> torch.dtype mapping.
 # Keyed by string because nanobind DataType instances are not singletons,
