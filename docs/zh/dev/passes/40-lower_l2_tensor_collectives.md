@@ -8,7 +8,7 @@
 
 目前支持 `pld.tensor.all_to_all_v`，且要求 `core_num=1`。
 
-HOST 通路（[`LowerHostTensorCollectives`](44-lower_host_tensor_collectives.md)）
+HOST 通路（[`LowerHostTensorCollectives`](46-lower_host_tensor_collectives.md)）
 在上一层解决同一问题，做法不同：它把集合通信按设备扇出成**每个设备一次**
 `builtin.tensor.*` chip dispatch。每次这样的 dispatch 都是一个完整的 L2
 orchestration task，而它唯一的工作就是提交一个 AIV kernel，因此
@@ -31,12 +31,12 @@ L3 -> L2  consume task                             └── consume       (AIV 
 ```
 
 这个位置是必要条件而非偏好。改写后的调用必须像任何其他 kernel 调用一样经过
-[`DeriveCallDirections`](39-derive_call_directions.md) 和
-[`AutoDeriveTaskDependencies`](40-auto_derive_task_dependencies.md)：正是这两个
+[`DeriveCallDirections`](41-derive_call_directions.md) 和
+[`AutoDeriveTaskDependencies`](42-auto_derive_task_dependencies.md)：正是这两个
 pass 把合成 kernel 的参数方向转换成排序 `compute -> collective -> consume` 的
 TensorMap 依赖边。放在它们之后改写，会让该 collective task 失去顺序约束。
 
-它同样运行在 [`MaterializeDistTensorCtx`](45-materialize_dist_tensor_ctx.md)
+它同样运行在 [`MaterializeDistTensorCtx`](47-materialize_dist_tensor_ctx.md)
 之前 —— 后者会补上 kernel 需要的 `CommCtx` 实参（见下文 *ABI*）。
 
 ## 行为

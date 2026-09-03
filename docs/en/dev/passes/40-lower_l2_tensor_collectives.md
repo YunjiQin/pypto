@@ -9,7 +9,7 @@ ordinary task inside the caller's own pipeline.
 
 Today it handles `pld.tensor.all_to_all_v` with `core_num=1`.
 
-The HOST rail ([`LowerHostTensorCollectives`](44-lower_host_tensor_collectives.md))
+The HOST rail ([`LowerHostTensorCollectives`](46-lower_host_tensor_collectives.md))
 solves the same problem one level up, and differently: it fans the collective
 out into one `builtin.tensor.*` chip dispatch *per device*. Each such dispatch is
 a whole extra L2 orchestration task whose only job is to submit one AIV kernel,
@@ -32,15 +32,15 @@ L3 -> L2  consume task                             └── consume       (AIV 
 ```
 
 The position is load-bearing. The emitted call must reach
-[`DeriveCallDirections`](39-derive_call_directions.md) and
-[`AutoDeriveTaskDependencies`](40-auto_derive_task_dependencies.md) like any
+[`DeriveCallDirections`](41-derive_call_directions.md) and
+[`AutoDeriveTaskDependencies`](42-auto_derive_task_dependencies.md) like any
 other kernel call: those two passes are what turn the synthesized kernel's
 parameter directions into the TensorMap edges that order
 `compute -> collective -> consume`. Running the rewrite after them would leave
 the collective task unordered.
 
 It also runs before
-[`MaterializeDistTensorCtx`](45-materialize_dist_tensor_ctx.md), which appends
+[`MaterializeDistTensorCtx`](47-materialize_dist_tensor_ctx.md), which appends
 the `CommCtx` arguments the kernel needs (see *ABI* below).
 
 ## Behavior
