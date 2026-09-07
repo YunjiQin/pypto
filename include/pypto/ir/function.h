@@ -516,9 +516,9 @@ inline constexpr const char* kAttrBuiltinTemplateVars = "builtin_template_vars";
  *
  * Value type: ``bool``; **absent means true**, so only the opt-out (``false``)
  * is ever stored. Written by the ``@pl.function(auto_scope=False)`` decorator and
- * by ``MaterializeRuntimeScopes`` (pass 48), which stamps ``false`` on the
+ * by ``MaterializeRuntimeScopes`` (pass 49), which stamps ``false`` on the
  * functions it has already processed. Read by that same pass (idempotence),
- * ``AutoDeriveTaskDependencies`` (pass 41), ``VerifyRuntimeScopesMaterialized``
+ * ``AutoDeriveTaskDependencies`` (pass 42), ``VerifyRuntimeScopesMaterialized``
  * and the Python printer.
  *
  * Decorator-only, for the same reason as ``kAttrExternalSource`` — see there.

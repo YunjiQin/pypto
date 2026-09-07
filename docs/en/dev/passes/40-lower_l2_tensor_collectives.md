@@ -168,8 +168,8 @@ passes earlier, so re-reporting them here would blame the wrong pass.
   expression* as `target`. It does **not** reject two distinct `pld.window()`
   views of one allocation — deduction runs when the Call is built, and
   `DistributedTensorType::window_buffer_` is not bound until
-  [`MaterializeCommDomainScopes`](43-materialize_comm_domain_scopes.md)
-  (pass 43). Whole-allocation distinctness is a **HOST-rail** guarantee:
+  [`MaterializeCommDomainScopes`](45-materialize_comm_domain_scopes.md)
+  (pass 45). Whole-allocation distinctness is a **HOST-rail** guarantee:
   `LowerHostTensorCollectives` resolves each operand back to its `WindowBuffer`
   within the same `host_orch` body and runs `CheckPairwiseDistinctWindows` over
   all five. This rail — like the InCore composite rail — sees the operands as
@@ -185,8 +185,8 @@ passes earlier, so re-reporting them here would blame the wrong pass.
   bound to different domains would address the wrong remote windows. The HOST
   rail enforces the equivalent through `FindScopeForBuffers`, which sees the
   window buffers directly. This rail cannot: a comm domain has no IR
-  representation until `MaterializeCommDomainScopes` (pass 43) and
-  `MaterializeDistTensorCtx` (pass 45), both of which run *after* this pass, and
+  representation until `MaterializeCommDomainScopes` (pass 45) and
+  `MaterializeDistTensorCtx` (pass 47), both of which run *after* this pass, and
   by then the collective's operands are the enclosing pipeline's parameters —
   relating them back to the host windows that bind them needs interprocedural
   tracing that does not exist today. Comparing the appended `CommCtx` arguments

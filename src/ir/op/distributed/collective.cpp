@@ -649,7 +649,7 @@ TypePtr DeduceTensorAllToAllVType(const std::vector<ExprPtr>& args,
   // moving the wrong bytes at runtime.
   //
   // The aliasing guard below is deliberately narrow. Deduction runs when the
-  // Call is built, long before MaterializeCommDomainScopes (pass 43) binds
+  // Call is built, long before MaterializeCommDomainScopes (pass 45) binds
   // `DistributedTensorType::window_buffer_`, so for a DSL program only the
   // operand-identity test can fire: it catches `input` and `target` being the
   // *same expression*, not two `pld.window()` views of one allocation. The

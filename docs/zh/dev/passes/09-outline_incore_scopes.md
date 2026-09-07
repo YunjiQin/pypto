@@ -192,7 +192,7 @@ with pl.cluster():
 `Call` 处理函数，因此任务提交需要自己的规则；否则每个提交实参都算作读取，只传给 `Out`
 槽位的 capture 就会变成 `InOut`。`Submit` 的 `args_[i]` 按前缀映射到 `params_[i]`
 （`args_.size() <= params_.size()`，省略的尾部由运行时分配），而会破坏该 identity 的
-尾随 `CommCtx` 形参由 `MaterializeDistTensorCtx`（pass 46）生成，远在任何 outliner 之后。它的 `deps_` 始终按
+尾随 `CommCtx` 形参由 `MaterializeDistTensorCtx`（pass 47）生成，远在任何 outliner 之后。它的 `deps_` 始终按
 读取处理——那是本次提交消费的 TaskId 值，绝非写入目的地。
 
 **Hierarchy 作用域是例外。** `OutlineScope` 对 `ScopeKind::Hierarchy` 有意保持

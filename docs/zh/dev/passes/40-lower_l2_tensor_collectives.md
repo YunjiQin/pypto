@@ -150,7 +150,7 @@ pass 之前就已运行，在这里重复报告会指向错误的 pass。
   向量、比 shape 更窄的 `valid_shape`，以及 `input` 与 `target` 是**同一个表达式**。
   它**不会**拒绝同一块 allocation 上的两个不同 `pld.window()` 视图 —— 类型推导在
   构造 Call 时就已运行，而 `DistributedTensorType::window_buffer_` 要到
-  [`MaterializeCommDomainScopes`](43-materialize_comm_domain_scopes.md)（pass 43）
+  [`MaterializeCommDomainScopes`](45-materialize_comm_domain_scopes.md)（pass 45）
   才被绑定。整块 allocation 层面的互不相同是 **HOST 通路**的保证：
   `LowerHostTensorCollectives` 能在同一个 `host_orch` 函数体内把每个操作数溯源回
   其 `WindowBuffer`，并对五个操作数运行 `CheckPairwiseDistinctWindows`。本通路
@@ -163,8 +163,8 @@ pass 之前就已运行，在这里重复报告会指向错误的 pass。
 - **「同属一个通信域」是未经检查的前置条件**。kernel 通过单个 `CommContext`
   （`args[5]`）解析所有对端地址，因此绑定到不同域的操作数会寻址到错误的远端窗口。
   HOST 通路用 `FindScopeForBuffers` 强制了等价约束——它能直接看到 window buffer；
-  本通路做不到：comm domain 在 `MaterializeCommDomainScopes`（pass 43）与
-  `MaterializeDistTensorCtx`（pass 45）之前没有 IR 表示，而这两者都在本 pass
+  本通路做不到：comm domain 在 `MaterializeCommDomainScopes`（pass 45）与
+  `MaterializeDistTensorCtx`（pass 47）之前没有 IR 表示，而这两者都在本 pass
   之后运行；到那时该集合通信的操作数已是外层 pipeline 的参数，把它们追溯回绑定它们
   的 host window 需要目前不存在的跨函数分析。改为比较追加的 `CommCtx` 实参也不成立：
   每个 `DistributedTensor` 参数各自生成一个，单域调用本就携带多个互不相同的 SSA 值。
