@@ -645,8 +645,23 @@ TypePtr DeduceTensorAllToAllVType(const std::vector<ExprPtr>& args,
 
   // Buffer contract: both payload buffers are addressed by flat element
   // arithmetic, and `input` is read while `target` is written by incoming
-  // pushes — so a provably strided view, or the same buffer in both roles, is
-  // rejected here rather than silently moving the wrong bytes at runtime.
+  // pushes, so a provably strided view is rejected here rather than silently
+  // moving the wrong bytes at runtime.
+  //
+  // The aliasing guard below is deliberately narrow. Deduction runs when the
+  // Call is built, long before MaterializeCommDomainScopes (pass 43) binds
+  // `DistributedTensorType::window_buffer_`, so for a DSL program only the
+  // operand-identity test can fire: it catches `input` and `target` being the
+  // *same expression*, not two `pld.window()` views of one allocation. The
+  // window-buffer comparison after it is a defence for IR whose back-reference
+  // is already bound (hand-built, or rebuilt after that pass).
+  //
+  // Whole-allocation distinctness is a HOST-rail guarantee only:
+  // LowerHostTensorCollectives resolves every operand back to its WindowBuffer
+  // — it can, because the `pld.window(...)` calls live in the same host_orch
+  // body — and runs CheckPairwiseDistinctWindows over all five. The InCore and
+  // CHIP/L2 rails receive the operands as enclosing-function parameters and
+  // have no such provenance, so there the contract is the caller's to keep.
   CheckStaticContiguousPayload(input_type, "input");
   CheckStaticContiguousPayload(target_type, "target");
   CHECK(args[0].get() != args[1].get())

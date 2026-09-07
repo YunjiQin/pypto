@@ -415,7 +415,12 @@ Variable-size all-to-all (MPI_Alltoallv). Flat 2D layouts:
 packed row-major views and must be two distinct buffers. A statically provable
 violation — a non-ND layout, a stride vector that is not the packed one, a
 `valid_shape` narrower than the shape, or the same operand in both roles — is
-rejected by the type deducer.
+rejected by the type deducer. Two *distinct* `pld.window()` views of one
+allocation are **not**: the deducer runs when the Call is built, before
+`DistributedTensorType::window_buffer_` is bound. Only the HOST rail rejects
+those, by resolving each operand back to its `WindowBuffer` (see below); on the
+InCore and CHIP rails the operands arrive as function parameters with no such
+provenance, so distinctness is the caller's obligation.
 
 `MAX_RECV = target.shape[0] // NR`. Lowering reads `send_counts[dest]` at
 runtime, clamps it to `[0, MAX_RECV]`, and publishes the **clamped** count into

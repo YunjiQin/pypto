@@ -62,7 +62,7 @@ data = self.__builtin_all_to_all_v__fp32(stage, data, signal, counts, recv)
 
 | 方面 | 取值 |
 | ---- | ---- |
-| 参数 | `input, target, signal, send_counts, recv_counts` —— 类型取自调用点 |
+| 参数 | `input, target, signal, send_counts, recv_counts` —— 规范化类型，**不是**调用点的类型：`input` / `send_counts` 声明为普通 `Tensor`，其余三个为 `DistributedTensor` |
 | 方向 | `In, InOut, InOut, In, InOut` |
 | 函数体 | `return target` —— 单条 `ReturnStmt`，永不参与代码生成 |
 | Attrs | `builtin_template_dir`、`builtin_template_vars` |
@@ -104,7 +104,7 @@ kernel 走同一条路径，区别只在于文本来自模板而非 ptoas。
 | ---- | --------- | -------------------- |
 | `args[0..4]` | `input, target, signal, send_counts, recv_counts` | 相同 |
 | `args[5]` | `CommContext*` | `CommContext*` |
-| `args[6..]` | — | `args[5]` 的未读副本 |
+| `args[6..7]` | — | `args[5]` 的未读副本 |
 
 两条通路都不传 rank 数标量。kernel 读 `CommContext::rankNum`，它与 HOST dispatch
 过去传的 `domain_size` 是同一个数：`comm_derive_context` **按 comm domain** 建
@@ -112,11 +112,12 @@ context，其 `rankNum` 就是该域的 rank 数。去掉这个标量的代价�
 读取，换来的是一份共享源码。这在 CHIP 通路上也是唯一可行方案 —— 它根本无法计算
 rank 数，`pld.system.nranks` 只有 InCore 代码生成，没有 orchestration 代码生成。
 
-`args[6..]` 的副本是 `MaterializeDistTensorCtx` **为每个 `DistributedTensor`
-参数各追加一个 `CommCtx` 参数**的产物；它们全部解析到同一个 `device_ctx`，因为
-一次调用的五个操作数必属同一个 comm domain。`input` 允许是普通 `pl.Tensor`，这会
-让该尾部少一项 —— 第一个 ctx 仍落在 `args[5]`，因为尾部总是跟在全部五个 tensor
-参数之后。
+`args[6..7]` 的副本是 `MaterializeDistTensorCtx` **为每个 `DistributedTensor`
+参数各追加一个 `CommCtx` 参数**的产物。合成签名中恰好声明三个这样的参数 ——
+`target`、`signal`、`recv_counts` —— 因为无论调用点传入哪种类型，`input` 与
+`send_counts` 都被规范化为普通 `Tensor`。因此该尾部恒为三项，且第一个 ctx 总是
+落在 `args[5]`，因为尾部跟在全部五个 tensor 参数之后。三者全部解析到同一个
+`device_ctx`，因为一次调用的五个操作数必属同一个 comm domain。
 
 ## 约束与诊断
 
@@ -144,10 +145,19 @@ pass 之前就已运行，在这里重复报告会指向错误的 pass。
 
 - **`core_num > 1`**。请求的 block 上限会随 op 传递，但此处只接受 `1`。
   `L -> B` 映射、原子 gang 准入和 per-lane 同步协议属于独立工作项。
-- **运行期操作数校验**。buffer 契约中静态可证的违规（带洞的 stride view、
-  `input` 与 `target` 别名）由 `pld.tensor.all_to_all_v` 的类型推导拒绝；在提交
-  AIV task 前没有运行期复检 —— `B` 固定为 1 时，需要复检的项（signal stride
-  `>= B`）本身是平凡成立的。
+- **操作数校验是静态的，且别名只覆盖了一部分**。`pld.tensor.all_to_all_v` 的类型
+  推导只拒绝仅凭操作数类型即可证明的违规：非 ND 布局、与紧凑步长不符的 stride
+  向量、比 shape 更窄的 `valid_shape`，以及 `input` 与 `target` 是**同一个表达式**。
+  它**不会**拒绝同一块 allocation 上的两个不同 `pld.window()` 视图 —— 类型推导在
+  构造 Call 时就已运行，而 `DistributedTensorType::window_buffer_` 要到
+  [`MaterializeCommDomainScopes`](43-materialize_comm_domain_scopes.md)（pass 43）
+  才被绑定。整块 allocation 层面的互不相同是 **HOST 通路**的保证：
+  `LowerHostTensorCollectives` 能在同一个 `host_orch` 函数体内把每个操作数溯源回
+  其 `WindowBuffer`，并对五个操作数运行 `CheckPairwiseDistinctWindows`。本通路
+  —— 与 InCore composite 通路一样 —— 看到的操作数是外层 pipeline 的参数，没有这样
+  的溯源能力，因此在这里「窗口两两互不相同」是调用方的义务。此外，在提交 AIV task
+  前也没有运行期复检 —— `B` 固定为 1 时，需要复检的项（signal stride `>= B`）本身
+  是平凡成立的。
 - **rank 数**。kernel 读取 `CommContext::rankNum`，因此当显式设备子集小于 context
   的 rank 数时，其行为与传入 comm domain `domain_size` 的 HOST 通路不同。
 - **「同属一个通信域」是未经检查的前置条件**。kernel 通过单个 `CommContext`
@@ -166,6 +176,9 @@ pass 之前就已运行，在这里重复报告会指向错误的 pass。
 - `tests/ut/ir/transforms/test_lower_composite_ops.py` —— composite 通路把
   CHIP orchestration 中的集合通信交给本 pass，并在 InCore 函数体中拒绝
   `core_num != 1`。
+- `tests/ut/ir/transforms/test_lower_host_tensor_collectives.py` —— 把窗口别名
+  的拒绝固定为 **HOST 通路**的保证（`CheckPairwiseDistinctWindows`），这正是上文
+  *当前限制* 一节所对照的另一面。
 - `tests/st/distributed/collectives/test_l2_tensor_all_to_all_v.py` —— P=2/4 的
   硬件正确性；InCore 与 HOST 通路同样会跑的 0 / 1 / 容量 / 超容量 / 负数计数矩阵，
   它把三条通路约束到同一份链路 golden；外加三条结构断言：不产生 builtin chip

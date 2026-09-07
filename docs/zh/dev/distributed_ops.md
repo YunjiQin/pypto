@@ -366,6 +366,11 @@ pld.tensor.all_to_all_v(
 `input` 和 `target` 都以扁平元素算术寻址，因此两者都必须是紧凑行主序视图，且必须是
 两个不同的 buffer。静态可证的违规——非 ND 布局、与紧凑步长不符的 stride 向量、比
 shape 更窄的 `valid_shape`，或同一个操作数同时充当两种角色——由类型推导直接拒绝。
+但同一块 allocation 上的两个**不同** `pld.window()` 视图**不会**被拒绝：类型推导在
+构造 Call 时运行，早于 `DistributedTensorType::window_buffer_` 被绑定。只有 HOST
+通路会拒绝这种情况——它把每个操作数溯源回其 `WindowBuffer`（见下文）；在 InCore 与
+CHIP 通路上，操作数是以函数参数的形式到达的，没有这样的溯源能力，因此互不相同是
+调用方的义务。
 
 `MAX_RECV = target.shape[0] // NR`。降级在运行时读取 `send_counts[dest]`、钳制到
 `[0, MAX_RECV]`，并把**钳制后**的计数通过 `pld.system.notify`（Set）写入对端

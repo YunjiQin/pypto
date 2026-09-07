@@ -46,10 +46,13 @@
  *
  *     args[0..4]  input, target, signal, send_counts, recv_counts (Tensor*)
  *     args[5]     CommContext*
- *     args[6..9]  unread duplicates of args[5] — MaterializeDistTensorCtx
+ *     args[6..7]  unread duplicates of args[5] — MaterializeDistTensorCtx
  *                 appends one CommCtx parameter per DistributedTensor
- *                 parameter, and all five resolve to the same device_ctx
- *                 (every operand of one collective belongs to one comm domain)
+ *                 parameter, and the canonical signature declares exactly
+ *                 three of those (target, signal, recv_counts; input and
+ *                 send_counts are plain Tensor whatever the call site passes).
+ *                 All three resolve to the same device_ctx, since every
+ *                 operand of one collective belongs to one comm domain.
  *
  * The rank count comes from ``CommContext::rankNum``, not from a scalar
  * argument: the CHIP orchestration cannot compute it (``pld.system.nranks``

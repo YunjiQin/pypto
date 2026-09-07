@@ -66,7 +66,7 @@ function added to the program:
 
 | Aspect | Value |
 | ------ | ----- |
-| Parameters | `input, target, signal, send_counts, recv_counts` — types taken from the call site |
+| Parameters | `input, target, signal, send_counts, recv_counts` — canonical types, **not** the call site's: `input` / `send_counts` are declared plain `Tensor`, the other three `DistributedTensor` |
 | Directions | `In, InOut, InOut, In, InOut` |
 | Body | `return target` — one `ReturnStmt`, never compiled |
 | Attrs | `builtin_template_dir`, `builtin_template_vars` |
@@ -113,7 +113,7 @@ Both rails reach the kernel with the same argument layout:
 | ---- | --------- | --------------------- |
 | `args[0..4]` | `input, target, signal, send_counts, recv_counts` | same |
 | `args[5]` | `CommContext*` | `CommContext*` |
-| `args[6..]` | — | unread duplicates of `args[5]` |
+| `args[6..7]` | — | unread duplicates of `args[5]` |
 
 Neither rail passes a rank-count scalar. The kernel reads
 `CommContext::rankNum`, which is the same number the HOST dispatch used to pass
@@ -123,12 +123,14 @@ at kernel entry and buys a single shared source. It is also the only option on
 the CHIP rail, which cannot compute a rank count at all —
 `pld.system.nranks` has an InCore codegen but no orchestration codegen.
 
-The `args[6..]` duplicates are an artifact of `MaterializeDistTensorCtx`
-appending **one `CommCtx` parameter per `DistributedTensor` parameter**; all of
-them resolve to the same `device_ctx`, since every operand of one collective
-belongs to one comm domain. A plain `pl.Tensor` `input` is allowed and shortens
-that tail by one — the first ctx still lands at `args[5]`, because the tail
-always follows all five tensor parameters.
+The `args[6..7]` duplicates are an artifact of `MaterializeDistTensorCtx`
+appending **one `CommCtx` parameter per `DistributedTensor` parameter**. The
+synthesized signature declares exactly three of those — `target`, `signal`,
+`recv_counts` — because `input` and `send_counts` are canonically plain
+`Tensor` whichever kind the call site passes. The tail is therefore always
+three slots wide, and the first ctx always lands at `args[5]` because the tail
+follows all five tensor parameters. All three resolve to the same `device_ctx`,
+since every operand of one collective belongs to one comm domain.
 
 ## Constraints and diagnostics
 
@@ -159,11 +161,22 @@ passes earlier, so re-reporting them here would blame the wrong pass.
 - **`core_num > 1`.** The requested block limit is carried through the op but
   only `1` is accepted here. The `L -> B` mapping, atomic gang admission and
   per-lane synchronization protocol are separate work.
-- **Runtime operand validation.** Statically provable violations of the buffer
-  contract (a strided view, `input` aliasing `target`) are rejected by the
-  `pld.tensor.all_to_all_v` type deducer. There is no runtime re-check before
-  the AIV task is submitted; with `B` fixed at 1 the checks that would need one
-  (signal stride `>= B`) are vacuous.
+- **Operand validation is static, and aliasing is only partly covered.** The
+  `pld.tensor.all_to_all_v` type deducer rejects what the operand types alone
+  prove: a non-ND layout, a stride vector that is not the packed one, a
+  `valid_shape` narrower than the shape, and `input` being the *same
+  expression* as `target`. It does **not** reject two distinct `pld.window()`
+  views of one allocation — deduction runs when the Call is built, and
+  `DistributedTensorType::window_buffer_` is not bound until
+  [`MaterializeCommDomainScopes`](43-materialize_comm_domain_scopes.md)
+  (pass 43). Whole-allocation distinctness is a **HOST-rail** guarantee:
+  `LowerHostTensorCollectives` resolves each operand back to its `WindowBuffer`
+  within the same `host_orch` body and runs `CheckPairwiseDistinctWindows` over
+  all five. This rail — like the InCore composite rail — sees the operands as
+  enclosing-pipeline parameters and has no such provenance, so pairwise-distinct
+  windows are the caller's obligation here. There is also no runtime re-check
+  before the AIV task is submitted; with `B` fixed at 1 the checks that would
+  need one (signal stride `>= B`) are vacuous.
 - **Rank count.** The kernel reads `CommContext::rankNum`, so an explicit device
   subset smaller than the context's rank count would be handled differently from
   the HOST rail, which passes the comm domain's `domain_size`.
@@ -188,6 +201,10 @@ passes earlier, so re-reporting them here would blame the wrong pass.
 - `tests/ut/ir/transforms/test_lower_composite_ops.py` — the composite rail
   defers a CHIP-orchestration collective to this pass and rejects
   `core_num != 1` in an InCore body.
+- `tests/ut/ir/transforms/test_lower_host_tensor_collectives.py` — pins the
+  window-aliasing rejection as a **HOST-rail** guarantee
+  (`CheckPairwiseDistinctWindows`), which is the contrast the *Current
+  limitations* note above is defined against.
 - `tests/st/distributed/collectives/test_l2_tensor_all_to_all_v.py` — hardware
   correctness for P=2/4; the 0 / 1 / capacity / over-capacity / negative count
   matrix the InCore and HOST rails also run, which holds all three rails to one
