@@ -10,6 +10,7 @@
 """Device-free JIT warmup shares specialization and prepares every chip build."""
 
 import sys
+import warnings
 from types import ModuleType
 from typing import Any
 
@@ -86,13 +87,47 @@ def test_sample_arguments_share_annotation_specialization(kernel, assembly):
     assert len(assembly) == 1
 
 
-def test_warmup_preserves_scalar_specialization_and_runtime_marker(kernel, assembly):
+def test_warmup_shares_one_preparation_across_scalar_values(kernel, assembly):
+    """A scalar value never splits the warmup (issue #2751).
+
+    Each distinct value used to prepare its own artifact, so warming a kernel
+    for a range of token counts assembled one binary per count.
+    """
     default = kernel.warmup()
-    specialized = kernel.warmup(factor=3.0)
-    dynamic = kernel.warmup(factor=pl.RUNTIME)
-    assert len({id(default), id(specialized), id(dynamic)}) == 3
-    assert kernel.compile(factor=pl.RUNTIME) is dynamic
-    assert len(assembly) == 3
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        literal = kernel.warmup(factor=3.0)
+    marked = kernel.warmup(factor=pl.RUNTIME)
+    assert literal is default
+    assert marked is default
+    assert kernel.compile(factor=pl.RUNTIME) is default
+    assert len(assembly) == 1
+
+
+def test_warmup_prepares_one_binary_per_constexpr_value(assembly):
+    """A ``pl.constexpr`` value splits the warmup where a scalar does not.
+
+    Warming a tuning sweep must produce one prepared binary per configuration,
+    and the prepared object must take only the runtime arguments.
+    """
+
+    @pl.jit
+    def scale(
+        x: pl.Tensor[[16, 16], pl.FP32],
+        out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+        factor: pl.Scalar[pl.FP32],
+        TILE: pl.constexpr,
+    ):
+        with pl.at(level=pl.Level.CORE_GROUP):
+            tile = pl.load(x, [0, 0], [TILE, TILE])
+            pl.store(pl.mul(tile, factor), [0, 0], out)
+        return out
+
+    small = scale.warmup(TILE=8)
+    assert scale.warmup(TILE=8) is small
+    large = scale.warmup(TILE=16)
+    assert large is not small
+    assert len(assembly) == 2
 
 
 def test_warmup_preserves_dynamic_extents(assembly):

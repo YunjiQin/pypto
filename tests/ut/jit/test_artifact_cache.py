@@ -19,8 +19,10 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from pypto._artifact_contract import ArtifactExecutionMode, ExecutionCapabilities
 from pypto._fslock import file_lock
 from pypto._identity import ToolchainIdentity, digest_record
+from pypto._kernel_abi import KernelABI
 from pypto.jit import artifact_cache
 from pypto.jit._artifact_manifest import MANIFEST_NAME, ArtifactKey, ArtifactSpec, ArtifactState, BuildKind
 from pypto.jit.artifact_cache import (
@@ -766,6 +768,47 @@ def test_spawned_processes_deduplicate_and_dead_process_releases_lock(store):
         if process.is_alive():
             process.kill()
             process.join(timeout=10)
+
+
+@pytest.mark.parametrize("state", list(ArtifactState))
+def test_capabilities_select_separate_artifact_slots(store, state):
+    program = _spec(state)
+    kernel = replace(
+        program,
+        execution_capabilities=ExecutionCapabilities((ArtifactExecutionMode.KERNEL,)),
+        kernel_abi=KernelABI("a2a3", "tensormap_and_ringbuffer", ()),
+    )
+    first = store.get_or_build(_key(), program, _builder).handle
+    assert store.lookup(_key(), kernel).status is LookupStatus.MISS
+    second = store.get_or_build(_key(), kernel, _builder).handle
+    assert first.directory != second.directory
+    for handle in (first, second):
+        marker = json.loads((handle.directory / MANIFEST_NAME).read_text())
+        assert marker["supported_execution_modes"] == handle.spec.execution_capabilities.record()
+        assert store.lookup(handle.key, handle.spec).status is LookupStatus.HIT
+
+
+@pytest.mark.parametrize("state", list(ArtifactState))
+def test_capability_tampering_invalidates_manifest(store, state):
+    handle = store.get_or_build(_key(), _spec(state), _builder).handle
+    path = handle.directory / MANIFEST_NAME
+    marker = json.loads(path.read_text())
+    marker["supported_execution_modes"] = ["kernel"]
+    path.write_text(json.dumps(marker))
+    assert store.lookup(handle.key, handle.spec).status is LookupStatus.INVALID
+
+
+def test_execution_capabilities_are_canonical_and_immutable():
+    program, kernel = ArtifactExecutionMode.PROGRAM, ArtifactExecutionMode.KERNEL
+    supplied = [program, kernel]
+    capabilities = ExecutionCapabilities.from_record([mode.value for mode in supplied])
+    assert capabilities.record() == ["kernel", "program"]
+    record = capabilities.record()
+    record.clear()
+    assert capabilities.modes == (kernel, program)
+    assert capabilities == ExecutionCapabilities((kernel, program))
+    with pytest.raises(ValueError, match="no verified ABI"):
+        replace(_spec(), execution_capabilities=capabilities)
 
 
 if __name__ == "__main__":

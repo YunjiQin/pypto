@@ -67,6 +67,7 @@ import re
 import tempfile
 import textwrap
 import threading
+import warnings
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, NamedTuple
@@ -402,6 +403,102 @@ def _param_layouts(func: Any, func_name: str) -> dict[str, _ir.TensorLayout]:
     return layouts
 
 
+def _constexpr_params(func: Any) -> list[str]:
+    """Parameter names annotated ``pl.constexpr``, in declaration order.
+
+    Constexpr-ness lives only in the annotation: the call site passes an
+    ordinary Python value, and nothing about that value says whether the kernel
+    wants it folded or dispatched. This recovers the declaration, exactly as
+    :func:`_param_layouts` recovers a layout the passed tensor cannot carry.
+
+    Order is preserved so diagnostics list parameters the way the signature
+    does.
+
+    Args:
+        func: The Python function whose annotations to read
+
+    Returns:
+        Constexpr parameter names; every other parameter is absent
+    """
+    from pypto.language.typing.constexpr import ConstexprMarker  # noqa: PLC0415
+
+    try:
+        sig = inspect.signature(func)
+    except (TypeError, ValueError):
+        return []
+    ann_ns = _annotation_namespace(func, sig)
+
+    return [
+        name
+        for name, param in sig.parameters.items()
+        if name != "self" and isinstance(_resolve_annotation(param.annotation, ann_ns), ConstexprMarker)
+    ]
+
+
+def _request_source_hash(source_hash: str, constexpr_records: Sequence[tuple[Any, ...]]) -> str:
+    """Fold this request's constexpr bindings into the function's source hash.
+
+    A ``pl.constexpr`` argument reaches the generated program exactly as a
+    module-level constant does, so its identity is governed by the same rule:
+    hash the text that gets emitted. Layering it onto ``source_hash`` rather
+    than adding a ``CacheKey`` field keeps that one rule — and carries the
+    identity into the persistent store for free, since the store's digest is
+    derived from the same key.
+
+    The records cover **every** function in the request, not just the entry.
+    ``_get_source_hash`` can only render free *names*, so a value a dep call
+    site reaches through anything else — ``helper(x, cfg.BLOCK)`` — is invisible
+    to it: changing ``cfg.BLOCK`` would change the generated source while the
+    key stood still, and the artifact built for the old value would be served.
+    Keying the *resolved* text closes that for any expression form.
+
+    Args:
+        source_hash: The function's own hash, from ``JITFunction._get_source_hash``
+        constexpr_records: ``(index, module, qualname, param, folded text)`` per
+            resolved constexpr binding, in a deterministic order
+
+    Returns:
+        ``source_hash`` unchanged when there are no constexpr bindings, so a
+        kernel without them keeps the identity it had before they existed
+    """
+    if not constexpr_records:
+        return source_hash
+    return compute_source_hash([source_hash, json.dumps(list(constexpr_records), separators=(",", ":"))])
+
+
+def _resolve_constexpr_value(func_name: str, name: str, value: Any) -> str:
+    """Render one constexpr argument into the source text it folds to.
+
+    The rendered text *is* the value's identity: it is what reaches the
+    generated program and what :meth:`JITFunction._get_source_hash` keys on, so
+    hashing it keeps the compilation key and the emitted code from drifting
+    apart. This is the same rule a module-level constant already follows.
+
+    Args:
+        func_name: Kernel name, for diagnostics
+        name: Parameter name
+        value: The value bound to it at this call site
+
+    Returns:
+        The generated-source text this value folds to
+
+    Raises:
+        TypeError: if the specializer cannot render @p value into source.
+    """
+    from .specializer import constant_source  # noqa: PLC0415
+
+    rendered = constant_source(value)
+    if rendered is None:
+        raise TypeError(
+            f"@pl.jit function '{func_name}': constexpr parameter '{name}' got "
+            f"{value!r}, which has no source form the specializer can fold. A "
+            f"'pl.constexpr' value must be an int, float, bool, str, a pl dtype, an "
+            f"enum member such as pl.Mem.Vec, or a list of those. Annotate '{name}' "
+            f"as 'pl.Scalar[dtype]' if it should instead be a runtime value."
+        )
+    return rendered
+
+
 def _signature_tensor_meta(
     annotation: Any,
     dtype: DataType,
@@ -430,44 +527,102 @@ def _signature_tensor_meta(
     return _build_tensor_meta(extents, dtype, dyn_dims, layout)
 
 
-def _signature_scalar_value(
+def _signature_constexpr_value(
     func_name: str,
     name: str,
     param: inspect.Parameter,
     kwargs: dict[str, Any],
-) -> int | float | bool | None:
-    """Resolve a scalar parameter's value for signature-mode specialization.
+) -> Any:
+    """Resolve a constexpr parameter's value in annotation-driven signature mode.
 
-    Value comes from ``kwargs`` (by param name) or the signature default; a
-    scalar with neither is an error (the signature carries no value).
+    Unlike a scalar, a constexpr parameter has no runtime slot to fall back on:
+    the value *is* what gets compiled, so one must be supplied here. It comes
+    from ``kwargs`` or the signature default.
+
+    Args:
+        func_name: Kernel name, for diagnostics
+        name: Parameter name
+        param: The ``inspect.Parameter``, consulted for its default
+        kwargs: Keyword arguments passed to ``compile()`` / ``lower()``
 
     Returns:
-        The literal to specialize into the compiled artifact, or ``None`` when
-        the caller passed ``pl.RUNTIME`` — the parameter then stays a runtime
-        ``pl.Scalar`` in the generated program instead of being baked in.
+        The value to fold into the artifact
+
+    Raises:
+        TypeError: if the parameter has neither a keyword value nor a default.
+    """
+    if name in kwargs:
+        return kwargs[name]
+    if param.default is not inspect.Parameter.empty:
+        return param.default
+    raise TypeError(
+        f"@pl.jit function '{func_name}': constexpr parameter '{name}' has no value. Its "
+        f"value is resolved at compile time, so it cannot be left to dispatch — pass it as "
+        f"a keyword, e.g. {func_name}.compile({name}=...), or give it a signature default. "
+        f"Annotate '{name}' as 'pl.Scalar[dtype]' instead to make it a runtime value."
+    )
+
+
+def _check_signature_scalar_value(
+    func_name: str,
+    name: str,
+    param: inspect.Parameter,
+    kwargs: dict[str, Any],
+) -> None:
+    """Validate the value a scalar parameter was given in signature mode.
+
+    A scalar parameter is a runtime value, so signature mode needs no value for
+    it and any value supplied is inert. One is still accepted rather than
+    rejected: a signature default (``value: pl.Scalar[pl.FP32] = 3.0``) is
+    legitimate, and refusing a literal here would make signature mode disagree
+    with a direct call, which takes the same literal and dispatches it.
+
+    An explicit keyword is the one form that used to mean "specialize this
+    value", so it warns rather than changing meaning silently.
+
+    Args:
+        func_name: Kernel name, for diagnostics
+        name: Parameter name
+        param: The ``inspect.Parameter``, consulted for its default
+        kwargs: Keyword arguments passed to ``compile()`` / ``lower()``
+
+    Raises:
+        TypeError: if the supplied value is neither a number nor ``pl.RUNTIME``.
     """
     from pypto.language.typing.scalar import RUNTIME  # noqa: PLC0415
 
     if name in kwargs:
         value = kwargs[name]
+        explicit_keyword = True
     elif param.default is not inspect.Parameter.empty:
         value = param.default
+        explicit_keyword = False
     else:
-        raise TypeError(
-            f"@pl.jit function '{func_name}': scalar parameter '{name}' has no value. When "
-            f"specializing from annotations, pass scalar values as keyword arguments, e.g. "
-            f"lower({name}=...) or compile({name}=...). Pass '{name}=pl.RUNTIME' instead to "
-            f"leave it unspecialized (its value is supplied at dispatch)."
-        )
+        return
+
     if value is RUNTIME:
-        return None
+        return
     if not isinstance(value, (int, float, bool)):
         raise TypeError(
             f"@pl.jit function '{func_name}': scalar parameter '{name}' must be an int/float/bool "
-            f"(specializes the value into the artifact) or pl.RUNTIME (leaves it unspecialized), "
-            f"got {type(value).__name__}."
+            f"or pl.RUNTIME, got {type(value).__name__}."
         )
-    return value
+    if explicit_keyword:
+        # The message, not the reported line, carries the identification: it
+        # names the kernel, the parameter and the value, so Python's
+        # (text, category, lineno) dedup still emits one warning per affected
+        # call form. Walking out to the user's frame is not available here —
+        # ``compile()`` reaches this through a ``contextlib`` decorator, so the
+        # first non-PyPTO frame is stdlib rather than user code.
+        warnings.warn(
+            f"@pl.jit function '{func_name}': '{name}' is a scalar parameter, so "
+            f"{func_name}.compile({name}={value!r}) no longer folds that value into the "
+            f"artifact — the parameter stays a runtime value whose value arrives at dispatch. "
+            f"Drop the keyword; to compile against a fixed constant, read it from a "
+            f"module-level or closure name in the body instead of taking it as a parameter.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -718,12 +873,13 @@ class _DepBinding(NamedTuple):
 
 
 @functools.lru_cache(maxsize=512)
-def _constant_dependency_names(func: Any) -> tuple[str, ...]:
-    """Find names that can supply folded constants, excluding body locals.
+def _body_local_names(func: Any) -> set[str]:
+    """Names a body binds locally: its parameters and every assignment target.
 
-    Match the specializer's parameter/Store-target shadowing rules. Annotation
-    names resolve in the defining namespace independently of body locals.
-    Decorators and defaults are already evaluated when the function is defined.
+    A local shadows a same-named module or closure binding, so anything that
+    folds a free name must consult this first. The specializer applies the same
+    rule through ``_BodyTransformer._used_names``; keeping one definition here
+    is what stops a folded value and the emitted source from disagreeing.
     """
     definition = _get_func_def(func)
     local_names = {arg.arg for arg in ast.walk(definition.args) if isinstance(arg, ast.arg)}
@@ -732,6 +888,18 @@ def _constant_dependency_names(func: Any) -> tuple[str, ...]:
         for node in ast.walk(definition)
         if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
     )
+    return local_names
+
+
+def _constant_dependency_names(func: Any) -> tuple[str, ...]:
+    """Find names that can supply folded constants, excluding body locals.
+
+    Match the specializer's parameter/Store-target shadowing rules. Annotation
+    names resolve in the defining namespace independently of body locals.
+    Decorators and defaults are already evaluated when the function is defined.
+    """
+    definition = _get_func_def(func)
+    local_names = _body_local_names(func)
     names = {
         node.id
         for statement in definition.body
@@ -890,7 +1058,6 @@ def _dep_return_metas(
     target: ast.expr,
     deps: _DepScan,
     local: dict[str, TensorMeta],
-    scalars: Mapping[str, int | float | bool],
 ) -> _DepReturn:
     """For ``v1, ..., vk = dep(args)`` where ``dep`` returns tensors it created
     itself, resolve each ``vi`` from the callee's own ``return`` statement.
@@ -926,7 +1093,6 @@ def _dep_return_metas(
         return _DEP_RETURN_DECLINED
     dep_params, _ = deps.io[dep_name]
     seed_meta: dict[str, TensorMeta] = {}
-    seed_scalars: dict[str, int | float | bool] = {}
     for dep_param, caller_arg in _build_param_mapping(dep_params, _call_arg_refs(call)).items():
         # A ``_SlicedArg`` (``chip_orch(x[r], ...)``) seeds nothing: that
         # per-rank dispatch form returns through ``Out`` params, so the
@@ -935,12 +1101,9 @@ def _dep_return_metas(
             continue
         if caller_arg in local:
             seed_meta[dep_param] = local[caller_arg]
-        elif caller_arg in scalars:
-            seed_scalars[dep_param] = scalars[caller_arg]
     callee_metas = _extract_local_tensor_metas(
         dep._func,
         seed_meta=seed_meta,
-        seed_scalars=seed_scalars,
         caller_func_type=dep._func_type,
         dep_seen=deps.seen,
     )
@@ -955,7 +1118,6 @@ def _dep_out_metas_or_return(
     target: ast.expr,
     deps: _DepScan,
     local: dict[str, TensorMeta],
-    scalars: Mapping[str, int | float | bool],
 ) -> _DepReturn:
     """Resolve one ``v1, ..., vk = dep(args)`` target, ``Out`` convention first.
 
@@ -966,7 +1128,7 @@ def _dep_out_metas_or_return(
     out_metas = _dep_out_metas(call, dep_name, target, deps, local)
     if out_metas:
         return _DepReturn(out_metas, frozenset())
-    return _dep_return_metas(call, dep_name, target, deps, local, scalars)
+    return _dep_return_metas(call, dep_name, target, deps, local)
 
 
 def _apply_dep_return(local: dict[str, TensorMeta], dep_return: _DepReturn) -> None:
@@ -1108,7 +1270,6 @@ def _update_local_tensor_meta(
     deps: _DepScan,
     resolve_int: Callable[[ast.expr], int | None],
     pl_attr_handlers: dict[str, Callable[[ast.Call, str | None], TensorMeta | None]],
-    scalars: Mapping[str, int | float | bool],
 ) -> None:
     """Apply one assignment's metadata effects to the source-ordered state."""
     parts = _assignment_parts(stmt)
@@ -1144,9 +1305,7 @@ def _update_local_tensor_meta(
         elif isinstance(fn, ast.Name) and fn.id in deps.io:
             # The in-place ``Out``-param convention first; a callee that
             # allocates its own results falls through to its return statement.
-            dep_returns = [
-                _dep_out_metas_or_return(value, fn.id, target, deps, local, scalars) for target in targets
-            ]
+            dep_returns = [_dep_out_metas_or_return(value, fn.id, target, deps, local) for target in targets]
             # Preserve the existing dependency-result behavior when neither
             # rule resolves the callee's results: an already-known target keeps
             # its metadata until a later supported rebinding can refine it.
@@ -1184,13 +1343,12 @@ def _walk_local_tensor_meta_stmts(
     deps: _DepScan,
     resolve_int: Callable[[ast.expr], int | None],
     pl_attr_handlers: dict[str, Callable[[ast.Call, str | None], TensorMeta | None]],
-    scalars: Mapping[str, int | float | bool],
 ) -> bool:
     """Walk supported DSL scopes in source order until the selected call."""
     for stmt in stmts:
         if _stmt_calls_dep(stmt, stop_at_dep):
             return True
-        _update_local_tensor_meta(stmt, local, dim_aliases, deps, resolve_int, pl_attr_handlers, scalars)
+        _update_local_tensor_meta(stmt, local, dim_aliases, deps, resolve_int, pl_attr_handlers)
         for attr in ("body", "orelse", "finalbody"):
             nested = getattr(stmt, attr, None)
             if isinstance(nested, list) and _walk_local_tensor_meta_stmts(
@@ -1201,7 +1359,6 @@ def _walk_local_tensor_meta_stmts(
                 deps,
                 resolve_int,
                 pl_attr_handlers,
-                scalars,
             ):
                 return True
     return False
@@ -1210,7 +1367,6 @@ def _walk_local_tensor_meta_stmts(
 def _extract_local_tensor_metas(
     func: Any,
     seed_meta: dict[str, TensorMeta] | None = None,
-    seed_scalars: dict[str, int | float | bool] | None = None,
     caller_func_type: str = "orchestration",
     stop_at_dep: str | None = None,
     dep_seen: frozenset[int] = frozenset(),
@@ -1221,8 +1377,8 @@ def _extract_local_tensor_metas(
     be produced inside a JIT function:
 
     1. ``var = pl.create_tensor([shape], dtype=pl.XXX)`` — shape from the
-       literal list (literal ints, ``Name`` refs to int globals / seeded
-       scalars, and simple int arithmetic over those), dtype from ``dtype=``.
+       literal list (literal ints, ``Name`` refs to int globals, and simple int
+       arithmetic over those), dtype from ``dtype=``.
        A shape element that resolves through a dynamic alias — either
        ``tokens = pl.tensor.dim(P, k)`` for a seeded param ``P`` whose dim
        ``k`` is ``DynDim``-bound, or a direct reference to a DynVar
@@ -1255,9 +1411,12 @@ def _extract_local_tensor_metas(
     ``seed_meta`` pre-populates the table with the caller's parameter metas
     (including any ``DynDim`` entries those carry) so a ``pl.slice`` of a
     parameter, a dep call passing a parameter through, or a local
-    ``pl.create_tensor`` sized off a dynamic dim of a parameter all resolve;
-    ``seed_scalars`` lets compile-time-specialized scalar parameters appear
-    as shape dimensions.
+    ``pl.create_tensor`` sized off a dynamic dim of a parameter all resolve.
+
+    A *scalar parameter* is a runtime value and therefore never resolves a
+    shape dim statically; a dim sized off one becomes a synthesized ``DynDim``
+    like any other runtime extent. Size a local off a module-level or closure
+    constant when the shape has to be static.
 
     A ``pl.create_tensor`` / ``pld.window`` dim that no static rule resolves —
     a runtime extent such as ``pld.world_size()``, ``pl.tensor.read(cfg, [0])``,
@@ -1274,7 +1433,6 @@ def _extract_local_tensor_metas(
     local: dict[str, TensorMeta] = dict(seed_meta or {})
     dtype_map = _get_pl_dtype_map()
     func_globals = func_name_lookup(func)
-    scalars: dict[str, int | float | bool] = seed_scalars or {}
     dim_aliases: dict[str, tuple[str, int]] = {}
     dynvar_anchors = _build_dynvar_anchor_index(seed_meta or {})
 
@@ -1289,9 +1447,9 @@ def _extract_local_tensor_metas(
         - ``Name`` that's a DynVar declared on a seeded param → returns the
           DynDim of the (first) anchor site.
 
-        Falls back to integer resolution for literal ints, int globals,
-        seeded scalars, and arithmetic over those (the same combinations the
-        original ``_resolve_int`` covered).
+        Falls back to integer resolution for literal ints, int globals, and
+        arithmetic over those (the same combinations the original
+        ``_resolve_int`` covered).
         """
         if isinstance(elt, ast.Constant) and isinstance(elt.value, int):
             return elt.value
@@ -1312,8 +1470,8 @@ def _extract_local_tensor_metas(
                     d = src_meta.shape[k]
                     if isinstance(d, DynDim):
                         return d
-            # Static int via globals or seeded scalars.
-            value = func_globals.get(elt.id, scalars.get(elt.id))
+            # Static int via globals (module-level or closure constants).
+            value = func_globals.get(elt.id)
             if isinstance(value, int) and not isinstance(value, bool):
                 return value
             return None
@@ -1474,7 +1632,6 @@ def _extract_local_tensor_metas(
         deps,
         _resolve_int,
         _pl_attr_handlers,
-        scalars,
     )
     return local
 
@@ -1496,8 +1653,10 @@ class _Specialization(NamedTuple):
     param_names: list[str]
     arguments: dict[str, Any]
     tensor_meta: dict[str, TensorMeta]
-    scalar_values: dict[str, int | float | bool]
     scalar_dtypes: dict[str, DataType]
+    # Constexpr parameter name -> the generated-source text its value folds to.
+    # Absent from ``arguments``: nothing is dispatched for a constexpr parameter.
+    constexpr_values: dict[str, str]
     per_func_dyn: dict[int, dict[str, dict[int, DynDim]]]
 
 
@@ -1551,6 +1710,152 @@ def _extract_call_args_for_dep(
     return _call_arg_refs(min(calls, key=lambda call: (call.lineno, call.col_offset)))
 
 
+def _dep_call_nodes(caller_func: Any, dep_call_name: str) -> list[ast.Call]:
+    """Every call to ``dep_call_name`` in ``caller_func``'s body, in source order."""
+    func_def = _get_func_def(caller_func)
+    calls = [
+        node
+        for node in ast.walk(func_def)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == dep_call_name
+    ]
+    return sorted(calls, key=lambda call: (call.lineno, call.col_offset))
+
+
+def _fold_call_site_constant(
+    arg: ast.expr,
+    caller_constexpr: Mapping[str, str],
+    caller_globals: Mapping[str, Any],
+    caller_locals: frozenset[str],
+) -> str | None:
+    """Source text a dep's constexpr argument folds to, or None when it does not.
+
+    A bare name is either one of the caller's own constexpr parameters, which
+    forwards, or a module-level/closure constant. Anything else is evaluated in
+    the caller's namespace and rendered by the same writer the entry path uses,
+    so every documented value form reaches a dep the same way it reaches an
+    entry: ``helper(x, -1)``, ``helper(x, [16, 32])``, ``helper(x, pl.FP32)``,
+    ``helper(x, pl.Mem.Vec)``.
+
+    ``caller_locals`` are the caller's parameters and assignment targets. A
+    local shadows a same-named global, so it is removed from the namespace
+    before anything is resolved: without that, a caller with a runtime scalar
+    ``n`` and an unrelated module-level ``n = 16`` binds the dep's compile-time
+    parameter to 16 instead of rejecting the runtime value, and the dep is
+    compiled against a constant the caller never passed.
+
+    Returns None when there is no compile-time value — a runtime scalar, a
+    tensor, an expression over either — so the caller can report it against the
+    parameter it was bound to.
+    """
+    from .specializer import constant_source  # noqa: PLC0415
+
+    if isinstance(arg, ast.Name):
+        forwarded = caller_constexpr.get(arg.id)
+        if forwarded is not None:
+            return forwarded
+        if arg.id in caller_locals:
+            return None
+        return free_name_source(arg.id, caller_globals)
+    # Trusted input: the caller's own source, evaluated in its own globals with
+    # builtins stripped and its locals removed, so only constant construction
+    # can run and any run-time name is absent and raises — the rejection we
+    # want. Forwarded constexpr parameters are re-bound because they *do* have a
+    # compile-time value, unlike the runtime locals they sit beside.
+    namespace = {k: v for k, v in caller_globals.items() if k not in caller_locals}
+    namespace["__builtins__"] = {}
+    for forwarded_name, text in caller_constexpr.items():
+        try:
+            namespace[forwarded_name] = ast.literal_eval(text)
+        except (ValueError, SyntaxError):
+            continue
+    try:
+        value = eval(ast.unparse(arg), namespace)  # noqa: S307
+    except Exception:  # noqa: BLE001 - any failure means "no compile-time value"
+        return None
+    return constant_source(value)
+
+
+def _resolve_dep_constexpr_values(
+    dep: JITFunction,
+    callers: Sequence[tuple[Any, str]],
+    resolved_constexpr: Mapping[int, Mapping[str, str]],
+) -> dict[str, str]:
+    """Resolve a dep's ``pl.constexpr`` parameters from every call site that reaches it.
+
+    One generated function is emitted per dep, so **every** call site of it must
+    agree on every constexpr value — across callers as well as within one body.
+    A diamond ``entry -> {left, right} -> shared`` where the two branches pass
+    different constants is the case that makes this matter: resolving from the
+    first caller alone would fold its value, drop the argument at both rewritten
+    call sites, and silently run the other branch against the wrong constant.
+    Divergence is reported instead.
+
+    Args:
+        dep: The dependency whose constexpr parameters to resolve
+        callers: Every ``(caller_func, dep_call_name)`` pair that reaches it
+        resolved_constexpr: Already-resolved bindings per ``id(func)``, so a
+            forwarded parameter (``helper(x, BLOCK)``) carries through
+
+    Returns:
+        Folded source text per constexpr parameter name; empty when the dep
+        declares none
+
+    Raises:
+        TypeError: if a constexpr parameter is unbound at a call site, bound to
+            something with no compile-time value, or given differing values.
+    """
+    constexpr_names = _constexpr_params(dep._func)
+    if not constexpr_names:
+        return {}
+
+    dep_param_names = dep._param_names()
+    resolved: dict[str, str] = {}
+    origin: dict[str, str] = {}
+    for caller_func, dep_call_name in callers:
+        caller_constexpr = resolved_constexpr.get(id(caller_func), {})
+        caller_globals = func_name_lookup(caller_func)
+        caller_locals = frozenset(_body_local_names(caller_func))
+        caller_name = getattr(caller_func, "__name__", "<caller>")
+        for call in _dep_call_nodes(caller_func, dep_call_name):
+            bound: dict[str, ast.expr] = {}
+            for index, arg in enumerate(call.args):
+                if index < len(dep_param_names):
+                    bound[dep_param_names[index]] = arg
+            for keyword in call.keywords:
+                if keyword.arg is not None:
+                    bound[keyword.arg] = keyword.value
+
+            for name in constexpr_names:
+                arg = bound.get(name)
+                if arg is None:
+                    raise TypeError(
+                        f"@pl.jit function '{dep.__name__}': constexpr parameter '{name}' is not "
+                        f"bound at the call site in '{caller_name}'. A 'pl.constexpr' parameter is "
+                        f"resolved at compile time, so every call must pass it — a signature "
+                        f"default is not read for a dep call."
+                    )
+                folded = _fold_call_site_constant(arg, caller_constexpr, caller_globals, caller_locals)
+                if folded is None:
+                    raise TypeError(
+                        f"@pl.jit function '{dep.__name__}': constexpr parameter '{name}' is bound "
+                        f"to '{ast.unparse(arg)}' at the call site in '{caller_name}', which has "
+                        f"no compile-time value. Pass a literal, one of the caller's own "
+                        f"'pl.constexpr' parameters, or a module-level/closure constant."
+                    )
+                previous = resolved.setdefault(name, folded)
+                origin.setdefault(name, caller_name)
+                if previous != folded:
+                    raise TypeError(
+                        f"@pl.jit function '{dep.__name__}': constexpr parameter '{name}' is called "
+                        f"with two different values — {previous} in '{origin[name]}' and {folded} in "
+                        f"'{caller_name}'. One generated function is emitted per dependency, so its "
+                        f"compile-time parameters must agree across every call site that reaches it. "
+                        f"Give each configuration its own kernel, or make '{name}' a "
+                        f"'pl.Scalar[dtype]' runtime parameter if the value need not be constant."
+                    )
+    return resolved
+
+
 def _call_arg_refs(node: ast.Call) -> list[tuple[str | None, str | _SlicedArg | None]]:
     """Unify one call node's positional and keyword args into ``(param, ref)`` pairs.
 
@@ -1593,17 +1898,15 @@ def _resolve_dep_call_metadata(
     dep: JITFunction,
     caller_func: Any,
     caller_tensor_meta: dict[str, TensorMeta],
-    caller_scalar_values: dict[str, int | float | bool],
     caller_scalar_dtypes: dict[str, DataType],
     dep_dyn_map: dict[str, dict[int, DynDim]],
     caller_func_type: str = "orchestration",
     dep_call_name: str | None = None,
 ) -> tuple[
     dict[str, TensorMeta],
-    dict[str, int | float | bool],
     dict[str, DataType],
 ]:
-    """Map ``dep``'s parameter names to TensorMeta / scalar metadata using
+    """Map ``dep``'s parameter names to TensorMeta / scalar dtypes using
     ``caller_func``'s call-site arguments.
 
     The caller may be the entry function or another dep (transitive case);
@@ -1629,7 +1932,6 @@ def _resolve_dep_call_metadata(
     intermediate_metas = _extract_local_tensor_metas(
         caller_func,
         seed_meta=caller_tensor_meta,
-        seed_scalars=caller_scalar_values,
         caller_func_type=caller_func_type,
         stop_at_dep=call_name if call_args is not None else None,
     )
@@ -1638,7 +1940,6 @@ def _resolve_dep_call_metadata(
     all_tensor_meta = intermediate_metas
 
     dep_tensor_meta: dict[str, TensorMeta] = {}
-    dep_scalar_values: dict[str, int | float | bool] = {}
     dep_scalar_dtypes: dict[str, DataType] = {}
 
     if call_args is not None:
@@ -1661,24 +1962,19 @@ def _resolve_dep_call_metadata(
                 continue
             if caller_arg in all_tensor_meta:
                 dep_tensor_meta[dep_param] = all_tensor_meta[caller_arg]
-            else:
-                # A scalar arg carries a value only when the caller specialized
-                # it; a ``pl.RUNTIME`` scalar has a dtype but no value. Forward
-                # each fact independently so the dtype survives either way.
-                if caller_arg in caller_scalar_values:
-                    dep_scalar_values[dep_param] = caller_scalar_values[caller_arg]
-                if caller_arg in caller_scalar_dtypes:
-                    dep_scalar_dtypes[dep_param] = caller_scalar_dtypes[caller_arg]
+            elif caller_arg in caller_scalar_dtypes:
+                # A scalar arg is a runtime value, so only its declared type
+                # crosses the call boundary.
+                dep_scalar_dtypes[dep_param] = caller_scalar_dtypes[caller_arg]
     else:
         # Fallback: name-based matching against the caller's metadata pool.
         dep_tensor_meta = {n: all_tensor_meta[n] for n in dep_param_names if n in all_tensor_meta}
-        dep_scalar_values = {n: caller_scalar_values[n] for n in dep_param_names if n in caller_scalar_values}
         dep_scalar_dtypes = {n: caller_scalar_dtypes[n] for n in dep_param_names if n in caller_scalar_dtypes}
 
     _overlay_dep_declared_dyn_dims(dep_dyn_map, dep_tensor_meta)
     _overlay_dep_declared_layouts(dep, dep_tensor_meta)
 
-    return dep_tensor_meta, dep_scalar_values, dep_scalar_dtypes
+    return dep_tensor_meta, dep_scalar_dtypes
 
 
 def _overlay_dep_declared_dyn_dims(
@@ -1782,6 +2078,12 @@ def _resolve_memory_planner(run_config: Any) -> _passes.MemoryPlanner:
     if ctx is not None:
         return ctx.get_memory_planner()
     return _passes.MemoryPlanner.PYPTO
+
+
+def _resolve_enable_buffer_ir() -> bool:
+    """Resolve the staged Buffer IR option inherited by ``ir.compile()``."""
+    ctx = _passes.PassContext.current()
+    return ctx.get_enable_buffer_ir() if ctx is not None else False
 
 
 def _resolve_enable_pypto_l0c_double_buffer() -> bool:
@@ -2170,6 +2472,10 @@ class JITFunction:
         changes this hash by construction, and one that does not fold (an opaque
         object, a JIT dep, ``pl`` itself) contributes nothing because it leaves
         the source unchanged.
+
+        Covers only what the *function* brings. A ``pl.constexpr`` argument
+        folds by the same rule but is bound per call site, so it belongs to the
+        request; :func:`_request_source_hash` layers it on top.
         """
         source_hash = self._get_static_source_hash()
         records = []
@@ -2182,6 +2488,42 @@ class JITFunction:
                     continue
                 records.append((index, func.__module__, func.__qualname__, name, folded))
         return compute_source_hash([source_hash, json.dumps(records, separators=(",", ":"))])
+
+    def _resolve_constexpr_bindings(self, entry_constexpr: Mapping[str, str]) -> dict[int, dict[str, str]]:
+        """Resolve every function's ``pl.constexpr`` bindings, entry then each dep.
+
+        Walked caller-first so a dep that forwards one of its caller's
+        compile-time parameters sees it already resolved. Run before the cache
+        key as well as during specialization: a dep's value is part of what gets
+        compiled, so it has to be part of what the key identifies.
+
+        Args:
+            entry_constexpr: The entry's own bindings, from argument binding
+
+        Returns:
+            Folded source text per constexpr param name, keyed by ``id(func)``
+        """
+        deps_topo, callers_by_id, _, _ = self._get_dep_graph()
+        resolved: dict[int, dict[str, str]] = {id(self._func): dict(entry_constexpr)}
+        for dep in reversed(deps_topo):
+            resolved[id(dep._func)] = _resolve_dep_constexpr_values(
+                dep, callers_by_id[id(dep._func)], resolved
+            )
+        return resolved
+
+    def _constexpr_identity_records(self, bindings: Mapping[int, Mapping[str, str]]) -> list[tuple[Any, ...]]:
+        """Flatten resolved bindings into deterministic cache-identity records.
+
+        Indexed by position in ``[self, *deps]`` and qualified by the defining
+        module, mirroring ``_get_source_hash``'s records so two functions that
+        share a parameter name stay distinguishable.
+        """
+        records: list[tuple[Any, ...]] = []
+        for index, jit_func in enumerate([self, *self._get_deps()]):
+            func = jit_func._func
+            for name, text in sorted(bindings.get(id(func), {}).items()):
+                records.append((index, func.__module__, func.__qualname__, name, text))
+        return records
 
     @cache_in_snapshot
     def _get_static_source_hash(self) -> str:
@@ -2235,11 +2577,19 @@ class JITFunction:
         list[str],
         dict[str, Any],
         dict[str, TensorMeta],
-        dict[str, int | float | bool],
         dict[str, DataType],
+        dict[str, str],
         dict[int, dict[str, dict[int, DynDim]]],
     ]:
         """Bind *args/**kwargs to param names and classify into tensor/scalar metadata.
+
+        A numeric argument to a ``pl.Scalar`` parameter is a **runtime value**:
+        it is dispatched as-is and never folded into the artifact, so it
+        contributes no metadata here and does not split the specialization
+        cache. A ``pl.constexpr`` parameter is the opposite -- its argument is
+        rendered to source text, leaves ``arguments`` so nothing is dispatched
+        for it, and reaches ``_get_source_hash`` so each distinct value selects
+        its own artifact.
 
         Tensor metas carry ``DynDim`` entries for every param dim that is
         either declared dynamic at this function (``bind_dynamic`` / annotation
@@ -2271,36 +2621,48 @@ class JITFunction:
         # from the annotation even on this path.
         param_layouts = _param_layouts(self._func, self.__name__)
         tensor_meta: dict[str, TensorMeta] = {}
-        scalar_values: dict[str, int | float | bool] = {}
         scalar_dtypes: dict[str, DataType] = {}
+        constexpr_names = _constexpr_params(self._func)
+        constexpr_values: dict[str, str] = {}
 
         from pypto.language.typing.scalar import RUNTIME  # noqa: PLC0415
 
         for name, value in arguments.items():
             # ``pl.RUNTIME`` is a compile-time marker, not a value. This path
             # binds real arguments (dispatch, or sample-argument compile), where
-            # an unrecognized object would otherwise slip through the
-            # int/float/bool filter below and fail much later with an opaque
-            # "must be real number" from the runtime. Note ``apply_defaults()``
-            # above materializes a ``= pl.RUNTIME`` signature default, so a plain
+            # it would otherwise reach the runtime and fail much later with an
+            # opaque "must be real number". Note ``apply_defaults()`` above
+            # materializes a ``= pl.RUNTIME`` signature default, so a plain
             # ``kernel(a, c)`` call reaches here too.
             if value is RUNTIME:
                 raise TypeError(
                     f"@pl.jit function '{self.__name__}': parameter '{name}' received "
-                    f"pl.RUNTIME, which is a compile-time marker rather than a value. It is "
-                    f"only accepted by annotation-driven signature mode — call compile() or "
-                    f"lower() with no tensor arguments and pass it by keyword, e.g. "
-                    f"{self.__name__}.compile({name}=pl.RUNTIME). To run the kernel, pass "
-                    f"'{name}' its actual value."
+                    f"pl.RUNTIME, which is a compile-time marker rather than a value. This "
+                    f"path binds real arguments, so pass '{name}' its actual value — a scalar "
+                    f"parameter is a runtime value and does not compile a separate artifact "
+                    f"per value. The marker is accepted only by annotation-driven signature "
+                    f"mode ({self.__name__}.compile() with no tensor arguments), where it is "
+                    f"now redundant."
                 )
             if _is_tensor(value):
                 tensor_meta[name] = _extract_tensor_meta(
                     value, entry_dyn_map.get(name), param_layouts.get(name)
                 )
-            elif isinstance(value, (int, float, bool)):
-                scalar_values[name] = value
 
-        return param_names, arguments, tensor_meta, scalar_values, scalar_dtypes, per_func_dyn_maps
+        # Drop constexpr bindings out of ``arguments``: they are resolved during
+        # specialization and have no slot in the dispatch ABI, so the ordered
+        # argument list this feeds must not carry them.
+        for name in constexpr_names:
+            constexpr_values[name] = _resolve_constexpr_value(self.__name__, name, arguments.pop(name))
+
+        return (
+            param_names,
+            arguments,
+            tensor_meta,
+            scalar_dtypes,
+            constexpr_values,
+            per_func_dyn_maps,
+        )
 
     def _bind_args_from_signature(
         self, kwargs: dict[str, Any]
@@ -2308,8 +2670,8 @@ class JITFunction:
         list[str],
         dict[str, Any],
         dict[str, TensorMeta],
-        dict[str, int | float | bool],
         dict[str, DataType],
+        dict[str, str],
         dict[int, dict[str, dict[int, DynDim]]],
     ]:
         """Derive the same metadata as ``_bind_args``, but from the kernel's
@@ -2322,17 +2684,24 @@ class JITFunction:
         dynamic and given a placeholder extent. Dynamic dimensions lower to runtime ``pl.tensor.dim`` reads
         and, on the compiled path, collapse to ``None`` in the cache key.
 
-        Scalar parameters carry no value in the signature, so their values must
-        come from ``kwargs`` (or a signature default). A literal is specialized
-        into the artifact; ``pl.RUNTIME`` instead leaves the parameter
-        unspecialized — it is omitted from ``scalar_values`` (and therefore from
-        the cache key) and survives into the generated program as a real
-        ``pl.Scalar`` parameter, exactly like a dynamic dim extent.
+        Scalar parameters need no value: each one survives into the generated
+        program as a real ``pl.Scalar`` parameter whose value arrives at
+        dispatch, exactly like a dynamic dim extent, and drops out of the cache
+        key so one artifact serves every value. A value supplied anyway — a
+        signature default, an explicit keyword, or ``pl.RUNTIME`` — is validated
+        and then contributes nothing (see :func:`_check_signature_scalar_value`).
+
+        A ``pl.constexpr`` parameter is the one kind that *does* need a value
+        here, because its value is the artifact: it comes from ``kwargs`` or a
+        signature default, and a parameter with neither is an error.
 
         Raises:
             TypeError: if a tensor parameter has a bare ``pl.Tensor`` annotation
-                (no shape to read), or a scalar parameter has no supplied value.
+                (no shape to read), a scalar parameter is given a value that is
+                neither a number nor ``pl.RUNTIME``, or a constexpr parameter
+                has no value.
         """
+        from pypto.language.typing.constexpr import ConstexprMarker  # noqa: PLC0415
         from pypto.language.typing.dynamic import DynVar  # noqa: PLC0415
         from pypto.language.typing.scalar import Scalar  # noqa: PLC0415
         from pypto.language.typing.tensor import Tensor  # noqa: PLC0415
@@ -2358,8 +2727,8 @@ class JITFunction:
         entry_dyn_map = per_func_dyn_maps[id(self._func)]
 
         tensor_meta: dict[str, TensorMeta] = {}
-        scalar_values: dict[str, int | float | bool] = {}
         scalar_dtypes: dict[str, DataType] = {}
+        constexpr_values: dict[str, str] = {}
 
         for name in param_names:
             param = sig.parameters[name]
@@ -2397,18 +2766,24 @@ class JITFunction:
             if isinstance(annotation, type) and issubclass(annotation, Tensor):
                 raise TypeError(bare_msg)
 
+            if isinstance(annotation, ConstexprMarker):
+                constexpr_values[name] = _resolve_constexpr_value(
+                    self.__name__,
+                    name,
+                    _signature_constexpr_value(self.__name__, name, param, kwargs),
+                )
+                continue
+
             # Scalar-like annotation: pl.Scalar[dtype] or a bare DataType.
             scalar_dtype = annotation.dtype if isinstance(annotation, Scalar) else None
             if scalar_dtype is None and isinstance(annotation, DataType):
                 scalar_dtype = annotation
             if scalar_dtype is not None:
-                value = _signature_scalar_value(self.__name__, name, param, kwargs)
-                # ``pl.RUNTIME`` -> no ``scalar_values`` entry. The specializer only
-                # substitutes names present in ``scalar_values``, so the parameter
-                # stays symbolic in the generated program; it also drops out of the
-                # cache key, so one artifact serves every runtime value.
-                if value is not None:
-                    scalar_values[name] = value
+                # The specializer never substitutes a scalar parameter, so it
+                # stays symbolic in the generated program and out of the cache
+                # key — one artifact serves every runtime value. Any value the
+                # caller supplied is only validated here.
+                _check_signature_scalar_value(self.__name__, name, param, kwargs)
                 scalar_dtypes[name] = scalar_dtype
                 continue
 
@@ -2420,10 +2795,19 @@ class JITFunction:
                 f"compile(*sample_args)."
             )
 
-        # Signature mode has no tensor sample arguments. Preserve supplied
-        # scalar values in the same arguments mapping returned by _bind_args.
-        arguments = dict(scalar_values)
-        return param_names, arguments, tensor_meta, scalar_values, scalar_dtypes, per_func_dyn_maps
+        # Signature mode binds no runtime arguments at all: it has no tensor
+        # samples, and a scalar's value now arrives at dispatch rather than at
+        # compile time. Its callers (``compile`` / ``lower`` / ``warmup``)
+        # discard the ordered-argument list this feeds.
+        arguments: dict[str, Any] = {}
+        return (
+            param_names,
+            arguments,
+            tensor_meta,
+            scalar_dtypes,
+            constexpr_values,
+            per_func_dyn_maps,
+        )
 
     # ------------------------------------------------------------------
     # Call
@@ -2462,22 +2846,16 @@ class JITFunction:
         # ``compile(a=x)``) must still bind through ``_bind_args``/``sig.bind``;
         # scalar/config kwargs do not block signature mode.
         signature_mode = allow_signature_mode and not args and not any(_is_tensor(v) for v in kwargs.values())
-        if signature_mode:
-            param_names, arguments, tensor_meta, scalar_values, scalar_dtypes, per_func_dyn = (
-                self._bind_args_from_signature(kwargs)
-            )
-        else:
-            param_names, arguments, tensor_meta, scalar_values, scalar_dtypes, per_func_dyn = self._bind_args(
-                args, kwargs
-            )
+        bind = self._bind_args_from_signature(kwargs) if signature_mode else self._bind_args(args, kwargs)
+        param_names, arguments, tensor_meta, scalar_dtypes, constexpr_values, per_func_dyn = bind
 
         return (
             _Specialization(
                 param_names,
                 arguments,
                 tensor_meta,
-                scalar_values,
                 scalar_dtypes,
+                constexpr_values,
                 per_func_dyn,
             ),
             run_config,
@@ -2522,8 +2900,8 @@ class JITFunction:
             with time_stage("build_ns"):
                 return self._compile(
                     specialization.tensor_meta,
-                    specialization.scalar_values,
                     specialization.scalar_dtypes,
+                    specialization.constexpr_values,
                     specialization.per_func_dyn,
                     pl,
                     **(compile_kwargs | overrides),
@@ -2533,8 +2911,14 @@ class JITFunction:
             record_stats(forced_rebuilds=1)
             return build(), ordered_args, run_config
 
+        # Resolved before the key rather than during ``build()``: a dep's
+        # compile-time value is part of what gets compiled, so the key has to
+        # identify it too.
+        constexpr_bindings = self._resolve_constexpr_bindings(specialization.constexpr_values)
         key = make_cache_key(
-            source_hash=self._get_source_hash(),
+            source_hash=_request_source_hash(
+                self._get_source_hash(), self._constexpr_identity_records(constexpr_bindings)
+            ),
             param_names=specialization.param_names,
             tensor_shapes={n: m.static_shape() for n, m in specialization.tensor_meta.items()},
             tensor_dtypes={n: m.dtype for n, m in specialization.tensor_meta.items()},
@@ -2543,7 +2927,6 @@ class JITFunction:
             dynamic_dims={
                 (n, i) for n, m in specialization.tensor_meta.items() for i in m.dynamic_dim_indices()
             },
-            scalar_values=specialization.scalar_values,
             platform=compile_kwargs["platform"],
             strategy=compile_kwargs["strategy"],
             distributed_config=compile_kwargs.get("distributed_config"),
@@ -2551,6 +2934,7 @@ class JITFunction:
             emit_source_loc=compile_kwargs["emit_source_loc"],
             memory_planner=compile_kwargs.get("memory_planner", _resolve_memory_planner(None)),
             enable_pypto_l0c_double_buffer=_resolve_enable_pypto_l0c_double_buffer(),
+            enable_buffer_ir=_resolve_enable_buffer_ir(),
             runtime=_resolve_runtime(),
         )
 
@@ -2690,16 +3074,17 @@ class JITFunction:
         requires every tensor parameter to carry a full ``pl.Tensor[[...],
         dtype]`` annotation (a bare ``pl.Tensor`` has no shape to read and
         raises). Dynamic dims (``pl.dynamic`` / ``bind_dynamic``) need no value —
-        the artifact is extent-independent. Scalar parameters have no value in
-        the signature, so pass them as keyword args (or via a signature
-        default); a literal **specializes** that value into the artifact, while
-        ``pl.RUNTIME`` leaves the parameter **unspecialized** — it stays a real
-        ``pl.Scalar`` parameter supplied at dispatch and, like a dynamic dim,
-        drops out of the cache key. A signature-mode call shares a cache entry
-        with an equivalent ``compile(*sample_tensors)`` call whenever the two
-        agree on every specialized scalar; ``pl.RUNTIME`` is its own
-        specialization and is rejected on the sample-argument path, which always
-        specializes the scalar value it is handed.
+        the artifact is extent-independent. Scalar parameters need no value
+        either: a ``pl.Scalar`` parameter is a **runtime value**, so it stays a
+        real parameter in the artifact, its value arrives at dispatch, and —
+        like a dynamic dim — it drops out of the cache key. A signature-mode
+        call therefore always shares a cache entry with an equivalent
+        ``compile(*sample_tensors)`` call. A value supplied anyway is inert: a
+        signature default is accepted silently, an explicit keyword warns
+        (that form used to specialize), and ``pl.RUNTIME`` is accepted here as
+        the no-op it now is. The sample-argument path takes the scalar as an
+        ordinary argument and rejects ``pl.RUNTIME``, which is a compile-time
+        marker rather than a value.
 
         Example::
 
@@ -2719,12 +3104,11 @@ class JITFunction:
             # From sample tensors (shape/dtype read; contents ignored):
             compiled = my_kernel.compile(sample_x, sample_w, sample_out, 128)
 
-            # Or straight from the (fully-annotated) signature — no tensors.
-            # num_tokens varies per launch, so keep it out of the artifact: its
-            # value is supplied on each dispatch through the compiled artifact
-            # (below), not by calling my_kernel(...) directly — an eager call
-            # re-specializes and compiles a separate artifact.
-            compiled = my_kernel.compile(num_tokens=pl.RUNTIME)
+            # Or straight from the (fully-annotated) signature — no tensors,
+            # and no value for num_tokens: it is a runtime value, supplied on
+            # each dispatch below. Calling my_kernel(...) eagerly with a
+            # different num_tokens reuses this same artifact.
+            compiled = my_kernel.compile()
 
             w_dev = worker.alloc_tensor(real_w.shape, real_w.dtype, init=real_w)
             h = worker.register(compiled)
@@ -2737,10 +3121,9 @@ class JITFunction:
                 contents are not read. Omit **all** positional args to compile
                 straight from the signature annotations instead.
             **kwargs: Keyword arguments. A ``config`` keyword, if present, is
-                a ``RunConfig``. In signature mode,
-                scalar parameter values are also passed here (by name) — a
-                literal to specialize it, or ``pl.RUNTIME`` to leave it
-                unspecialized.
+                a ``RunConfig``. Signature mode needs no scalar values; one
+                passed by name is validated and then ignored, and an explicit
+                scalar keyword warns rather than specializing.
 
         Returns:
             The cached ``CompiledProgram`` for this specialization.
@@ -2753,8 +3136,8 @@ class JITFunction:
 
         Uses the same arguments, configuration, specialization, and in-process
         cache as :meth:`compile`. Fully annotated tensors need no sample
-        allocation; scalar defaults, keyword values, and ``pl.RUNTIME`` follow
-        the same rules as annotation-driven compilation.
+        allocation, and scalar parameters need no value at all — they are
+        runtime values, so one preparation serves every value.
 
         Unlike :meth:`compile`, this also assembles the kernel and orchestration
         binaries for every chip-level build before returning. It creates no
@@ -2848,8 +3231,8 @@ class JITFunction:
         specialization, _ = self._resolve_specialization(args, kwargs, allow_signature_mode=True)
         return self._compile_to_program(
             specialization.tensor_meta,
-            specialization.scalar_values,
             specialization.scalar_dtypes,
+            specialization.constexpr_values,
             specialization.per_func_dyn,
             pl,
         )
@@ -2884,9 +3267,9 @@ class JITFunction:
         Args:
             *args: Positional sample arguments matching the decorated function.
                 Omit tensor samples to specialize from fully shaped annotations.
-            **kwargs: Keyword sample arguments and an optional ``config``. In
-                signature mode a scalar parameter takes a literal (specialized
-                into the IR) or ``pl.RUNTIME`` (left unspecialized).
+            **kwargs: Keyword sample arguments and an optional ``config``. A
+                scalar parameter needs no value in signature mode: it stays a
+                symbolic ``pl.Scalar`` parameter in the returned program.
 
         Returns:
             The specialized ``ir.Program`` after configured passes.
@@ -2901,8 +3284,8 @@ class JITFunction:
         )
         pre_pass, rename_map = self._compile_to_program_with_rename_map(
             specialization.tensor_meta,
-            specialization.scalar_values,
             specialization.scalar_dtypes,
+            specialization.constexpr_values,
             specialization.per_func_dyn,
             pl,
         )
@@ -2929,8 +3312,8 @@ class JITFunction:
     def _compile(
         self,
         tensor_meta: dict[str, TensorMeta],
-        scalar_values: dict[str, int | float | bool],
         scalar_dtypes: dict[str, DataType],
+        constexpr_values: dict[str, str],
         per_func_dyn: dict[int, dict[str, dict[int, DynDim]]],
         pl: Any,
         **ir_compile_kwargs: Any,
@@ -2955,7 +3338,7 @@ class JITFunction:
         """
         from pypto.ir.compile import compile as ir_compile  # noqa: PLC0415
 
-        contexts = self._build_contexts(tensor_meta, scalar_values, scalar_dtypes, per_func_dyn)
+        contexts = self._build_contexts(tensor_meta, scalar_dtypes, constexpr_values, per_func_dyn)
         class_name = f"_jit_{self.__name__}"
         specializer = Specializer(class_name, contexts)
         source = specializer.specialize()
@@ -2977,16 +3360,16 @@ class JITFunction:
     def _compile_to_program(
         self,
         tensor_meta: dict[str, TensorMeta],
-        scalar_values: dict[str, int | float | bool],
         scalar_dtypes: dict[str, DataType],
+        constexpr_values: dict[str, str],
         per_func_dyn: dict[int, dict[str, dict[int, DynDim]]],
         pl: Any,
     ) -> Any:
         """Specialize entry + deps and return the parsed pre-pass ``ir.Program``."""
         program, _rename_map = self._compile_to_program_with_rename_map(
             tensor_meta,
-            scalar_values,
             scalar_dtypes,
+            constexpr_values,
             per_func_dyn,
             pl,
         )
@@ -2995,13 +3378,13 @@ class JITFunction:
     def _compile_to_program_with_rename_map(
         self,
         tensor_meta: dict[str, TensorMeta],
-        scalar_values: dict[str, int | float | bool],
         scalar_dtypes: dict[str, DataType],
+        constexpr_values: dict[str, str],
         per_func_dyn: dict[int, dict[str, dict[int, DynDim]]],
         pl: Any,
     ) -> tuple[Any, dict[str, str]]:
         """Return the parsed pre-pass program and specializer rename map."""
-        contexts = self._build_contexts(tensor_meta, scalar_values, scalar_dtypes, per_func_dyn)
+        contexts = self._build_contexts(tensor_meta, scalar_dtypes, constexpr_values, per_func_dyn)
         class_name = f"_jit_{self.__name__}"
         specializer = Specializer(class_name, contexts)
         source = specializer.specialize()
@@ -3018,8 +3401,8 @@ class JITFunction:
     def _build_contexts(
         self,
         tensor_meta: dict[str, TensorMeta],
-        scalar_values: dict[str, int | float | bool],
         scalar_dtypes: dict[str, DataType],
+        constexpr_values: dict[str, str],
         per_func_dyn: dict[int, dict[str, dict[int, DynDim]]],
     ) -> list[SpecializeContext]:
         """Build SpecializeContext list for entry + every transitive dep.
@@ -3058,10 +3441,13 @@ class JITFunction:
             int,
             tuple[
                 dict[str, TensorMeta],
-                dict[str, int | float | bool],
                 dict[str, DataType],
             ],
-        ] = {id(self._func): (tensor_meta, scalar_values, scalar_dtypes)}
+        ] = {id(self._func): (tensor_meta, scalar_dtypes)}
+        # Constexpr bindings resolved per function, so a dep that forwards one of
+        # its caller's compile-time parameters carries the same value through.
+        # The same walk backs the cache key, so the two cannot disagree.
+        resolved_constexpr = self._resolve_constexpr_bindings(constexpr_values)
 
         # One generated ``@pl.function`` name per JIT function, unique across
         # the program. Two distinct deps may share a ``__name__`` (two modules
@@ -3090,19 +3476,19 @@ class JITFunction:
             # of ``shared`` is emitted, so the call sites in other branches
             # must agree on shapes/dtypes anyway.
             caller_func, dep_call_name = callers_by_id[id(dep._func)][0]
-            c_meta, c_sv, c_sd = resolved[id(caller_func)]
+            c_meta, c_sd = resolved[id(caller_func)]
+            dep_constexpr = resolved_constexpr[id(dep._func)]
             caller_ftype = func_type_by_id.get(id(caller_func), "orchestration")
-            dep_meta, dep_sv, dep_sd = _resolve_dep_call_metadata(
+            dep_meta, dep_sd = _resolve_dep_call_metadata(
                 dep,
                 caller_func,
                 c_meta,
-                c_sv,
                 c_sd,
                 per_func_dyn.get(id(dep._func), empty_dyn),
                 caller_func_type=caller_ftype,
                 dep_call_name=dep_call_name,
             )
-            resolved[id(dep._func)] = (dep_meta, dep_sv, dep_sd)
+            resolved[id(dep._func)] = (dep_meta, dep_sd)
             dep_contexts.append(
                 build_specialize_context(
                     func=dep._func,
@@ -3110,8 +3496,8 @@ class JITFunction:
                     func_type=dep._func_type,
                     level=dep._level,
                     tensor_meta=dep_meta,
-                    scalar_values=dep_sv,
                     scalar_dtypes=dep_sd,
+                    constexpr_values=dep_constexpr,
                     dep_names=callees_by_id[id(dep._func)],
                     dep_func_names=dep_func_names_by_caller.get(id(dep._func), {}),
                     auto_scope=dep._auto_scope,
@@ -3130,8 +3516,8 @@ class JITFunction:
             func_type=self._func_type,
             level=self._level,
             tensor_meta=tensor_meta,
-            scalar_values=scalar_values,
             scalar_dtypes=scalar_dtypes,
+            constexpr_values=constexpr_values,
             dep_names=callees_by_id[id(self._func)],
             dep_func_names=dep_func_names_by_caller.get(id(self._func), {}),
             auto_scope=self._auto_scope,

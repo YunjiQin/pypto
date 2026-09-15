@@ -93,25 +93,23 @@ Ascend910B（a2a3）——跨核传输经过 GM → Mat，Mat 仅支持 NZ 布�
 | Vec->Mat | 保持原始布局 | — |
 | Mat/Acc->Vec | 保持原始布局 | — |
 
-在两种后端上，AIV 推送侧（V→C）都会在 `tpush_to_aic` 前插入一个 `tile.move` 将源 tile 转换为所需的 fractal 布局。`tile.move` 辅助函数（`CreateMove`）在结果类型携带 TileView 时会传播 `blayout`/`slayout` kwargs。
+在两种后端上，普通数据的 AIV 推送侧（V→C）都会在 `tpush_to_aic` 前插入一个 `tile.move` 将源 tile 转换为所需的 fractal 布局。`tile.move` 辅助函数（`CreateMove`）在结果类型携带 TileView 时会传播 `blayout`/`slayout` kwargs。Ascend950 MX scale 使用下文单独说明的 row/row carrier。
 
-### 手写 pipe 与 MX scale 限制
+### 手写 pipe 同样获得该适配
 
 上述规则描述的是边界移动路径，它只能看到本 pass 在展开 InCore 函数时构建的 pipe。完全手写的
 pipe（`pl.reserve_buffer`、`pl.{aic,aiv}_initialize_pipe` 与 `pl.tpush_to_aic`）不会经过该
 路径。在 `RequiresVtoCFractalAdapt()` 成立的后端上，这样的推送会把裸 ND tile 送进一个被 cube
 按 fractal 解释的 FIFO，导致弹出 tile 的每个元素都错位。
 
-`AdaptManualVtoCPush` 为已有的非 MX data-tile 路径补上这个缺口。它作为本 pass 的最后一个阶段，
-遍历本 pass **产出**的每一个 AIV 函数，包括转成 AIV 的纯向量 InCore 函数，以及 mixed 函数拆出的
-AIV 半边。它保留原 push 的 kwargs —— 丢掉 `id` 会让多 pipe 程序坍缩到同一个 FIFO 上 —— 并且
-仅在遇到受支持的手写 push 时查询 `RequiresVtoCFractalAdapt()`。
+`AdaptManualVtoCPush` 负责补上这个缺口。它作为本 pass 的最后一个阶段，遍历本 pass **产出**的
+每一个 AIV 函数，包括转成 AIV 的纯向量 InCore 函数，以及 mixed 函数拆出的 AIV 半边。普通数据仍
+使用固定的 cube 侧 Mat transfer view。对于 MX，pass 会从 AIV import 解析到 AIC reserve，并按
+V2C pipe `id` 及出现顺序配对 push/pop，从实际消费方 `tpop` 契约规划每次传输。peer 缺失、initializer
+不唯一、push/pop 数量或 split 不匹配、slot 太小都会直接报错，不会猜测布局。
 
-该阶段不会将手写 push 与消费侧 `tpop` 配对，因此无法安全推导 MX-scale carrier。如果
-手写 `tile.tpush_to_aic` 的源 dtype 是 FP8E8M0，pass 会直接报错，而不是静默改写为 NZ。请使用
-下文的自动 mixed-kernel 边界，或通过 GM 暂存 scale。编译器生成
-的 MX push 会携带一个临时内部标记；其 carrier 已根据边界 destination 完成规划，最后阶段只删除该
-标记。
+该改写同时支持 FP8E8M0 MX scale 和普通 data tile，保留原 push 的 kwargs/attrs（包括 `id`），并且
+保持幂等：已经处于边界 view 的 push 不会再次改写。只有遇到手写 V→C push 时才查询后端能力。
 
 ### 经 GM 中转的跨核依赖
 
@@ -151,11 +149,16 @@ AIV 半边。它保留原 push 的 kwargs —— 丢掉 `id` 会让多 pipe 程�
 ### MX scale 的 V2C 传输
 
 在 Ascend950 上，mixed `quant_mx` → `matmul_mx` 路径会把两个结果都经 V2C
-传递。row/row 匹配的 scale 直接 push；col/col 的 B 侧 scale 使用零拷贝
-`tile.transpose_view` 形成物理 row/row push，AIC `tpop` 则保留公开的
-col/col 逻辑 shape 与 layout。该支持仅适用于编译器生成的边界；手写 MX-scale
-V2C pipe 会按上述规则被拒绝。物理 ND push 的最后一维还必须全部有效；如果
-该约束被破坏，Pass 会报告内部错误。
+传递。FP8E8M0 fractal-32 scale 不再走 NZ TINSERT。完整有效的逻辑 row/row scale 直接推送；逻辑
+col/col scale 会在完成 carrier 准备后使用官方零拷贝 `tile.transpose_view`，得到物理 shape 转置后的
+row/row carrier。若生产者和消费者的逻辑布局不同，则先用真正的 Vec→Vec `tile.move` 转成消费方布局，
+再生成 carrier。
+
+AIC `tpop` 始终保留消费方公开的逻辑 shape、layout 与 `valid_shape`。逻辑 scale 部分有效时，生产侧
+发送完整物理 box，使 ND insert 连续且按 32 字节对齐。Pass 会先物化一个私有 Vec carrier，再仅对该
+carrier 使用 `tile.set_validshape` 扩大有效范围；这样 slice/reshape view 仍保持合法，原始逻辑 scale
+的元数据也不会改变。消费侧仍忽略原始逻辑有效区之外的 padding。完整 carrier 的字节数必须放得进
+配对 pipe 的 `slot_size`。
 
 ### 覆盖槽位数（`slot_num`）
 
@@ -276,7 +279,8 @@ program_expanded = expand_pass(program)
       - Ascend950：Left→NZ，Right→ZN，Mat/Vec→保持原始
       - Ascend910B：Left→NZ，Right→NZ（Mat 仅支持 NZ），Mat/Vec→保持原始
   6. 修复两侧函数体中的循环携带状态
-     - 删除在当前核心侧无用的 dead iter_args
+     - 删除在当前核心侧无用的 dead iter_args——"有用"包含循环自身的 yield，
+       因此仅被用于喂给另一个存活槽位的 carry（多级 FIFO 轮转）会被保留
      - 为保留下来的 iter_args 补回缺失的 init value 定义
      - 当分支局部值被裁剪后，将悬空 yield 改写为 identity yield
      - 将悬空的 tile.store 结果变量（被 AIC 侧拆分裁剪的 SSA 版本）重映射到对应的输出参数
@@ -332,6 +336,8 @@ program_expanded = expand_pass(program)
 **嵌套结构处理**：包含混合操作的 ForStmt、IfStmt 和 WhileStmt 会被复制到 AIC 和 AIV 函数体中，内部内容递归裁剪。
 
 **拆分后的循环状态修复**：在构建 AIC/AIV 函数体时，Pass 会先保留共享的控制流骨架，因此某一侧可能暂时留下多余的 iter_args、缺失的 init value 定义，或引用已被裁剪分支局部值的 yield。Pass 会先在 DCE 前按固定顺序修复这些情况，再在 DCE 后做一次循环状态归一化，因为某些仅用于过渡的共享别名会在 DCE 后消失，进而让相应 iter_arg 变成真正可删除。最后再运行一次 DCE，清理第二次裁剪后暴露出的 init-value 链。
+
+**哪些 carry 算存活**：只被循环自身尾部 yield 读取的 iter_arg，只要它喂入的槽位存活，它本身就存活——多级 FIFO 正是这种形状：第 `N` 级除了把自己轮转进第 `N-1` 级的那条 yield 之外别无读者。因此存活性分析要在 yield 上做闭包，而不是只看函数体；裁剪后还会断言"保留下来的 yield 值不会引用刚被删除的 carry"。删错 carry 会留下一个自由变量，后续没有任何 Pass 会拒绝它，最终由 PTO codegen 以 "no MLIR mapping for MemRef base ..." 报出。
 
 **Group 包装函数的参数化返回**：新建的 Group 包装函数在所有
 返回位置都能追踪到参数回写（经 `return_lineage::ReturnedParamIndices`）时，

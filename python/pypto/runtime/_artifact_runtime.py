@@ -13,6 +13,8 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from pypto._artifact_contract import ArtifactExecutionMode
+from pypto._kernel_abi import KernelABI
 from pypto.jit._artifact_manifest import ArtifactState, BuildKind, read_manifest
 from pypto.jit.artifact_cache import ArtifactHandle, ArtifactStore
 
@@ -28,6 +30,7 @@ class ArtifactRuntime:
     """
 
     def __init__(self, store: ArtifactStore, handle: ArtifactHandle, platform: str, run_directory: Path):
+        handle.spec.execution_capabilities.require(ArtifactExecutionMode.PROGRAM)
         if store.root != handle.cache_root:
             raise ValueError("Artifact handle and store have different cache roots")
         run_directory = run_directory.resolve()
@@ -49,7 +52,9 @@ class ArtifactRuntime:
         Promotion crosses a new trust boundary and receives a new inventory.
         """
         if self._manifest is None:
-            self._manifest = read_manifest(self.handle.directory, self.handle.key, self.handle.spec)
+            manifest = read_manifest(self.handle.directory, self.handle.key, self.handle.spec)
+            _restore_program_metadata(self.handle)
+            self._manifest = manifest
         return self._manifest
 
     def load(self) -> dict[str, tuple[Any, str, dict[str, Any]]]:
@@ -73,6 +78,7 @@ class ArtifactRuntime:
                 if result.handle is not None:
                     handle = result.handle
                     manifest = read_manifest(handle.directory, handle.key, handle.spec)
+                    _restore_program_metadata(handle)
                     self.handle = handle
                     self.directory = handle.directory
                     self._manifest = manifest
@@ -92,6 +98,18 @@ class ArtifactRuntime:
             return chips
 
 
+def _restore_program_metadata(handle: ArtifactHandle) -> Any:
+    """Restore the consumer contract before importing generated/runtime code."""
+    from pypto.ir.compiled_program import CompiledProgram  # noqa: PLC0415
+    from pypto.ir.distributed_compiled_program import DistributedCompiledProgram  # noqa: PLC0415
+
+    cls = CompiledProgram if handle.spec.build_kind is BuildKind.SINGLE_CHIP else DistributedCompiledProgram
+    compiled = cls.from_dir(handle.directory)
+    if compiled.execution_capabilities != handle.spec.execution_capabilities:
+        raise ValueError("Artifact manifest capabilities do not match compiled metadata")
+    return compiled
+
+
 def bind_artifact(compiled: Any, store: ArtifactStore, handle: ArtifactHandle, run_directory: Path) -> None:
     """Attach a validated artifact before runtime loading, retaining fresh IR.
 
@@ -105,10 +123,12 @@ def bind_artifact(compiled: Any, store: ArtifactStore, handle: ArtifactHandle, r
     if not isinstance(compiled, CompiledProgram | DistributedCompiledProgram):
         raise TypeError(f"Unsupported artifact-backed program: {type(compiled).__name__}")
     runtime = ArtifactRuntime(store, handle, compiled.platform, run_directory)
-    runtime._validate()
-    cls = CompiledProgram if handle.spec.build_kind is BuildKind.SINGLE_CHIP else DistributedCompiledProgram
-    restored = cls.from_dir(handle.directory)
+    manifest = read_manifest(handle.directory, handle.key, handle.spec)
+    restored = _restore_program_metadata(handle)
+    if compiled.execution_capabilities != restored.execution_capabilities:
+        raise ValueError("Artifact capabilities do not match the compiled program")
     _attach(compiled, runtime, restored.platform)
+    runtime._manifest = manifest
 
 
 def _attach(compiled: Any, runtime: ArtifactRuntime, persisted_platform: str) -> None:
@@ -127,6 +147,8 @@ def _attach(compiled: Any, runtime: ArtifactRuntime, persisted_platform: str) ->
         expected = BuildKind.SINGLE_CHIP
     else:
         raise TypeError(f"Unsupported artifact-backed program: {type(compiled).__name__}")
+    if handle.spec.execution_capabilities != compiled.execution_capabilities:
+        raise ValueError("Artifact manifest capabilities do not match compiled metadata")
     if handle.spec.build_kind is not expected or persisted_platform != compiled.platform:
         raise ValueError("Artifact build kind/platform does not match the compiled program")
     if vars(compiled).get("_artifact_runtime") is not None:
@@ -139,12 +161,8 @@ def _attach(compiled: Any, runtime: ArtifactRuntime, persisted_platform: str) ->
 
 def restore_artifact(store: ArtifactStore, handle: ArtifactHandle, run_directory: Path) -> Any:
     """Restore metadata without IR, and attach the explicit artifact loading policy."""
-    from pypto.ir.compiled_program import CompiledProgram  # noqa: PLC0415
-    from pypto.ir.distributed_compiled_program import DistributedCompiledProgram  # noqa: PLC0415
-
     manifest = read_manifest(handle.directory, handle.key, handle.spec)
-    cls = CompiledProgram if handle.spec.build_kind is BuildKind.SINGLE_CHIP else DistributedCompiledProgram
-    compiled = cls.from_dir(handle.directory)
+    compiled = _restore_program_metadata(handle)
     runtime = ArtifactRuntime(store, handle, compiled.platform, run_directory)
     runtime._manifest = manifest
     _attach(compiled, runtime, compiled.platform)
@@ -155,3 +173,19 @@ def runtime_output_directory(compiled: Any) -> Path:
     """Return writable run storage without changing the immutable artifact root."""
     runtime = vars(compiled).get("_artifact_runtime")
     return compiled.output_dir if runtime is None else runtime.run_directory
+
+
+def restore_kernel_metadata(handle: ArtifactHandle, expected_abi: KernelABI) -> dict[str, Any]:
+    """Validate a kernel stage and its sidecar without assembly or device work.
+
+    Both generated and ready handles retain the same contract. A ready marker
+    still does not imply that a callable has been registered in this process.
+    """
+    handle.spec.execution_capabilities.require(ArtifactExecutionMode.KERNEL)
+    if handle.spec.kernel_abi is None:
+        raise ValueError("Kernel artifact is missing its ABI descriptor")
+    handle.spec.kernel_abi.require_compatible(expected_abi)
+    read_manifest(handle.directory, handle.key, handle.spec)
+    from pypto.ir.compiled_program import load_kernel_metadata  # noqa: PLC0415
+
+    return load_kernel_metadata(handle.directory, expected_abi)

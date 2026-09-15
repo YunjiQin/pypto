@@ -11,8 +11,8 @@
 
 import logging
 import os
+import tempfile
 from contextlib import AbstractContextManager, nullcontext
-from datetime import datetime
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 from pypto.backend import BackendType
@@ -213,6 +213,7 @@ def _run_pass_pipeline(  # noqa: PLR0913
             else outer.get_enable_pypto_l0c_double_buffer()
         )
         rt = runtime if runtime is not None else outer.get_runtime()
+        buffer_ir = outer.get_enable_buffer_ir()
     else:
         instruments = list(extra_instruments)
         vlevel = (
@@ -223,7 +224,8 @@ def _run_pass_pipeline(  # noqa: PLR0913
         mplan = memory_planner if memory_planner is not None else _passes.MemoryPlanner.PYPTO
         dbc_flag = enable_pypto_l0c_double_buffer if enable_pypto_l0c_double_buffer is not None else False
         rt = runtime if runtime is not None else _passes.RuntimeKind.TENSORMAP_AND_RINGBUFFER
-    ctx = _passes.PassContext(instruments, vlevel, dphase, disabled, mplan, dbc_flag, rt)
+        buffer_ir = False
+    ctx = _passes.PassContext(instruments, vlevel, dphase, disabled, mplan, dbc_flag, rt, buffer_ir)
 
     if mplan == _passes.MemoryPlanner.PTOAS:
         logger.warning(
@@ -289,10 +291,11 @@ def compile(  # noqa: PLR0913
 
     Args:
         program: Input Program to compile
-        output_dir: Output directory. When None, defaults to
-            ``<base>/<program_name>_<timestamp>``, where ``<base>`` is the
-            ``PYPTO_PROG_BUILD_DIR`` environment variable if set (and
-            non-empty), else ``build_output``.
+        output_dir: Output directory. When None, a fresh directory
+            ``<base>/<program_name>_<unique>`` is created per call, where
+            ``<base>`` is the ``PYPTO_PROG_BUILD_DIR`` environment variable if
+            set (and non-empty), else ``build_output``. The suffix is opaque --
+            do not derive one; read ``compiled.output_dir`` instead.
         strategy: Optimization strategy to use (default: Default)
         dump_passes: Per-pass IR dump control. A ``PassDumpLevel``
             (``NONE`` / ``CONCISE`` / ``EXPLICIT``) or a ``bool``
@@ -380,14 +383,22 @@ def compile(  # noqa: PLR0913
     _select_backend(backend_type=backend_type, platform=platform)
 
     if output_dir is None:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         # ``or`` (not get's default arg) so an empty-but-set env var
         # (``export PYPTO_PROG_BUILD_DIR=``) still falls back to build_output
         # rather than writing artifacts into the current working directory.
         base = os.environ.get("PYPTO_PROG_BUILD_DIR") or "build_output"
-        output_dir = os.path.join(base, f"{program.name}_{timestamp}")
-
-    os.makedirs(output_dir, exist_ok=True)
+        os.makedirs(base, exist_ok=True)
+        # mkdtemp, not ``<name>_<timestamp>``: the timestamp had one-second
+        # resolution and the directory was created with ``exist_ok=True``, so two
+        # compiles of same-named programs within one second shared a directory
+        # and the second silently overwrote the first's kernels. A caller that
+        # compiles one program and runs it before compiling the next never saw
+        # it; one that compiles a batch up front and dispatches afterwards gets
+        # the wrong kernel with no error -- only a numeric assertion catches it.
+        # `@pl.jit` already resolves its own output directory this way.
+        output_dir = tempfile.mkdtemp(prefix=f"{program.name}_", dir=base)
+    else:
+        os.makedirs(output_dir, exist_ok=True)
 
     _validate_pass_context_conflicts(
         operation="compile",

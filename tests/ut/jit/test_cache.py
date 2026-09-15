@@ -22,10 +22,12 @@ import pytest
 from pypto.ir import DistributedConfig, OptimizationStrategy
 from pypto.jit._source import capture_namespaces, function_namespace
 from pypto.jit.cache import (
+    SCALAR_SEMANTICS,
     compute_source_hash,
     make_cache_key,
 )
 from pypto.jit.decorator import (
+    _resolve_enable_buffer_ir,
     _resolve_enable_pypto_l0c_double_buffer,
     _resolve_memory_planner,
     _resolve_runtime,
@@ -71,7 +73,6 @@ class TestMakeCacheKey:
         tensor_shapes=None,
         tensor_dtypes=None,
         dynamic_dims=None,
-        scalar_values=None,
         platform=None,
         strategy=None,
         distributed_config=None,
@@ -81,6 +82,7 @@ class TestMakeCacheKey:
         tensor_layouts=None,
         dep_layouts=(),
         runtime=passes.RuntimeKind.TENSORMAP_AND_RINGBUFFER,
+        enable_buffer_ir=False,
     ):
         return make_cache_key(
             source_hash=source_hash,
@@ -88,7 +90,6 @@ class TestMakeCacheKey:
             tensor_shapes=tensor_shapes or {},
             tensor_dtypes=tensor_dtypes or {},
             dynamic_dims=dynamic_dims or set(),
-            scalar_values=scalar_values or {},
             platform=platform,
             strategy=strategy,
             distributed_config=distributed_config,
@@ -98,6 +99,7 @@ class TestMakeCacheKey:
             tensor_layouts=tensor_layouts,
             dep_layouts=dep_layouts,
             runtime=runtime,
+            enable_buffer_ir=enable_buffer_ir,
         )
 
     def test_basic_key_structure(self):
@@ -107,21 +109,22 @@ class TestMakeCacheKey:
             tensor_dtypes={"a": DataType.FP32},
         )
         assert isinstance(key, tuple)
-        assert len(key) == 7
-        source_hash, platform, strategy, tensor_part, scalar_part, dist_part, compile_opts = key
+        assert len(key) == 6
+        source_hash, platform, strategy, tensor_part, dist_part, compile_opts = key
         assert source_hash == "abc"
         assert platform is None
         assert strategy is None
         assert isinstance(tensor_part, tuple)
-        assert isinstance(scalar_part, tuple)
         assert dist_part is None  # single-chip default
         assert compile_opts == (
+            ("scalar_semantics", 2),
             ("analyze_auto_scopes_for_deps", False),
             ("emit_source_loc", True),
             ("memory_planner", None),
             ("enable_pypto_l0c_double_buffer", False),
             ("dep_layouts", ()),
             ("runtime", "tensormap_and_ringbuffer"),
+            ("enable_buffer_ir", False),
         )
 
     def test_tensor_shape_in_key(self):
@@ -130,7 +133,7 @@ class TestMakeCacheKey:
             tensor_shapes={"a": (128, 64)},
             tensor_dtypes={"a": DataType.FP32},
         )
-        _, _, _, tensor_part, _, _, _ = key
+        _, _, _, tensor_part, _, _ = key
         assert len(tensor_part) == 1
         info = tensor_part[0]
         assert info.name == "a"
@@ -144,7 +147,7 @@ class TestMakeCacheKey:
             tensor_dtypes={"a": DataType.FP32},
             dynamic_dims={("a", 0)},
         )
-        _, _, _, tensor_part, _, _, _ = key
+        _, _, _, tensor_part, _, _ = key
         assert tensor_part[0].shape == (None, 128)
 
     def test_dynamic_dim_cache_hit_on_different_concrete_value(self):
@@ -155,7 +158,6 @@ class TestMakeCacheKey:
             tensor_shapes={"a": (256, 128)},
             tensor_dtypes={"a": DataType.FP32},
             dynamic_dims={("a", 0)},
-            scalar_values={},
         )
         key_512 = make_cache_key(
             source_hash="x",
@@ -163,7 +165,6 @@ class TestMakeCacheKey:
             tensor_shapes={"a": (512, 128)},
             tensor_dtypes={"a": DataType.FP32},
             dynamic_dims={("a", 0)},
-            scalar_values={},
         )
         assert key_256 == key_512
 
@@ -175,7 +176,6 @@ class TestMakeCacheKey:
             tensor_shapes={"a": (256, 128)},
             tensor_dtypes={"a": DataType.FP32},
             dynamic_dims={("a", 0)},
-            scalar_values={},
         )
         key_256 = make_cache_key(
             source_hash="x",
@@ -183,24 +183,18 @@ class TestMakeCacheKey:
             tensor_shapes={"a": (256, 256)},
             tensor_dtypes={"a": DataType.FP32},
             dynamic_dims={("a", 0)},
-            scalar_values={},
         )
         assert key_128 != key_256
 
-    def test_scalar_values_in_key(self):
-        key = self._make_key(
-            param_names=["BLOCK_M"],
-            scalar_values={"BLOCK_M": 64},
-        )
-        _, _, _, _, scalar_part, _, _ = key
-        assert len(scalar_part) == 1
-        assert scalar_part[0].name == "BLOCK_M"
-        assert scalar_part[0].value == 64
+    def test_scalar_semantics_version_is_in_key(self):
+        """The key states which scalar contract built it (issue #2751).
 
-    def test_different_scalar_values_cause_miss(self):
-        k1 = self._make_key(param_names=["B"], scalar_values={"B": 64})
-        k2 = self._make_key(param_names=["B"], scalar_values={"B": 128})
-        assert k1 != k2
+        Without the stamp, an artifact compiled when a numeric argument was
+        folded into the body could be served to a request that expects the
+        parameter to stay symbolic.
+        """
+        _, _, _, _, _, compile_opts = self._make_key(param_names=["B"])
+        assert ("scalar_semantics", SCALAR_SEMANTICS) in compile_opts
 
     def test_param_order_preserved(self):
         """Tensor infos should follow param_names order."""
@@ -210,9 +204,8 @@ class TestMakeCacheKey:
             tensor_shapes={"a": (16,), "b": (32,)},
             tensor_dtypes={"a": DataType.FP16, "b": DataType.FP32},
             dynamic_dims=set(),
-            scalar_values={},
         )
-        _, _, _, tensor_part, _, _, _ = key
+        _, _, _, tensor_part, _, _ = key
         assert tensor_part[0].name == "b"
         assert tensor_part[1].name == "a"
 
@@ -437,6 +430,12 @@ class TestMakeCacheKey:
         key_on = self._make_key(**kwargs, enable_pypto_l0c_double_buffer=True)
         assert key_off == key_on
 
+    @pytest.mark.parametrize("planner", [MemoryPlanner.PYPTO, MemoryPlanner.DSA_RP, MemoryPlanner.PTOAS])
+    def test_buffer_ir_splits_key_for_every_planner(self, planner):
+        assert self._make_key(memory_planner=planner) != self._make_key(
+            memory_planner=planner, enable_buffer_ir=True
+        )
+
     def test_runtime_splits_key(self):
         """The runtime is baked into the artifact's ``kernel_config.py`` and decides
         which worker can bind it, so a ``host_build_graph`` call must not reuse a
@@ -478,6 +477,16 @@ class TestResolveMemoryPlanner:
         with passes.PassContext([], memory_planner=planner):
             assert _resolve_memory_planner(None) == planner
         assert _resolve_memory_planner(None) == MemoryPlanner.PYPTO
+
+
+def test_buffer_ir_cache_option_follows_active_context():
+    assert _resolve_enable_buffer_ir() is False
+    with passes.PassContext([], enable_buffer_ir=True):
+        assert _resolve_enable_buffer_ir() is True
+        with passes.PassContext([]):
+            assert _resolve_enable_buffer_ir() is False
+        assert _resolve_enable_buffer_ir() is True
+    assert _resolve_enable_buffer_ir() is False
 
 
 class TestResolveEnablePyptoL0cDoubleBuffer:
@@ -961,6 +970,249 @@ class TestGlobalDependencies:
         )
         kernel = pl.jit(implementation)
         assert kernel._get_source_hash() == kernel._get_source_hash()
+
+
+def _scalar_kernel(
+    x: pl.Tensor[[16, 16], pl.FP32],
+    out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+    row: pl.Scalar[pl.INT32],
+    bias: pl.Scalar[pl.FP32],
+    flag: pl.Scalar[pl.BOOL],
+):
+    """One parameter per supported scalar kind; ``flag`` is carried, not read."""
+    with pl.at(level=pl.Level.CORE_GROUP):
+        tile = pl.load(x, [row, 0], [16, 16])
+        pl.store(pl.add(tile, bias), [0, 0], out)
+    return out
+
+
+class TestRuntimeScalarParameters:
+    """A scalar parameter is a runtime value, not a specialization (issue #2751).
+
+    Changing a token count, an offset, or a scale must reuse the compiled
+    artifact and pass the new value at execution time.
+    """
+
+    @pytest.fixture
+    def compile_programs(self, monkeypatch):
+        """Run real specialization and parsing without invoking toolchains."""
+        programs = []
+
+        def compile_program(program, **kwargs):
+            programs.append(program)
+            return program
+
+        monkeypatch.setattr(importlib.import_module("pypto.ir.compile"), "compile", compile_program)
+        return programs
+
+    def test_one_compilation_serves_every_value(self, compile_programs):
+        torch = pytest.importorskip("torch")
+
+        kernel = pl.jit(_scalar_kernel)
+        x = torch.zeros(16, 16, dtype=torch.float32)
+        out = torch.zeros_like(x)
+
+        first = kernel.compile(x, out, 0, 1.0, False)
+        for row, bias, flag in ((1, 2.0, True), (2, -0.0, False), (3, 0.5, True)):
+            assert kernel.compile(x, out, row, bias, flag) is first
+        assert len(compile_programs) == 1
+
+    def test_generated_program_keeps_each_scalar_symbolic(self):
+        """Every scalar survives as a parameter and every use reads the symbol.
+
+        A folded value would leave the declared parameter unused and bake one
+        call site's number into the artifact.
+        """
+        torch = pytest.importorskip("torch")
+
+        kernel = pl.jit(_scalar_kernel)
+        x = torch.zeros(16, 16, dtype=torch.float32)
+        source = kernel.specialize(x, torch.zeros_like(x), 7, 3.5, True).as_python()
+
+        assert "row: pl.Scalar[pl.INT32]" in source
+        assert "bias: pl.Scalar[pl.FP32]" in source
+        assert "flag: pl.Scalar[pl.BOOL]" in source
+        assert "pl.tile.load(x, [row, 0]" in source
+        assert "pl.tile.adds(tile, bias)" in source
+
+
+def _constexpr_kernel(
+    x: pl.Tensor[[32, 32], pl.FP32],
+    out: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+    scale: pl.Scalar[pl.FP32],
+    BLOCK: pl.constexpr,
+):
+    """One parameter of each kind, so the two contracts are exercised together."""
+    with pl.at(level=pl.Level.CORE_GROUP):
+        tile = pl.load(x, [0, 0], [BLOCK, BLOCK])
+        pl.store(pl.add(tile, scale), [0, 0], out)
+    return out
+
+
+_CONSTEXPR_SETTINGS = types.SimpleNamespace(BLOCK=16)
+# A module global deliberately sharing a name with a runtime parameter below.
+n = 16
+
+
+@pl.jit.incore
+def _constexpr_tile_dep(
+    a: pl.Tensor[[32, 32], pl.FP32],
+    out: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+    N: pl.constexpr,
+):
+    pl.store(pl.load(a, [0, 0], [N, N]), [0, 0], out)
+    return out
+
+
+@pl.jit
+def _attr_cfg_entry(a: pl.Tensor[[32, 32], pl.FP32], out: pl.Out[pl.Tensor[[32, 32], pl.FP32]]):
+    with pl.at(level=pl.Level.CORE_GROUP):
+        pass
+    return _constexpr_tile_dep(a, out, _CONSTEXPR_SETTINGS.BLOCK)
+
+
+@pl.jit
+def _shadowed_entry(
+    a: pl.Tensor[[32, 32], pl.FP32],
+    out: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+    n: pl.Scalar[pl.INT32],
+):
+    with pl.at(level=pl.Level.CORE_GROUP):
+        pass
+    return _constexpr_tile_dep(a, out, n)
+
+
+class TestConstexprParameters:
+    """``pl.constexpr`` selects a specialization; ``pl.Scalar`` does not (issue #2759).
+
+    The pair has to be tested together: the point of the annotation is that two
+    parameters of the same kernel sit on opposite sides of the compile-time /
+    run-time line.
+    """
+
+    @pytest.fixture
+    def compile_programs(self, monkeypatch):
+        """Run real specialization and parsing without invoking toolchains."""
+        programs = []
+
+        def compile_program(program, **kwargs):
+            programs.append(program)
+            return program
+
+        monkeypatch.setattr(importlib.import_module("pypto.ir.compile"), "compile", compile_program)
+        return programs
+
+    @pytest.fixture
+    def samples(self):
+        torch = pytest.importorskip("torch")
+        x = torch.zeros(32, 32, dtype=torch.float32)
+        return x, torch.zeros_like(x)
+
+    def test_constant_selects_a_specialization_and_scalar_does_not(self, compile_programs, samples):
+        x, out = samples
+        kernel = pl.jit(_constexpr_kernel)
+
+        first = kernel.compile(x, out, 1.0, 16)
+        assert kernel.compile(x, out, 2.0, 16) is first, "a runtime Scalar must not split the cache"
+        assert kernel.compile(x, out, 9.5, 16) is first
+        second = kernel.compile(x, out, 1.0, 32)
+        assert second is not first, "a constexpr value must select its own specialization"
+        assert kernel.compile(x, out, 7.0, 32) is second
+        assert len(compile_programs) == 2
+
+    def test_value_reaches_the_body_and_leaves_the_signature(self, samples):
+        """The constant folds into the IR; the parameter is gone from the ABI.
+
+        Leaving it declared would demand an argument at dispatch for something
+        the artifact already decided.
+        """
+        x, out = samples
+        kernel = pl.jit(_constexpr_kernel)
+        source = kernel.specialize(x, out, 1.0, 16).as_python()
+
+        assert "pl.tile.load(x, [0, 0], [16, 16]" in source
+        assert "scale: pl.Scalar[pl.FP32]" in source
+        assert "BLOCK" not in source
+
+    def test_a_value_with_no_source_form_is_rejected(self, samples):
+        x, out = samples
+        kernel = pl.jit(_constexpr_kernel)
+
+        with pytest.raises(TypeError, match=r"constexpr parameter 'BLOCK'.*no source form"):
+            kernel.specialize(x, out, 1.0, object())
+
+    def test_signature_mode_requires_a_value(self):
+        """Unlike a scalar, a constexpr has no runtime slot to fall back on."""
+
+        @pl.jit
+        def sig_kernel(
+            x: pl.Tensor[[32, 32], pl.FP32],
+            out: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+            BLOCK: pl.constexpr,
+        ):
+            with pl.at(level=pl.Level.CORE_GROUP):
+                pl.store(pl.load(x, [0, 0], [BLOCK, BLOCK]), [0, 0], out)
+            return out
+
+        with pytest.raises(TypeError, match=r"constexpr parameter 'BLOCK' has no value"):
+            sig_kernel.specialize()
+        assert "[8, 8]" in sig_kernel.specialize(BLOCK=8).as_python()
+
+    def test_a_kernel_without_constexpr_keeps_its_identity(self):
+        """The request hash is untouched when no constexpr parameter is bound.
+
+        Layering the binding onto ``source_hash`` must not invalidate every
+        existing artifact just for existing.
+        """
+        from pypto.jit.decorator import _request_source_hash  # noqa: PLC0415
+
+        at_16 = [(0, "m", "k", "BLOCK", "16")]
+        at_32 = [(0, "m", "k", "BLOCK", "32")]
+        assert _request_source_hash("abc", []) == "abc"
+        assert _request_source_hash("abc", at_16) != "abc"
+        assert _request_source_hash("abc", at_16) != _request_source_hash("abc", at_32)
+
+    def test_a_dep_only_constant_reaches_the_cache_key(self):
+        """A value only the dep call site names must still move the key.
+
+        ``_get_source_hash`` can render free *names* only, so an attribute on a
+        config object was invisible to it: the generated source changed while
+        the key stood still, and the artifact built for the old value was served.
+        """
+        from pypto.jit.decorator import _request_source_hash  # noqa: PLC0415
+
+        torch = pytest.importorskip("torch")
+        x = torch.zeros(32, 32, dtype=torch.float32)
+        out = torch.zeros_like(x)
+
+        def request_hash():
+            bindings = _attr_cfg_entry._resolve_constexpr_bindings({})
+            return _request_source_hash(
+                _attr_cfg_entry._get_source_hash(),
+                _attr_cfg_entry._constexpr_identity_records(bindings),
+            )
+
+        _CONSTEXPR_SETTINGS.BLOCK = 16
+        before, source_before = request_hash(), _attr_cfg_entry.specialize(x, out).as_python()
+        _CONSTEXPR_SETTINGS.BLOCK = 32
+        after, source_after = request_hash(), _attr_cfg_entry.specialize(x, out).as_python()
+
+        assert "[16, 16]" in source_before
+        assert "[32, 32]" in source_after
+        assert before != after
+
+    def test_a_shadowed_global_does_not_fold_a_runtime_value(self):
+        """A caller local wins over a same-named global, as everywhere else.
+
+        With a module-level ``n = 16`` beside a runtime scalar parameter also
+        called ``n``, the dep was bound to 16 and compiled against a constant
+        the caller never passed.
+        """
+        torch = pytest.importorskip("torch")
+        x = torch.zeros(32, 32, dtype=torch.float32)
+
+        with pytest.raises(TypeError, match=r"'N' is bound to 'n'.*no compile-time value"):
+            _shadowed_entry.specialize(x, torch.zeros_like(x), 4)
 
 
 if __name__ == "__main__":

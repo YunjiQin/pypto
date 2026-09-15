@@ -10,6 +10,8 @@
 """Tests for the shared IR pass pipeline."""
 
 import json
+from contextlib import nullcontext
+from pathlib import Path
 
 import pytest
 from pypto import DataType, ir
@@ -50,6 +52,31 @@ def test_run_pass_pipeline_orders_outer_before_extra_instruments():
     for outer_event, extra_event in zip(seen[::2], seen[1::2], strict=True):
         assert outer_event[0] == "outer"
         assert extra_event == ("extra", outer_event[1])
+
+
+@pytest.mark.parametrize("mode", ["plain", "dump", "profiling", "dump_and_profiling"])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_buffer_ir_option_survives_nested_pipeline_contexts(tmp_path, mode, enabled):
+    """Compilation, dump and profiling wrappers inherit the same storage option."""
+    seen: list[bool] = []
+
+    def observe(_pass: passes.Pass, _program: ir.Program) -> None:
+        ctx = passes.PassContext.current()
+        assert ctx is not None
+        seen.append(ctx.get_enable_buffer_ir())
+
+    instrument = passes.CallbackInstrument(before_pass=observe, name="ObserveBufferIR")
+    profiling = CompileProfiler() if "profiling" in mode else nullcontext()
+    with passes.PassContext([instrument], enable_buffer_ir=enabled), profiling:
+        _run_pass_pipeline(
+            _scalar_program(),
+            operation="lower",
+            dump_passes="dump" in mode,
+            passes_dump_dir=str(tmp_path / "passes"),
+        )
+        ctx = passes.PassContext.current()
+        assert ctx is not None and ctx.get_enable_buffer_ir() == enabled
+    assert seen and all(value == enabled for value in seen)
 
 
 def test_run_pass_pipeline_names_diagnostic_conflict_for_lower():
@@ -143,6 +170,28 @@ def test_compile_outer_profiler_retains_ownership(tmp_path):
     assert [stage["name"] for stage in stages] == ["passes", "codegen"]
     assert stages[0]["children"]
     assert not (output_dir / "report" / "pipeline_profile.json").exists()
+
+
+def test_default_output_dirs_are_unique_per_compile(tmp_path, monkeypatch):
+    """Two compiles of one program never share a directory.
+
+    The default used to be ``<program name>_<timestamp>`` at one-second
+    resolution, created with ``exist_ok=True``. Two same-named programs compiled
+    inside one second therefore landed in one directory and the second's kernels
+    overwrote the first's, silently: a caller that compiled a batch up front and
+    dispatched afterwards got the wrong kernel with no error, and only a numeric
+    assertion could catch it.
+
+    Asserted on distinctness rather than on the naming scheme, so it still holds
+    if the scheme changes again.
+    """
+    monkeypatch.setenv("PYPTO_PROG_BUILD_DIR", str(tmp_path))
+
+    dirs = [ir.compile(_scalar_program(), dump_passes=False, skip_ptoas=True).output_dir for _ in range(3)]
+
+    assert len({str(d) for d in dirs}) == 3, f"compiles shared an output directory: {dirs}"
+    for d in dirs:
+        assert Path(d).is_dir()
 
 
 if __name__ == "__main__":

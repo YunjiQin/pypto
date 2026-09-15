@@ -21,8 +21,8 @@ prepared = decode.warmup(config=RunConfig(platform="a2a3"))
 print(pypto.cache_stats())
 ```
 
-`decode` has complete tensor annotations and scalar defaults. Alternatively,
-pass sample tensors and scalars using the ordinary `compile()` argument rules.
+`decode` has complete tensor annotations. Alternatively, pass sample tensors and
+scalars using the ordinary `compile()` argument rules.
 Warmup builds every required binary without initializing an NPU or executing a
 kernel. The build host still needs the target compiler, SDK and host runtime.
 
@@ -53,6 +53,50 @@ Private fallback results are shared only among overlapping calls in one process;
 invalid/unwritable storage and read-only misses do not provide cross-process
 private-build deduplication. Compiler errors propagate and can be retried.
 Unsupported extern packaging and changing application sources stay private.
+
+## Program build ownership
+
+`pypto.runtime.kernel_compiler.KernelCompiler` owns compiler invocations,
+linking, temporary output directories and binary validation. It consumes
+metadata from the installed Simpler SDK without inheriting its compiler or
+calling its build methods. This works with the existing runtime pin; it does
+not introduce kernel execution or change program call semantics.
+
+| Previous inherited responsibility | Current owner |
+| --------------------------------- | ------------- |
+| SDK root, tool selection, target flags, runtime headers and helper sources | Simpler metadata queries, consumed by PyPTO |
+| AICore compilation and `kernel_entry` linking | PyPTO `KernelCompiler.compile_incore` |
+| Simulator kernel shared libraries | PyPTO `KernelCompiler.compile_incore` |
+| Orchestration shared libraries, Build-ID and host threading flags | PyPTO `KernelCompiler.compile_orchestration` |
+| Temporary output validation and cleanup on success/failure | PyPTO; optional `build_dir` selects the temporary parent, not retained intermediates |
+| Callable assembly, binary publication and restoration | Existing PyPTO device runner, prebuilt loader and artifact store |
+
+HBG orchestration uses the host compiler. TRB uses the host compiler for
+simulation and the AArch64 compiler for onboard targets. Required SDK helper
+sources must exist; a missing helper fails before invoking the compiler.
+Compiler commands retain the SDK's relative path spelling and working directory.
+All generated outputs reside in PyPTO-owned temporary or artifact directories.
+Build and restoration do not initialize a Worker or execute business logic.
+
+Each compiler or linker invocation has a 900-second timeout. Set
+`PYPTO_COMPILER_TIMEOUT` to a positive, finite number of seconds before creating
+the compiler to override it. This is a limit per invocation, not for the whole
+program build. A timeout raises `RuntimeError` identifying the build stage;
+temporary outputs are cleaned up and failed builds do not publish a cache stamp.
+
+Mutable program output directories use binary-context schema 2. A successful
+transaction records the context plus SHA-256 hashes of reusable binary files.
+The next transaction preserves verified files and discards changed or unrecorded
+files; missing files are rebuilt on demand. Old stamps require one rebuild.
+The stamp is removed before assembly and published again only after success,
+so failed or interrupted transactions cannot authorize partial output.
+
+Persistent GENERATED entries still provide source identity only: promotion
+builds their binaries privately. Inherited mutable binaries are never trusted
+as READY evidence. Complete READY entries use their existing validated inventory
+and restore without compiler invocation or cache writes, including read-only
+restoration. Per-directory and per-key locks retain the existing concurrency
+contract; no second cache store is introduced.
 
 ## Configuration
 
@@ -183,7 +227,9 @@ module-level JIT functions. It validates the complete list before any build.
 Paths are relative to the configuration file. Tensor metadata uses allocation-free
 meta tensors; omit it when annotations fully determine tensor parameters. Dtypes
 are `FP16`, `BF16`, `FP32`, `INT8`, `INT16`, `INT32`, `INT64`, and `BOOL`. Scalars
-are finite JSON numbers or booleans. The usual scalar defaults are honored.
+are finite JSON numbers or booleans; they complete the binding but no longer
+select an artifact, since a scalar parameter is a runtime value. Omit them
+unless the request also names sample tensors, which makes the binding positional.
 
 Serializable `run_config` fields are `platform`, `strategy`, `memory_planner`,
 `distributed_config`, `dump_passes`, `dump_ptoas_passes`, `save_kernels`, and

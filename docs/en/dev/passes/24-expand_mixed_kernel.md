@@ -117,9 +117,9 @@ Ascend910B (a2a3) — cross-core transfer goes through GM → Mat, and Mat only 
 | Vec→Mat | preserve original | — |
 | Mat/Acc→Vec | preserve original | — |
 
-On both backends, the AIV push side (V→C) inserts a `tile.move` before `tpush_to_aic` to convert the source tile into the required fractal layout. The `tile.move` helper (`CreateMove`) propagates `blayout`/`slayout` kwargs when the result type carries a TileView.
+On both backends, the ordinary-data AIV push side (V→C) inserts a `tile.move` before `tpush_to_aic` to convert the source tile into the required fractal layout. The `tile.move` helper (`CreateMove`) propagates `blayout`/`slayout` kwargs when the result type carries a TileView. Ascend950 MX scales use the dedicated row/row carrier described below.
 
-### Hand-written pipes and the MX-scale limitation
+### Hand-written pipes get the same adapter
 
 The rule above describes the boundary-move path, which only sees the pipes this pass
 builds while expanding an InCore function. A pipe authored directly (`pl.reserve_buffer`,
@@ -128,19 +128,18 @@ it. On a backend where `RequiresVtoCFractalAdapt()` holds, such a push would shi
 ND tile into a FIFO the cube reads as fractal, scattering every element of the popped
 tile.
 
-`AdaptManualVtoCPush` closes that gap for the existing non-MX data-tile paths. It runs as
-the pass's final phase over **every** AIV function the pass emits, including pure-vector
-InCore bodies converted to AIV and the AIV half of a mixed body. It preserves the original
-push kwargs — dropping `id` would collapse a multi-pipe program onto a single FIFO — and
-consults `RequiresVtoCFractalAdapt()` only when a supported manual push is encountered.
+`AdaptManualVtoCPush` closes that gap. It runs as the pass's final phase over **every**
+AIV function the pass emits, including pure-vector InCore bodies converted to AIV and the
+AIV half of a mixed body. Ordinary data keeps the fixed cube-side Mat transfer view.
+For MX, the pass resolves the AIV import to its AIC reserve and pairs V2C operations by pipe
+`id` and occurrence order, so each push is planned from its actual consumer `tpop` contract.
+Missing peers, ambiguous initializers, mismatched push/pop counts or splits, and undersized
+slots are rejected instead of guessing a layout.
 
-This phase does not pair a hand-written push with its consumer `tpop`, so it cannot safely
-derive an MX-scale carrier. A hand-written `tile.tpush_to_aic` whose source has FP8E8M0
-dtype is rejected instead of being silently rewritten to NZ. Use the automatic mixed-kernel
-boundary described below, or stage the scale through GM. Compiler-generated MX pushes
-carry a temporary internal marker, arrive
-with their carrier already planned from the boundary destination, and have the marker
-removed by this final phase.
+The rewrite applies to FP8E8M0 MX scales as well as ordinary data tiles, preserves the
+original push kwargs and attrs (including `id`), and is idempotent: a push already staged
+into the boundary view is left unchanged. The backend capability is consulted only after a
+manual V→C push is encountered.
 
 ### GM-mediated cross-lane dependencies
 
@@ -180,13 +179,21 @@ When cross-core directions use different tile sizes, the pass picks `max(all obs
 ### MX scale V2C transport
 
 On Ascend950, a mixed `quant_mx` → `matmul_mx` path transports both results over
-V2C. A matching row/row scale is pushed directly. A col/col B-side scale uses a
-zero-copy `tile.transpose_view` for the physical row/row push, while the AIC
-`tpop` retains the public col/col logical shape and layout. This support applies
-to compiler-generated boundaries only; hand-written MX-scale V2C pipes are
-rejected as described above. The physical ND push also requires the final
-dimension to be fully valid; the pass reports an internal error if that
-invariant is violated.
+V2C. FP8E8M0 fractal-32 scales never use the NZ TINSERT path. A full-valid
+logical row/row scale is pushed directly. A logical col/col scale takes the
+official, zero-copy `tile.transpose_view` after any carrier preparation,
+producing a row/row carrier with the physically transposed shape. If producer
+and consumer logical layouts differ, a real Vec→Vec `tile.move` converts to the
+consumer layout before that carrier step.
+
+The AIC `tpop` keeps the consumer's public logical shape, layout, and
+`valid_shape`. For a partial logical scale, the producer transports the full
+physical box so the ND insert is contiguous and 32-byte aligned. The pass first
+materializes a private Vec carrier, then widens only that carrier with
+`tile.set_validshape`; this keeps slice/reshape views legal and leaves the
+original logical scale metadata unchanged. The consumer still ignores padding
+outside its original logical valid region. The carrier's full byte size must fit
+the paired pipe's `slot_size`.
 
 ### Overriding the slot count (`slot_num`)
 
@@ -319,7 +326,9 @@ Phase 2 — Expand each InCore function F:
       - Ascend950: Left→NZ, Right→ZN, Mat/Vec→preserve
       - Ascend910B: Left→NZ, Right→NZ (Mat only supports NZ), Mat/Vec→preserve
   6. Repair loop-carried state on both bodies
-     - Strip dead iter_args whose carried values are unused on this side
+     - Strip dead iter_args whose carried values are unused on this side —
+       "used" closes over the loop's own yield, so a carry read only to feed
+       another live slot (a multi-entry FIFO rotation) stays alive
      - Pull back missing init-value definitions for surviving iter_args
      - Rewrite dangling yields to identity yields when a branch-local value was stripped
      - Remap dangling tile.store result vars (SSA versions stripped by AIC-side splitting) to the corresponding output parameter
@@ -378,6 +387,14 @@ this pass; no call attributes carry placement. See
 **Nested structure handling**: ForStmt, IfStmt, and WhileStmt containing mixed ops are duplicated into both AIC and AIV bodies with recursively pruned contents.
 
 **Loop-state repair after splitting**: mixed-loop control flow is intentionally preserved during body construction, which can leave one side with extra iter_args, missing init-value definitions, or yields that reference stripped branch-local values. The pass repairs those cases before DCE, then normalizes loop-carried state once more after DCE because dead shared aliases can disappear and make an iter_arg removable only at that stage. A final DCE pass cleans up any init-value chains that become dead after the second strip.
+
+**Which carries count as live**: an iter_arg read only by the loop's own trailing
+yield is still live when the slot it feeds is live — that is exactly the shape of
+a multi-entry FIFO, whose entry `N` is read nowhere but the yield that rotates it
+into entry `N-1`. Liveness therefore closes over the yield instead of being read
+off the body alone, and the strip asserts that no surviving yield value names a
+carry it just dropped. Dropping such a carry would leave a free Var that no later
+pass rejects and PTO codegen reports as "no MLIR mapping for MemRef base ...".
 
 **Group wrapper param-returns**: a newly created Group wrapper
 returns its own parameters when every return position traces to a param

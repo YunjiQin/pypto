@@ -65,6 +65,7 @@ class IRProperty(Enum):
     AccStorePhaseValid = ...
     NoScalarKernelReturn = ...
     AivSplitLoweredValid = ...
+    BufferIR = ...
 
 class IRPropertySet:
     """A set of IR properties backed by a bitset."""
@@ -293,6 +294,7 @@ class PassContext:
         memory_planner: MemoryPlanner = MemoryPlanner.PYPTO,
         enable_pypto_l0c_double_buffer: bool = False,
         runtime: RuntimeKind = RuntimeKind.TENSORMAP_AND_RINGBUFFER,
+        enable_buffer_ir: bool = False,
     ) -> None:
         """Create a PassContext with instruments and pass configuration (incl. memory planner).
 
@@ -305,6 +307,9 @@ class PassContext:
         what lands in ``RUNTIME_CONFIG["runtime"]`` in the generated
         ``kernel_config.py``. Passes that legalize runtime-specific IR read it
         from the context.
+
+        ``enable_buffer_ir`` enables the staged Buffer IR development pipeline.
+        It defaults to false while the migration is incomplete.
         """
         ...
 
@@ -333,6 +338,10 @@ class PassContext:
 
     def get_runtime(self) -> RuntimeKind:
         """Get the target Simpler runtime ABI for this context."""
+        ...
+
+    def get_enable_buffer_ir(self) -> bool:
+        """Whether the staged Buffer IR development pipeline is enabled."""
         ...
 
     def get_enable_pypto_l0c_double_buffer(self) -> bool:
@@ -791,9 +800,9 @@ def legalize_graph_boundary() -> Pass:
     """Make every ``FunctionType.Graph`` function legal to record and replay.
 
     Hoists each boundary scalar a Graph body *derives* out to its call sites.
-    Under ``host_build_graph`` a boundary scalar is tracked by the address of its
-    argument slot, so a value computed inside the region has no slot and would be
-    frozen at its first-call value on every later replay, with no warning.
+    Under ``host_build_graph`` a boundary scalar carries its parameter origin.
+    A value computed inside the region loses that origin and would be frozen at
+    its first-call value on every later replay.
 
     Also rejects, at compile time, the boundary shapes the runtime would decline
     to cache — an oversized or empty tensor boundary, runtime-allocated outputs,

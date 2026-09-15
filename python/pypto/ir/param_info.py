@@ -22,10 +22,13 @@ the metadata out removes the back edge; ``compiled_program`` re-exports these
 names, so nothing else has to know they moved.
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import TypeVar
 
 import torch
 
+from pypto._kernel_abi import KernelABI, KernelParameter
 from pypto.pypto_core import DataType
 from pypto.pypto_core.ir import ParamDirection
 
@@ -84,3 +87,59 @@ class _ParamInfo:
 # Public spelling for code outside ``pypto.ir`` (the replay-script writer, and
 # harnesses that bind arguments themselves).
 ParamInfo = _ParamInfo
+
+
+_Arg = TypeVar("_Arg")
+
+
+def bind_complete_args(
+    args: Sequence[_Arg], param_infos: Sequence[_ParamInfo], *, caller_name: str
+) -> list[_Arg]:
+    """Bind every positional parameter without allocating outputs or converting values.
+
+    Out and InOut slots are mandatory, even when the IR has return values.
+    Tensor aliases and runtime scalar values are preserved. Consumer-specific
+    dtype, shape, storage and ABI validation happens after this shared binding.
+    """
+    if len(args) != len(param_infos):
+        raise TypeError(
+            f"{caller_name} expects {len(param_infos)} arguments including all Out/InOut parameters, "
+            f"got {len(args)}. Parameters: {[p.name for p in param_infos]}"
+        )
+    return list(args)
+
+
+def kernel_abi_from_params(
+    param_infos: Sequence[_ParamInfo], *, platform: str, runtime: str, return_aliases: Sequence[int]
+) -> KernelABI:
+    """Map logical IR parameters to the pinned simpler pools without device work."""
+    return KernelABI(
+        platform,
+        runtime,
+        tuple(
+            KernelParameter(
+                p.name, str(p.dtype), p.direction.name, tuple(p.shape) if p.shape is not None else None
+            )
+            for p in param_infos
+        ),
+        tuple(return_aliases),
+    )
+
+
+def bind_kernel_args(
+    args: Sequence[_Arg], param_infos: Sequence[_ParamInfo], abi: KernelABI
+) -> tuple[list[_Arg], list[_Arg], list[_Arg]]:
+    """Split a complete call into pools and return aliases, preserving borrowed objects.
+
+    Tensor metadata validation and scalar encoding belong to the per-call
+    adapter. This helper neither dereferences tensor storage nor coerces values.
+    """
+    abi.require_compatible(
+        kernel_abi_from_params(
+            param_infos, platform=abi.platform, runtime=abi.runtime, return_aliases=abi.return_aliases
+        )
+    )
+    bound = bind_complete_args(args, param_infos, caller_name="Kernel call")
+    tensors = [arg for arg, param in zip(bound, abi.parameters) if param.shape is not None]
+    scalars = [arg for arg, param in zip(bound, abi.parameters) if param.shape is None]
+    return tensors, scalars, [bound[index] for index in abi.return_aliases]

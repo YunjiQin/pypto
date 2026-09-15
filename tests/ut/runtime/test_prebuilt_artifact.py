@@ -23,6 +23,7 @@ from unittest.mock import Mock, patch
 import pypto.language as pl
 import pytest
 from pypto import CacheConfig, cache_stats, ir, passes
+from pypto._artifact_contract import ArtifactExecutionMode, ExecutionCapabilities
 from pypto._identity import ToolchainIdentity, digest_record
 from pypto.ir.compiled_program import _COMPILED_META_SCHEMA, CompiledProgram
 from pypto.ir.distributed_compiled_program import _META_SCHEMA, DistributedCompiledProgram
@@ -90,6 +91,7 @@ def _chip(root: Path) -> None:
 def _generated(root: Path, kind: BuildKind) -> None:
     meta: dict[str, Any] = dict(
         schema=_COMPILED_META_SCHEMA,
+        supported_execution_modes=["program"],
         params=[],
         num_return_types=0,
         platform="a2a3sim",
@@ -800,6 +802,85 @@ def automatic_jit_case(tmp_path, fake_runtime, monkeypatch):
     return kernel, builds
 
 
+def test_published_artifact_is_restored_for_a_different_scalar_value(tmp_path, fake_runtime, monkeypatch):
+    """A second process reuses the published artifact when only a scalar differs.
+
+    A scalar parameter is a runtime value (issue #2751), so it is absent from
+    both the in-process key and the persisted specialization identity. Clearing
+    the object cache is the same path a new process takes.
+    """
+
+    @pl.jit
+    def kernel(n: pl.Scalar[pl.INT32]):
+        pass
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("PYPTO_PROG_BUILD_DIR", raising=False)
+    monkeypatch.setattr("pypto.jit._persistent.capture_toolchain", lambda *args: _key().environment)
+    builds = []
+
+    def compile_(*args, **kwargs):
+        root = Path(kwargs.get("output_dir", tmp_path / f"private-{len(builds)}"))
+        _generated(root, BuildKind.SINGLE_CHIP)
+        compiled = CompiledProgram.from_dir(root)
+        compiled._program = ir.Program([], "fixture", ir.Span.unknown())
+        builds.append(compiled)
+        return compiled
+
+    monkeypatch.setattr(kernel, "_compile", compile_)
+    config = RunConfig(platform="a2a3sim", cache_config=CacheConfig(enabled=True, root=tmp_path / "cache"))
+    # Runtime UTs install verification instruments, which intentionally bypass caches.
+    with passes.PassContext([]):
+        published = kernel.compile(n=1, config=config)
+        assert published.program is not None
+        kernel._artifact_objects.clear()
+        restored = kernel.compile(n=999, config=config)
+    assert restored is not published
+    assert restored.program is None  # came back from the store, not from a build
+    assert len(builds) == 1
+
+
+def test_constexpr_values_publish_separate_artifacts(tmp_path, fake_runtime, monkeypatch):
+    """Two constants publish two artifacts, and each is restored on its own key.
+
+    A scalar would share one entry (issue #2751); a ``pl.constexpr`` must not,
+    or a second process would restore the artifact built for the other constant.
+    """
+
+    @pl.jit
+    def kernel(BLOCK: pl.constexpr):
+        pass
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("PYPTO_PROG_BUILD_DIR", raising=False)
+    monkeypatch.setattr("pypto.jit._persistent.capture_toolchain", lambda *args: _key().environment)
+    builds = []
+
+    def compile_(*args, **kwargs):
+        root = Path(kwargs.get("output_dir", tmp_path / f"private-{len(builds)}"))
+        _generated(root, BuildKind.SINGLE_CHIP)
+        compiled = CompiledProgram.from_dir(root)
+        compiled._program = ir.Program([], "fixture", ir.Span.unknown())
+        builds.append(compiled)
+        return compiled
+
+    monkeypatch.setattr(kernel, "_compile", compile_)
+    config = RunConfig(platform="a2a3sim", cache_config=CacheConfig(enabled=True, root=tmp_path / "cache"))
+    # Runtime UTs install verification instruments, which intentionally bypass caches.
+    with passes.PassContext([]):
+        small = kernel.compile(BLOCK=16, config=config)
+        large = kernel.compile(BLOCK=32, config=config)
+        assert small is not large
+        assert len(builds) == 2
+        # Clearing the object cache is the path a new process takes.
+        kernel._artifact_objects.clear()
+        restored_small = kernel.compile(BLOCK=16, config=config)
+        restored_large = kernel.compile(BLOCK=32, config=config)
+    assert restored_small is not restored_large
+    assert restored_small.program is None and restored_large.program is None
+    assert len(builds) == 2, "restoration must not rebuild either constant"
+
+
 def test_automatic_jit_refreshes_sources_before_object_hit(tmp_path, automatic_jit_case):
     kernel, builds = automatic_jit_case
     source = tmp_path / "extra.py"
@@ -1046,6 +1127,52 @@ def test_unresolved_linker_dependency_compiles_privately(tmp_path, automatic_jit
             assert "requires search-path resolution" in cache_stats().last_bypass_reason
     assert len(builds) == 2 and not root.exists()
     assert cache_stats().bypasses - before.bypasses == 2
+
+
+@pytest.mark.parametrize("kind", list(BuildKind))
+def test_promotion_preserves_execution_capabilities(tmp_path, fake_runtime, kind):
+    store = ArtifactStore(tmp_path / "cache", private_root=tmp_path / "private")
+    generated = store.get_or_build(_key(), _spec(kind), lambda root: _generated(root, kind)).handle
+    assert generated is not None
+    compiled = restore_artifact(store, generated, tmp_path / "run")
+    assert compiled.execution_capabilities == generated.spec.execution_capabilities
+    compiled._artifact_runtime.load()
+    ready = compiled._artifact_runtime.handle
+    assert ready.spec.state is ArtifactState.BINARY_READY
+    assert ready.spec.execution_capabilities == generated.spec.execution_capabilities
+    restored = restore_artifact(store, ready, tmp_path / "second-run")
+    assert restored.execution_capabilities == compiled.execution_capabilities
+
+
+def test_unverified_shared_binary_capabilities_are_rejected():
+    with pytest.raises(ValueError, match="no verified ABI"):
+        ArtifactSpec(
+            ArtifactState.GENERATED,
+            BuildKind.SINGLE_CHIP,
+            _spec().required_files,
+            ExecutionCapabilities((ArtifactExecutionMode.PROGRAM, ArtifactExecutionMode.KERNEL)),
+        )
+
+
+def test_generated_hit_checks_capabilities_of_ready_payload(tmp_path, fake_runtime):
+    store, generated = _publish(tmp_path, BuildKind.SINGLE_CHIP)
+    first = ArtifactRuntime(store, generated, "a2a3sim", tmp_path / "first-run")
+    first.load()
+    ready = first.handle
+    meta_path = ready.directory / "compiled_meta.json"
+    meta = json.loads(meta_path.read_text())
+    meta["supported_execution_modes"] = ["kernel"]
+    meta_path.write_text(json.dumps(meta))
+    # A producer can write a self-consistent inventory with an incompatible
+    # consumer contract. Both must be checked when promoting a generated hit.
+    marker = _artifact_manifest.make_manifest(ready.directory, ready.key, ready.spec)
+    (ready.directory / _artifact_manifest.MANIFEST_NAME).write_bytes(
+        _artifact_manifest.encode_manifest(marker)
+    )
+    with patch("pypto.runtime._artifact_runtime.load_prebuilt") as load:
+        with pytest.raises(ValueError, match="requires 'program'"):
+            ArtifactRuntime(store, generated, "a2a3sim", tmp_path / "next-run").load()
+    load.assert_not_called()
 
 
 if __name__ == "__main__":

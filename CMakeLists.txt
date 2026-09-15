@@ -317,6 +317,7 @@ set(PYPTO_SOURCES
     src/ir/verifier/verify_runtime_scopes_materialized.cpp
     src/ir/verifier/verify_call_directions.cpp
     src/ir/verifier/verify_tile_type_coherence.cpp
+    src/ir/verifier/verify_buffer_ir.cpp
     src/ir/verifier/verify_assign_type_symmetry.cpp
     src/ir/verifier/verify_graph_functions.cpp
     src/ir/verifier/verify_orchestration_references.cpp
@@ -341,6 +342,7 @@ set(PYPTO_SOURCES
     src/codegen/orchestration/orchestration_codegen.cpp
     src/codegen/orchestration_op_registry.cpp
     src/codegen/pto/pto_codegen.cpp
+    src/codegen/pto/pto_buffer_codegen.cpp
     src/codegen/pto/pto_control_flow_codegen.cpp
     src/codegen/pto/pto_scalar_expr_codegen.cpp
     src/codegen/pto/pto_type_utils.cpp
