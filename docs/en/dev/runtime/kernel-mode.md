@@ -497,6 +497,71 @@ or queue-blocking entry is shipped in the production adapter.
 
 ## Verification
 
+### Integration-branch CI
+
+Pull requests targeting `feat/kernel-mode-integration-test` run the
+`Kernel Mode CI` workflow. Its required stages are pre-commit (without
+clang-tidy), the full CPU unit suite with the native adapter disabled, pinned
+toolchain resolution, and a native adapter build plus targeted device tests.
+The CPU suite includes the optional-import guard from PR #2785 (09A).
+
+The device job uses the verified `[self-hosted, linux, ARM64, npu-xp]` pool,
+the existing `setup-ci-job` bundle environment, and `task-submit` with the
+runner's `DEVICE_ID`. It installs Torch 2.6.0 and torch_npu 2.6.0.post2 in its
+isolated environment, requires C++11 ABI, and builds both the adapter and the
+test-only queue gate from the checked-out source. The torch_npu 2.6.0.post2
+CPython 3.10 / ARM64 wheel is installed from Ascend's official
+`v7.1.0.2-pytorch2.6.0` release with a pinned SHA256; that version is not on PyPI.
+The job installs the pinned dependencies in `.github/requirements/kernel-mode.txt`:
+CANN 9 TBE's base dependencies and PyYAML, an undeclared torch_npu wheel dependency.
+It checks torch_npu and TBE imports before building the adapter; sourcing CANN's
+environment alone does not install its Python dependencies into the job venv.
+The native build uses `build/kernel-native`, separate from the shared setup's
+scikit-build wheel cache in `build/`. It verifies that the source-tree core,
+adapter, and test gate can import before allocating a device.
+Simpler and pto-isa come from
+the submodule pin; ptoas comes from `toolchain/versions.env`. CANN comes from the
+runner's `CANN_ROOT` and must satisfy the adapter's documented prerequisites.
+No device work runs outside a task allocation.
+
+Two serial allocations run the eager/stream/lifecycle/program regression cases
+and the warmed capture/replay cases. Both JIT and registered entries, taskQueue
+settings, cold-call rejection, and the `aot_eager` graph path are included.
+The delayed host-queue test with taskQueue disabled is explicitly deselected
+because it has no blocked callback to test; every selected device case must
+pass without skips. Pytest runs serially on the allocated card; its cases
+create isolated processes as needed.
+
+Artifacts retain JUnit reports, the actual chip name/device id, source and SDK
+revisions, Python/Torch/torch_npu/nanobind versions, `npu-smi` output, and CANN
+version metadata when provided by the installation. Missing, empty, malformed,
+failed or skipped device reports fail the report check. The final
+`Kernel Mode required results` job runs even after upstream failures and
+requires every stage to succeed; skipped or cancelled jobs cannot satisfy it.
+Configure that check in the integration branch's merge rules if it should be
+enforced by GitHub; defining a workflow alone does not change repository rules.
+
+This is CI wiring for the current A2/A3-family TRB implementation, not full
+platform acceptance. Each artifact records the actual chip tested; a pass on
+one chip does not establish separate A2 and A3 results. A5, HBG and the complete
+platform matrix remain pending in 09C. Capture still requires prior warmup.
+
+The shared `run_without_optional_runtime` unit-test fixture runs a fresh Python
+process with `torch_npu`, `simpler`, `simpler_setup`, `_task_interface` and
+`pypto._torch_npu` blocked by an import finder. It detects both import statements and dynamic
+`importlib.import_module()` calls, including attempts whose `ImportError` is
+caught by the caller. Explicit enforcement checks remain active under
+`PYTHONOPTIMIZE=1` and `2`; negative controls cover both settings and normal
+execution. PyTorch backend autoload is disabled in that subprocess
+to isolate PyPTO's behavior from installed framework plugins. The guard's own
+negative tests ensure an attempted import cannot silently pass on a CPU runner
+where the dependency is already absent.
+
+These checks cover package import/reload, program configuration and registered
+Fake/Meta dispatch. They run in the existing full unit-test CI job without
+optional runtime dependencies or a new device job. They do not validate native
+adapter builds or device execution; those require the integration branch.
+
 `tests/ut/torch/test_interop.py` uses real CPU storage with an emulated NPU device
 label and stubs only framework format/context queries. It tests view offsets,
 aliases, independent scalar/stream snapshots, ownership, invalid inputs and
