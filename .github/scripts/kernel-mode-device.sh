@@ -13,25 +13,7 @@ source .claude/skills/testing/load-env.sh
 export PYTHONPATH="$PWD/python:$PWD/build/torch_npu_tests${PYTHONPATH:+:$PYTHONPATH}"
 export TORCH_DEVICE_BACKEND_AUTOLOAD=0
 : "${TASK_DEVICE:?Run through task-submit to reserve a device}"
-case "${1:-}" in
-  eager)
-    cases=(
-      tests/st/runtime/kernel/test_jit_eager.py
-      tests/st/runtime/kernel/test_kernel_context.py
-      tests/st/runtime/kernel/test_kernel_shutdown.py
-      tests/st/runtime/kernel/test_torch_interop.py
-      tests/st/runtime/kernel/test_torch_launch.py
-      tests/st/runtime/kernel/test_torch_ops.py
-    )
-    selection=(-k 'not capture'
-      '--deselect=tests/st/runtime/kernel/test_torch_launch.py::test_torch_kernel_launch[delayed-0]')
-    ;;
-  capture)
-    cases=(tests/st/runtime/kernel/test_capture.py tests/st/runtime/kernel/test_torch_ops.py)
-    selection=(-k capture)
-    ;;
-  *) echo "Expected eager or capture suite, got '${1:-}'" >&2; exit 2 ;;
-esac
+source .github/scripts/kernel-mode-cases.sh "${1:-}"
 mkdir -p test-results/kernel-mode
 # A reused self-hosted checkout must never reuse an earlier JUnit result.
 rm -f "test-results/kernel-mode/$1.xml"
@@ -51,9 +33,11 @@ from simpler.task_interface import ChipWorker
 
 from pypto._kernel_abi import SIMPLER_KERNEL_REVISION
 from pypto.torch.launch import _load_native
+from pypto.torch.shutdown import require_supported_framework
 
-if torch.__version__.split("+")[0] != "2.6.0" or torch_npu.__version__ != "2.6.0.post2":
-    raise RuntimeError(f"Expected Torch 2.6.0 / torch_npu 2.6.0.post2, got {torch.__version__}/{torch_npu.__version__}")
+require_supported_framework(torch_npu)
+if torch.__version__.split("+", 1)[0] != "2.6.0":
+    raise RuntimeError(f"Expected Torch 2.6.0, got {torch.__version__}")
 if not torch._C._GLIBCXX_USE_CXX11_ABI:
     raise RuntimeError("Kernel adapter requires the C++11 ABI")
 if not hasattr(ChipWorker, "kernel_init") or not hasattr(ChipWorker, "kernel_prepare_callable"):
@@ -87,5 +71,5 @@ if [ -f "${ASCEND_HOME_PATH:-}/version.cfg" ]; then
 fi
 # These tests create isolated child processes and own queue-mode parametrization.
 # Do not use xdist: one allocated device runs one test at a time.
-python -m pytest "${cases[@]}" "${selection[@]}" --platform=a2a3 \
-  --device="$TASK_DEVICE" -v --junitxml="test-results/kernel-mode/$1.xml" 2>&1 | tee "test-results/kernel-mode/$1-pytest.log"
+python -m pytest "${cases[@]}" --platform=a2a3 \
+  --device="$TASK_DEVICE" -v -o junit_family=legacy --junitxml="test-results/kernel-mode/$1.xml" 2>&1 | tee "test-results/kernel-mode/$1-pytest.log"

@@ -102,6 +102,54 @@ persistent-cache policy uses `pypto.configure_cache`. A
 An active `PassContext` must name the bound runtime; without one, eager
 compilation uses the runtime from `init`.
 
+## Callable identity and hot-path measurements
+
+Each loaded `KernelArtifact` memoizes the digest of the complete Simpler callable
+and PyPTO ABI. Concurrent eager and capture lookups share this identity; a failed
+descriptor build is not cached. Capture uses `loaded_identity()`, which never
+loads or compiles an artifact. Process registrations still belong to their Worker
+generation; only immutable binary identity is cached.
+
+`tests/st/runtime/kernel/test_hot_path.py` defaults to 64 host-return samples per
+entry/variant for direct JIT and registered `torch.ops`, with taskQueue off and
+on. It writes p50/p99 in microseconds, validation/cache-key/descriptor counts,
+and one-versus-two-producer throughput into JUnit properties. An uncached control
+restores per-call descriptor hashing on the same build to isolate that cost.
+Warmup and batch drains are outside the latency samples. Producer throughput uses
+16-call batches with a serialized handoff and drain, included in elapsed time;
+it does not measure unrestricted concurrent streams. Timings are evidence, not
+CI pass thresholds. The small default checks counters and correctness; its tail
+latencies are not a performance acceptance result. For the full measurement,
+pass `--kernel-perf-samples=1024` to pytest. Keeping the same 16-call batch size
+preserves the backlog counter contract while reducing repeated work in PR CI.
+
+The pinned Simpler runtime rejects changing caller streams while the previous
+caller's serial tail is incomplete (`PTO_RUNTIME_ERR_PREPARED_INCOMPATIBLE`,
+`-1002`). Applications must establish completion before switching caller streams.
+The adapter's host launch lock alone does not establish that device completion.
+This also limits the two-producer experiment; removing a host lock cannot make
+unrestricted multi-stream submission supported.
+
+With taskQueue enabled, a deliberately blocked host callback holds exactly
+0/16/256 initial tickets on another stream. Each measured batch adds 16 tickets,
+then releases the gate and drains. A queued test-only stream fence completes
+the background stream before the foreground launches reach Simpler; it executes
+after gate release, outside host latency samples. The test asserts `16 * pending + 120` calls to
+`done()` per batch, exposing the existing full-list scan. This blocked-queue
+experiment cannot run with taskQueue disabled, where the gate executes inline;
+ordinary latency and producer measurements cover both modes. Four tickets from
+a destroyed graph currently cause four device synchronizations on the next eager
+submission; a separate counter assertion records that behavior. Queue reclamation,
+graph synchronization batching and lock removal remain separate changes with
+lifetime, asynchronous-failure and Simpler concurrency requirements.
+
+Build with `PYPTO_BUILD_TORCH_NPU_TESTS=ON` for these cases. That option adds private
+`_test_counters()` and `_test_reset_counters()` hooks to the optional adapter;
+normal builds omit the hooks and counter increments. Counts cover adapter
+`Done()` calls and device-synchronization attempts, not all framework/SDK calls.
+Both control and cached measurements use the same instrumented build. The kernel
+eager device CI job runs these cases and uploads their JUnit evidence.
+
 ## Call metadata and ownership
 
 [`CallSignature`](../../../../python/pypto/torch/interop.py) copies the shared
@@ -571,17 +619,36 @@ or queue-blocking entry is shipped in the production adapter.
 
 Pull requests targeting `feat/kernel-mode-integration-test` run the
 `Kernel Mode CI` workflow. Its required stages are pre-commit (without
-clang-tidy), the full CPU unit suite with the native adapter disabled, pinned
+clang-tidy), focused kernel CPU regressions with the native adapter disabled, pinned
 toolchain resolution, and a native adapter build plus targeted device tests.
-The CPU suite includes the optional-import guard from PR #2785 (09A).
+The CPU suite includes JIT routing, ABI/compiler/artifact contracts, Worker and
+shutdown state, torch interop/registration/launch/capture, JUnit evidence checks,
+and the optional-import guard from PR #2785 (09A). The explicit selections live
+in `.github/scripts/kernel-mode-cases.sh`; this PR workflow does not run the
+repository-wide unit or device matrices. Those tests remain available to run
+manually. CPU tests and pre-commit start independently; device jobs depend only
+on toolchain resolution. The final result still requires every job to pass.
 
-Each device job uses the verified `[self-hosted, linux, ARM64, npu-xp]` pool,
+Each device job requires one NPU and uses the shared `[self-hosted, linux, npu]` pool,
 the existing `setup-ci-job` bundle environment, and `task-submit` with the
 runner's `DEVICE_ID`. It installs Torch 2.6.0 and torch_npu 2.6.0.post2 in its
 isolated environment, requires C++11 ABI, and builds both the adapter and the
-test-only queue gate from the checked-out source. The torch_npu 2.6.0.post2
-CPython 3.10 / ARM64 wheel is installed from Ascend's official
-`v7.1.0.2-pytorch2.6.0` release with a pinned SHA256; that version is not on PyPI.
+test-only queue gate from the checked-out source. The installer selects packages
+for the runner architecture. ARM64 uses the Torch CPU index and the
+SHA256-pinned torch_npu CPython 3.10 wheel. x86_64 uses the Torch
+`cpu-cxx11-abi` index and the CPython 3.10 wheel from Ascend's C++11 ABI zip.
+Both torch_npu packages come from the official `v7.1.0.2-pytorch2.6.0` release;
+that version is not on PyPI. Release downloads allow up to ten minutes per
+transfer, with a 15-second connection timeout and a one-minute low-speed cutoff
+below 1 KiB/s, so slow downloads can finish without letting stalled transfers hang.
+Up to four attempts resume interrupted transfers from the bytes already received;
+if the server rejects resuming, the next attempt starts from zero. Only a completed
+download is passed to the installer.
+The job checks the Torch ABI before building.
+Device preflight reuses the runtime framework-version check, accepting the
+C++11 ABI build suffix while still requiring release 2.6.0.post2. The full
+task log is uploaded even if preflight fails before producing JUnit evidence;
+a missing or failed JUnit report still fails the job.
 The job installs the pinned dependencies in `.github/requirements/kernel-mode.txt`:
 CANN 9 TBE's base dependencies and PyYAML, an undeclared torch_npu wheel dependency.
 It checks torch_npu and TBE imports before building the adapter; sourcing CANN's
@@ -601,12 +668,18 @@ Each job owns its checkout, environment, build, device allocation, report check,
 and task cleanup. `fail-fast: false` lets the other job finish after one fails.
 Their artifacts are `kernel-device-eager-results` and
 `kernel-device-capture-results`; each contains only that suite's evidence.
-Both JIT and registered entries, taskQueue settings, cold-call rejection, and the
-`aot_eager` graph path are included.
-The delayed host-queue test with taskQueue disabled is explicitly deselected
-because it has no blocked callback to test; every selected device case must
-pass without skips. Pytest runs serially on the allocated card; its cases
-create isolated processes as needed.
+The PR selection contains 10 eager cases and 6 capture cases:
+
+- Eager: direct JIT in both queue modes, explicit program regression, registered
+  `aot_eager`, submission failure in both queue modes, a delayed host callback,
+  normal process shutdown, and the two small hot-path counter runs.
+- Capture: cold-call rejection, queue-off direct JIT replay, registered storage
+  ownership and shutdown, a mixed-entry multi-operator graph, and `aot_eager`
+  capture. This samples key contracts without their full Cartesian matrix.
+
+Every selected device case must pass without skips. Explicit pytest node IDs
+make missing or renamed cases fail collection. Pytest runs serially on the
+allocated card; its cases create isolated processes as needed.
 
 Artifacts retain JUnit reports, the actual chip name/device id, source and SDK
 revisions, Python/Torch/torch_npu/nanobind versions, `npu-smi` output, and CANN
@@ -635,7 +708,7 @@ negative tests ensure an attempted import cannot silently pass on a CPU runner
 where the dependency is already absent.
 
 These checks cover package import/reload, program configuration and registered
-Fake/Meta dispatch. They run in the existing full unit-test CI job without
+Fake/Meta dispatch. They run in the focused kernel unit-test CI job without
 optional runtime dependencies or a new device job. They do not validate native
 adapter builds or device execution; those require the integration branch.
 
