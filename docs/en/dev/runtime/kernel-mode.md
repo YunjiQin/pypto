@@ -41,17 +41,6 @@ verified with torch_npu 2.6.0.post2 as described below; other framework versions
 are rejected before native kernel initialization until their teardown contract
 is validated. This remains integration-branch functionality.
 
-HBG integration is prepared through `pypto.torch.init(runtime="host_build_graph")`.
-It uses the same process Worker and selects HBG for JIT compilation; registering
-`torch.ops` does not fix a runtime before init. Repeating init with another
-runtime is a configuration conflict. This path is **not runnable with the current
-Simpler pin**: it depends on [Simpler #2289](https://github.com/hw-native-sys/simpler/pull/2289).
-Merge that dependency and update the pin/ABI revision before enabling HBG in CI
-or claiming device support. The focused `test_host_build_graph` cases in
-`tests/st/runtime/kernel/test_torch_ops.py` cover eager calls, registered calls,
-`torch.compile`, Worker reuse and warmed capture/replay with taskQueue off/on;
-their device validation is pending. Warmup remains required by the PyPTO API.
-
 Host/simulator and distributed execution use explicit program compilation:
 
 ```python
@@ -150,17 +139,11 @@ python -m simpler_setup.tools.swimlane_converter \
 Open the merged file in Perfetto. Dependency collection adds overhead; for timing
 measurements, collect the same operator's graph separately with `enable_dep_gen`
 and pass its file to the converter using `--deps-json`. Use separate processes
-when changing init settings. A window can include multiple launches: the converter
-uses run boundaries to separate repeated task IDs, preserves launch spacing, and
-adds a `Kernel Launches` track with `launch_epoch` in event details. A launch bar
-ends at its last observed record, not a measured completion timestamp. The supplied
-dependency topology and name mapping apply to every launch; use separate windows
-for workloads with different mappings. Standalone scheduler overhead analysis and
-the dependency viewer's timing sidecar still require single-launch captures.
-The converter emits integer event and flow-binding IDs across launch and rank
-namespaces, so Perfetto can import dependency arrows without caller-side ID rewriting.
-This integration supports A2/A3 TMR, including warmed graph replay; begin/end
-themselves cannot run inside capture.
+when changing init settings. A window can include multiple launches, but the
+converter requires unique `(core_id, reg_task_id)` pairs across the window and
+can reject IDs reused across launches. Use one PyPTO launch per window for trace
+conversion. This integration supports A2/A3 TMR, including warmed graph replay;
+begin/end themselves cannot run inside capture.
 
 ## Callable identity and hot-path measurements
 
@@ -415,7 +398,7 @@ context resources currently use Simpler defaults. An incompatible configuration
 is rejected instead of opening another Worker.
 
 The integration SDK is pinned to
-`17ea300256e2a6db5af397ce619a7d480b595d80`. Its supported Python surface is
+`46b92250f2f5fa6e7166085f91e3fc7b7e74ca46`. Its supported Python surface is
 `simpler.task_interface.ChipWorker.kernel_init`, `kernel_prepare_callable`,
 `kernel_begin_dfx`, `kernel_end_dfx` and `finalize`.
 PyPTO's private adapter uses these existing methods. Init and prepare take no

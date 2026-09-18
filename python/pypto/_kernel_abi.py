@@ -21,7 +21,7 @@ from typing import Any
 
 # This is a PyPTO descriptor revision, not a version exported by simpler.
 KERNEL_DESCRIPTOR_SCHEMA = 1
-SIMPLER_KERNEL_REVISION = "17ea300256e2a6db5af397ce619a7d480b595d80"
+SIMPLER_KERNEL_REVISION = "46b92250f2f5fa6e7166085f91e3fc7b7e74ca46"
 TENSOR_DTYPE_TAGS = {
     "fp32": 0,
     "fp16": 1,
@@ -57,10 +57,9 @@ TENSOR_DIRECTION_TAGS = {"In": 1, "Out": 2, "InOut": 3}
 MAX_KERNEL_TENSORS = 256
 MAX_KERNEL_SCALARS = 128
 MAX_KERNEL_RANK = 5
-# Targets accepted by the framework frontend. Runtime initialization still
-# checks native capability; HBG requires its Simpler integration.
-# Binary descriptors may name other targets.
-EAGER_KERNEL_TARGETS = frozenset({("a2a3", "tensormap_and_ringbuffer"), ("a2a3", "host_build_graph")})
+# (platform, runtime) pairs whose native launch is validated for framework
+# eager and graph calls. Binary descriptors may name other targets.
+EAGER_KERNEL_TARGETS = frozenset({("a2a3", "tensormap_and_ringbuffer")})
 
 
 @dataclass(frozen=True)
