@@ -53,7 +53,8 @@ JITFunction.__call__ flow
 6. Build CacheKey including referenced constants (dynamic dims → None in shape tuple).
 7. Require the target bound by pypto.torch.init; validate complete NPU arguments and
    capture the current scalar values and stream.
-8. Resolve a kernel artifact, compiling on a cache miss.
+8. During capture, find the Worker-owned prepared specialization; otherwise resolve
+   a kernel artifact, compiling on a cache miss or diagnostic bypass.
 9. Prepare once on the initialized process Worker, enqueue and return output aliases.
 """
 
@@ -70,8 +71,9 @@ import tempfile
 import textwrap
 import threading
 import warnings
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Hashable, Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 from pypto._cache_config import capture_cache_config, record_stats, time_stage
@@ -2351,8 +2353,9 @@ def _resolve_compile_request(run_config: Any) -> tuple[dict[str, Any], bool]:
 
     The compile mapping of RunConfig or CompileOptions is the source for both
     codegen and cache keys.
-    Diagnostics are requests to run the compiler, so decide bypass before any
-    cache lookup (including source-key construction). With persistence disabled,
+    Diagnostics request fresh compilation outside capture. Program calls bypass
+    even source-key construction; kernel capture can reuse a prepared registration
+    independently of this compilation-cache policy. With persistence disabled,
     tool discovery remains on the compile path; persistent hits additionally
     require a verified installation identity.
     """
@@ -2379,7 +2382,6 @@ def _resolve_compile_request(run_config: Any) -> tuple[dict[str, Any], bool]:
         or kwargs["profiling"]
         or get_active_profiler() is not None
         or kwargs.get("output_dir") is not None
-        or bool(os.environ.get("PYPTO_PROG_BUILD_DIR"))
         or os.environ.get("PYPTO_EMIT_DEBUG_RUNNER") is not None
         or os.environ.get("PYPTO_REBUILD_FROM_PTO") is not None
         or kwargs.get("verification_level") is not None
@@ -2513,7 +2515,7 @@ class JITFunction:
         self._external_dual_aiv_dispatch = external_dual_aiv_dispatch
         self._external_include_dirs = external_include_dirs
         self._dep_graph_state: _CachedDepGraph | None = None
-        self._cache: dict[CacheKey | tuple[CacheKey, KernelABI], Any] = {}
+        self._cache: dict[Hashable, Any] = {}
         self._artifact_objects: dict[Any, Any] = {}
         self._kernel_contracts: dict[CacheKey, tuple[Any, KernelABI]] = {}
         self._cache_lock = threading.RLock()
@@ -3142,7 +3144,7 @@ class JITFunction:
         allow_signature_mode: bool = False,
         *,
         _kernel: bool = False,
-        _preflight: Callable[[KernelABI, list[Any]], bool] | None = None,
+        _preflight: Callable[[KernelABI, list[Any], Hashable], bool] | None = None,
         _kernel_config: KernelConfig | None = None,
     ) -> tuple[Any, list[Any], Any | None]:
         """Look up or build a specialized program or internal kernel artifact.
@@ -3164,6 +3166,8 @@ class JITFunction:
         )
 
         compile_kwargs, bypass_cache = _resolve_compile_request(run_config)
+        build_root = os.environ.get("PYPTO_PROG_BUILD_DIR")
+        output_root = Path(build_root).resolve() if build_root else None
         runtime = _resolve_runtime()
         if _kernel_config is not None:
             # Eager calls compile for the target bound by pypto.torch.init;
@@ -3207,6 +3211,19 @@ class JITFunction:
                 raise RuntimeError("Kernel capture requires warmup outside capture for this specialization")
             record_stats(generation_builds=1)
             with time_stage("build_ns"):
+                if (
+                    output_root is not None
+                    and compile_kwargs.get("output_dir") is None
+                    and "output_dir" not in overrides
+                ):
+                    private_root = output_root
+                    if cache_config.enabled and cache_config.root in (output_root, *output_root.parents):
+                        from ._persistent import _fallback_private_root  # noqa: PLC0415
+
+                        assert cache_config.root is not None
+                        private_root = _fallback_private_root(cache_config.root, os.getpid())
+                    private_root.mkdir(parents=True, exist_ok=True)
+                    overrides["output_dir"] = tempfile.mkdtemp(prefix=f"{self.__name__}_", dir=private_root)
                 if kernel_abi is not None:
                     assert kernel_program is not None
                     from pypto.ir.compile import _compile_impl  # noqa: PLC0415
@@ -3225,12 +3242,8 @@ class JITFunction:
                     **(compile_kwargs | overrides),
                 )
 
-        if bypass_cache:
+        if bypass_cache and not _kernel:
             record_stats(forced_rebuilds=1)
-            if _kernel:
-                kernel_program, kernel_abi = resolve_kernel_contract()
-                if _preflight is not None:
-                    capturing = _preflight(kernel_abi, ordered_args)
             return build(), ordered_args, run_config
 
         # Resolved before the key rather than during ``build()``: a dep's
@@ -3260,14 +3273,35 @@ class JITFunction:
             runtime=runtime,
         )
 
+        # A prepared callable belongs to the Worker, not to the compiler cache.
+        # Include operator identity and scalar ABI types, never runtime values.
+        kernel_key = (self, key, tuple(sorted(specialization.scalar_dtypes.items())))
+        preflight_done = False
+        if _kernel_config is not None and _preflight is not None:
+            from pypto.runtime.kernel.context import get_process_kernel_state  # noqa: PLC0415
+
+            prepared = get_process_kernel_state().find_specialization(kernel_key, _kernel_config)
+            if prepared is not None:
+                capturing = _preflight(prepared.artifact.kernel_abi, ordered_args, kernel_key)
+                preflight_done = True
+                if capturing:
+                    return prepared.artifact, ordered_args, run_config
+
+        if bypass_cache:
+            record_stats(forced_rebuilds=1)
+            kernel_program, kernel_abi = resolve_kernel_contract()
+            if _preflight is not None and not preflight_done:
+                capturing = _preflight(kernel_abi, ordered_args, kernel_key)
+            return build(), ordered_args, run_config
+
         with self._cache_lock:
             if _kernel:
                 if key not in self._kernel_contracts:
                     self._kernel_contracts[key] = resolve_kernel_contract()
                 kernel_program, kernel_abi = self._kernel_contracts[key]
-                if _preflight is not None:
-                    capturing = _preflight(kernel_abi, ordered_args)
-            memory_key = key if kernel_abi is None else (key, kernel_abi)
+                if _preflight is not None and not preflight_done:
+                    capturing = _preflight(kernel_abi, ordered_args, kernel_key)
+            memory_key = (key, kernel_abi, output_root)
             if cache_config.enabled:
                 from ._persistent import resolve_persistent  # noqa: PLC0415
 
@@ -3279,7 +3313,7 @@ class JITFunction:
                     self._persistent_source_digest,
                     platform=compile_kwargs["platform"],
                     runtime_name=runtime_kind_to_name(runtime),
-                    distributed=self._func_type == "host",
+                    output_root=output_root,
                     **({} if kernel_abi is None else {"kernel_abi": kernel_abi, "require_cached": capturing}),
                 )
             elif memory_key in self._cache:
@@ -3364,9 +3398,11 @@ class JITFunction:
         # The bound target cannot change once initialized; read it once per call.
         target = _eager_kernel_config(kwargs.get("config"))
         frame = None
+        specialization_key: Hashable | None = None
 
-        def preflight(abi: KernelABI, arguments: list[Any]) -> bool:
-            nonlocal frame
+        def preflight(abi: KernelABI, arguments: list[Any], key: Hashable) -> bool:
+            nonlocal frame, specialization_key
+            specialization_key = key
             frame = describe_eager_call(abi, arguments, target)
             return bool(frame.capture_id)
 
@@ -3374,7 +3410,7 @@ class JITFunction:
             args, kwargs, _kernel=True, _preflight=preflight, _kernel_config=target
         )
         assert frame is not None
-        return invoke(artifact, frame, target)
+        return invoke(artifact, frame, target, specialization=specialization_key)
 
     def compile(self, *args: Any, **kwargs: Any) -> Any:
         """Specialize + compile for the shape/dtype combination implied by *args*,
