@@ -114,6 +114,14 @@ def _run(device: int, directory: str, mode: str, diagnostics: str) -> None:
                     timeout=60,
                 )
                 trace = json.loads(merged.read_text())
+                # Prefixed strings such as "launch0:1" are rejected by Perfetto.
+                # Check the converter output directly, without caller-side repair.
+                assert all(
+                    isinstance(event[field], int)
+                    for event in trace["traceEvents"]
+                    for field in ("id", "bind_id")
+                    if field in event
+                )
                 launch_events = [
                     event for event in trace["traceEvents"] if event.get("cat") == "kernel_launch"
                 ]

@@ -146,6 +146,8 @@ ends at its last observed record, not a measured completion timestamp. The suppl
 dependency topology and name mapping apply to every launch; use separate windows
 for workloads with different mappings. Standalone scheduler overhead analysis and
 the dependency viewer's timing sidecar still require single-launch captures.
+The converter emits integer event and flow-binding IDs across launch and rank
+namespaces, so Perfetto can import dependency arrows without caller-side ID rewriting.
 This integration supports A2/A3 TMR, including warmed graph replay; begin/end
 themselves cannot run inside capture.
 
@@ -402,7 +404,7 @@ context resources currently use Simpler defaults. An incompatible configuration
 is rejected instead of opening another Worker.
 
 The integration SDK is pinned to
-`6cde59295057d99b846319366141a27f101afc56`. Its supported Python surface is
+`17ea300256e2a6db5af397ce619a7d480b595d80`. Its supported Python surface is
 `simpler.task_interface.ChipWorker.kernel_init`, `kernel_prepare_callable`,
 `kernel_begin_dfx`, `kernel_end_dfx` and `finalize`.
 PyPTO's private adapter uses these existing methods. Init and prepare take no
