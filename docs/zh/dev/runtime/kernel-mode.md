@@ -29,15 +29,6 @@ A5、HBG 执行仍属后续工作；直接 JIT 和注册后的 torch.ops 均支�
 torch_npu 2.6.0.post2 的退出契约接入；其他框架版本在完成退出协议验证前拒绝 native kernel
 初始化。此功能仍限于集成分支。
 
-HBG 接入已准备为 `pypto.torch.init(runtime="host_build_graph")`，复用同一个进程 Worker，
-并让 JIT 按 HBG 编译；注册 `torch.ops` 不会在 init 前绑定 runtime。再次 init 选择不同
-runtime 会报配置冲突。**当前 Simpler pin 仍无法运行此路径**：需要先合入
-[Simpler #2289](https://github.com/hw-native-sys/simpler/pull/2289)，更新 pin 与 ABI revision，
-再将 HBG 加入 CI 并确认设备支持。`tests/st/runtime/kernel/test_torch_ops.py` 的
-`test_host_build_graph` 用例覆盖 eager、注册调用、`torch.compile`、Worker 复用以及
-warmup 后的 capture/replay，并分别开启/关闭 taskQueue；上板验证仍待完成。
-PyPTO API 仍要求 capture 前 warmup。
-
 Host/模拟器和分布式执行使用显式 program 编译：
 
 ```python
@@ -125,8 +116,6 @@ python -m simpler_setup.tools.swimlane_converter \
 `launch_epoch`。调用条的终点是最后一条观测记录，不是测量得到的完成时间。
 传入的依赖拓扑和名称映射会应用于每次调用；映射不同的工作负载应分别采集。
 独立的调度开销分析和依赖查看器的时间信息仍要求单次调用的采集结果。
-转换器在不同 launch 和 rank 命名空间之间使用整数事件及 flow 绑定 ID，
-因此 Perfetto 可以直接导入依赖箭头，无需调用方改写 ID。
 当前支持 A2/A3 TMR，包括预热后的 graph replay；begin/end 本身不支持 capture。
 
 ## Callable 身份与热路径测量
@@ -318,7 +307,7 @@ Simpler 或 native launch 扩展；`torch` 仍是 PyPTO 的常规依赖。真正
 Worker。`KernelConfig` 固定 platform、runtime、device、AICPU 线程数和 DFX 配置，其他常驻资源
 暂用 simpler 默认值。配置不兼容时报错，不额外创建 Worker。
 
-集成 SDK 固定为 `17ea300256e2a6db5af397ce619a7d480b595d80`。实际 Python 接口为
+集成 SDK 固定为 `32dff953d07f6bd2aacab8532860f28aca6df931`。实际 Python 接口为
 `simpler.task_interface.ChipWorker.kernel_init`、`kernel_prepare_callable`、
 `kernel_begin_dfx`、`kernel_end_dfx` 和 `finalize`。PyPTO 内部 adapter
 使用这些已有方法；init/prepare 不接收 caller stream，native context generation 和
