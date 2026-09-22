@@ -402,7 +402,7 @@ context resources currently use Simpler defaults. An incompatible configuration
 is rejected instead of opening another Worker.
 
 The integration SDK is pinned to
-`6cde59295057d99b846319366141a27f101afc56`. Its supported Python surface is
+`32dff953d07f6bd2aacab8532860f28aca6df931`. Its supported Python surface is
 `simpler.task_interface.ChipWorker.kernel_init`, `kernel_prepare_callable`,
 `kernel_begin_dfx`, `kernel_end_dfx` and `finalize`.
 PyPTO's private adapter uses these existing methods. Init and prepare take no

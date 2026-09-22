@@ -307,7 +307,7 @@ Simpler 或 native launch 扩展；`torch` 仍是 PyPTO 的常规依赖。真正
 Worker。`KernelConfig` 固定 platform、runtime、device、AICPU 线程数和 DFX 配置，其他常驻资源
 暂用 simpler 默认值。配置不兼容时报错，不额外创建 Worker。
 
-集成 SDK 固定为 `6cde59295057d99b846319366141a27f101afc56`。实际 Python 接口为
+集成 SDK 固定为 `32dff953d07f6bd2aacab8532860f28aca6df931`。实际 Python 接口为
 `simpler.task_interface.ChipWorker.kernel_init`、`kernel_prepare_callable`、
 `kernel_begin_dfx`、`kernel_end_dfx` 和 `finalize`。PyPTO 内部 adapter
 使用这些已有方法；init/prepare 不接收 caller stream，native context generation 和
