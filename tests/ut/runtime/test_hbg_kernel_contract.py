@@ -10,6 +10,9 @@
 """HBG kernel Host orchestration cannot dereference Tensor storage."""
 
 import importlib
+import sys
+from enum import Enum
+from types import SimpleNamespace
 
 import pypto.language as pl
 import pytest
@@ -19,9 +22,13 @@ from pypto.pypto_core import ir, passes
 
 
 @pytest.fixture
-def stub_ptoas(monkeypatch):
+def stub_codegen_dependencies(monkeypatch):
     # Preserve the real pass pipeline, Host codegen, config and ABI stamping.
-    # Only the external Device C++ translator is replaced for hardware-free UTs.
+    # Generated configs only need this enum from the optional runtime SDK.
+    task_interface = SimpleNamespace(ArgDirection=Enum("ArgDirection", ["SCALAR", "IN", "OUT", "INOUT"]))
+    monkeypatch.setitem(sys.modules, "simpler", SimpleNamespace(task_interface=task_interface))
+    monkeypatch.setitem(sys.modules, "simpler.task_interface", task_interface)
+    # Replace the external Device C++ translator for hardware-free UTs.
     monkeypatch.setattr(
         "pypto.backend.pto_backend._compile_pto_module",
         lambda _code, _name, _directory, _planner=None: '#include "pto/pto-inst.hpp"\n'
@@ -224,7 +231,7 @@ def test_scalar_graph_decision_and_tensor_metadata_are_allowed():
 
 
 @pytest.mark.parametrize("form", ["scope", "submit"])
-def test_device_dispatch_predicate_is_allowed(tmp_path, form, stub_ptoas):
+def test_device_dispatch_predicate_is_allowed(tmp_path, form, stub_codegen_dependencies):
     @pl.program
     class Scope:
         @pl.function(type=pl.FunctionType.Orchestration)
@@ -276,7 +283,7 @@ def test_device_dispatch_predicate_is_allowed(tmp_path, form, stub_ptoas):
 
 
 @pytest.mark.parametrize("name", ["add", "repeat_add", "read_on_host"])
-def test_hbg_integration_kernels_compile(tmp_path, monkeypatch, name, stub_ptoas):
+def test_hbg_integration_kernels_compile(tmp_path, monkeypatch, name, stub_codegen_dependencies):
     from pypto.ir import _kernel_compile  # noqa: PLC0415
 
     from tests.st.runtime.kernel import test_hbg_contract  # noqa: PLC0415
