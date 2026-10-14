@@ -15,6 +15,7 @@ import textwrap
 import warnings
 
 import pypto.language as pl
+import pypto.language.distributed as pld
 import pytest
 from pypto.jit.specializer import (
     DynDim,
@@ -662,6 +663,17 @@ class TestRenderFreeValue:
         """Declining is the safe answer: the name survives and the parser reports it."""
         assert _render_free_value(value) is None
 
+    @pytest.mark.parametrize("enum_type", [pld.ReduceOp, pld.NotifyOp, pld.WaitCmp, pld.AtomicType])
+    def test_distributed_enum_members_round_trip(self, enum_type):
+        # AtomicType is shared with pl; its existing canonical spelling stays stable.
+        prefix = "pl" if enum_type is pld.AtomicType else "pld"
+        for member in enum_type:
+            rendered = _render_free_value(member)
+            assert rendered is not None
+            source = ast.unparse(rendered)
+            assert source == f"{prefix}.{enum_type.__name__}.{member.name}"
+            assert eval(source, {"pl": pl, "pld": pld}) is member  # noqa: S307
+
     def test_nan_renders_as_a_nan_producing_expression(self):
         """NaN has no literal, but ast.unparse still writes something evaluable."""
         rendered = _render_free_value(float("nan"))
@@ -694,6 +706,20 @@ class TestSpecializer:
             auto_scope=auto_scope,
         )
         return specialize("_TestClass", [ctx])
+
+    def test_folded_distributed_enum_adds_import_without_distributed_params(self):
+        ctx = _make_ctx(
+            func_name="kernel",
+            source="def kernel():\n    pld.tensor.allreduce(data, signal, op=REDUCE_OP)\n",
+            func_type="host",
+            param_names=[],
+            tensor_meta={},
+        )
+        ctx.py_globals = {"REDUCE_OP": pld.ReduceOp.Max}
+        source = specialize("_TestClass", [ctx])
+        assert "import pypto.language.distributed as pld" in source
+        assert "op=pld.ReduceOp.Max" in source
+        assert "REDUCE_OP" not in source
 
     def test_generated_has_pl_program(self):
         src = """
