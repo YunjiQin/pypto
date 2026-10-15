@@ -167,16 +167,18 @@ def _build_host_allreduce_max():
     return host_orch
 
 
-def _allreduce_chunked_steps(size: int, *, dtype, dtype_bytes: int):
-    """Chunked stage-in/out steps shared by the arbitrary-length host builtins.
-
-    The reduce op is deliberately not a parameter: a `ReduceOp` captured from
-    the factory frame does not fold, so every op supplies its own literal in
-    its `host_orch` (see `_build_host_allreduce_literal_op`).
-    """
+def _build_host_allreduce(
+    size: int,
+    *,
+    dtype,
+    dtype_bytes: int,
+    reduce_op: pld.ReduceOp = pld.ReduceOp.Sum,
+):
+    """Build a host-builtin allreduce with chunked stage-in/out helpers."""
 
     sz = size
     DTYPE = dtype
+    DTYPE_BYTES = dtype_bytes
     alignment = 32 // dtype_bytes
     stage_rows = alignment if size == 1 else 1
     if size == 1:
@@ -232,17 +234,6 @@ def _allreduce_chunked_steps(size: int, *, dtype, dtype_bytes: int):
     ) -> pl.Tensor[[1, sz], DTYPE]:
         return consume_step(data, out)
 
-    return publish_orch, consume_orch
-
-
-def _build_host_allreduce_sum_arbitrary_length(size: int, *, dtype, dtype_bytes: int):
-    """Build a Sum host-builtin allreduce of any length, with chunked stage-in/out helpers."""
-
-    sz = size
-    DTYPE = dtype
-    DTYPE_BYTES = dtype_bytes
-    publish_orch, consume_orch = _allreduce_chunked_steps(size, dtype=dtype, dtype_bytes=dtype_bytes)
-
     @pl.jit.host
     def host_orch(
         inputs: pl.Tensor[[NR, 1, sz], DTYPE],
@@ -257,104 +248,13 @@ def _build_host_allreduce_sum_arbitrary_length(size: int, *, dtype, dtype_bytes:
 
         data = pld.window(data_buf, [1, sz], dtype=DTYPE)
         signal = pld.window(signal_buf, [pld.world_size()], dtype=pl.INT32)
-        data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
+        data = pld.tensor.allreduce(data, signal, op=reduce_op)
 
         for r in pl.range(pld.world_size()):
             consume_orch(data, outputs[r], device=r)
         return outputs
 
     return host_orch
-
-
-def _build_host_allreduce_literal_op(size: int, *, dtype, dtype_bytes: int, reduce_op):
-    """Chunked host builtin for a non-default `ReduceOp`, written as a literal.
-
-    The op cannot be threaded through the factory frame: a `ReduceOp` held in a
-    closure (or a module global) does not fold when the @pl.jit specializer
-    reprints and reparses the generated source, failing with
-    `ParserTypeError: Cannot resolve expression '<NAME>'`, while a literal
-    `op=pld.ReduceOp.<X>` in the body specializes fine. Each op therefore gets
-    its own `host_orch` over the shared stage helpers.
-    """
-
-    sz = size
-    DTYPE = dtype
-    DTYPE_BYTES = dtype_bytes
-    publish_orch, consume_orch = _allreduce_chunked_steps(size, dtype=dtype, dtype_bytes=dtype_bytes)
-
-    if reduce_op is pld.ReduceOp.Max:
-
-        @pl.jit.host
-        def host_orch(
-            inputs: pl.Tensor[[NR, 1, sz], DTYPE],
-            outputs: pl.Out[pl.Tensor[[NR, 1, sz], DTYPE]],
-        ) -> pl.Tensor[[NR, 1, sz], DTYPE]:
-            data_buf = pld.alloc_window_buffer(sz * DTYPE_BYTES)
-            signal_buf = pld.alloc_window_buffer(pld.world_size() * pl.INT32.get_byte())
-
-            for r in pl.range(pld.world_size()):
-                data = pld.window(data_buf, [1, sz], dtype=DTYPE)
-                publish_orch(inputs[r], data, device=r)
-
-            data = pld.window(data_buf, [1, sz], dtype=DTYPE)
-            signal = pld.window(signal_buf, [pld.world_size()], dtype=pl.INT32)
-            data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Max)
-
-            for r in pl.range(pld.world_size()):
-                consume_orch(data, outputs[r], device=r)
-            return outputs
-
-        return host_orch
-
-    if reduce_op is pld.ReduceOp.Min:
-
-        @pl.jit.host
-        def host_orch(
-            inputs: pl.Tensor[[NR, 1, sz], DTYPE],
-            outputs: pl.Out[pl.Tensor[[NR, 1, sz], DTYPE]],
-        ) -> pl.Tensor[[NR, 1, sz], DTYPE]:
-            data_buf = pld.alloc_window_buffer(sz * DTYPE_BYTES)
-            signal_buf = pld.alloc_window_buffer(pld.world_size() * pl.INT32.get_byte())
-
-            for r in pl.range(pld.world_size()):
-                data = pld.window(data_buf, [1, sz], dtype=DTYPE)
-                publish_orch(inputs[r], data, device=r)
-
-            data = pld.window(data_buf, [1, sz], dtype=DTYPE)
-            signal = pld.window(signal_buf, [pld.world_size()], dtype=pl.INT32)
-            data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Min)
-
-            for r in pl.range(pld.world_size()):
-                consume_orch(data, outputs[r], device=r)
-            return outputs
-
-        return host_orch
-
-    if reduce_op is pld.ReduceOp.Prod:
-
-        @pl.jit.host
-        def host_orch(
-            inputs: pl.Tensor[[NR, 1, sz], DTYPE],
-            outputs: pl.Out[pl.Tensor[[NR, 1, sz], DTYPE]],
-        ) -> pl.Tensor[[NR, 1, sz], DTYPE]:
-            data_buf = pld.alloc_window_buffer(sz * DTYPE_BYTES)
-            signal_buf = pld.alloc_window_buffer(pld.world_size() * pl.INT32.get_byte())
-
-            for r in pl.range(pld.world_size()):
-                data = pld.window(data_buf, [1, sz], dtype=DTYPE)
-                publish_orch(inputs[r], data, device=r)
-
-            data = pld.window(data_buf, [1, sz], dtype=DTYPE)
-            signal = pld.window(signal_buf, [pld.world_size()], dtype=pl.INT32)
-            data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Prod)
-
-            for r in pl.range(pld.world_size()):
-                consume_orch(data, outputs[r], device=r)
-            return outputs
-
-        return host_orch
-
-    raise ValueError(f"unsupported reduce op for the chunked host builtin: {reduce_op!r}")
 
 
 def _build_host_allreduce_signal_reuse():
@@ -663,7 +563,7 @@ class TestL3HostTensorAllReduce:
         inputs = _make_rank_inputs(n_ranks, size, dtype=torch.float16)
         outputs = torch.zeros_like(inputs)
 
-        host_orch = _build_host_allreduce_sum_arbitrary_length(size, dtype=pl.FP16, dtype_bytes=2)
+        host_orch = _build_host_allreduce(size, dtype=pl.FP16, dtype_bytes=2)
         compiled = host_orch.compile(
             inputs,
             outputs,
@@ -714,7 +614,7 @@ class TestL3HostTensorAllReduce:
         )
         outputs = torch.zeros_like(inputs)
 
-        host_orch = _build_host_allreduce_literal_op(
+        host_orch = _build_host_allreduce(
             size,
             dtype=pl.FP16,
             dtype_bytes=2,
@@ -751,7 +651,7 @@ class TestL3HostTensorAllReduce:
         inputs = _make_rank_inputs(n_ranks, size)
         outputs = torch.zeros_like(inputs)
 
-        host_orch = _build_host_allreduce_sum_arbitrary_length(size, dtype=pl.FP32, dtype_bytes=4)
+        host_orch = _build_host_allreduce(size, dtype=pl.FP32, dtype_bytes=4)
         compiled = host_orch.compile(
             inputs,
             outputs,
