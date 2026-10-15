@@ -14,7 +14,8 @@ from pathlib import Path
 from pypto._kernel_abi import EAGER_KERNEL_TARGETS, KernelABI
 
 
-def init(
+# Keep the public configuration options explicit and keyword-only for compatibility.
+def init(  # noqa: PLR0913
     *,
     device: int | None = None,
     platform: str = "a2a3",
@@ -26,6 +27,7 @@ def init(
     ring_task_window: int | tuple[int, ...] | None = None,
     ring_heap: int | tuple[int, ...] | None = None,
     ring_dep_pool: int | tuple[int, ...] | None = None,
+    enable_sdma: bool = False,
 ) -> None:
     """Fix this process's kernel execution target and initialize its Worker.
 
@@ -58,9 +60,13 @@ def init(
             the difference -- it is device memory the runtime holds for its life.
             Too small a heap is a runtime fault at dispatch, not a silent slowdown.
         ring_dep_pool: Per-ring dependency-list pool capacity, same shape.
+        enable_sdma: Provision SDMA resources during initialization for async
+            prefetch kernels. Requires a Simpler kernel SDMA provider. This
+            setting cannot change after initialization.
 
     Raises:
-        TypeError: ``device`` is neither None nor an int.
+        TypeError: ``device`` is neither None nor an int, or ``enable_sdma``
+            is not a bool.
         ValueError: The target, device or thread count is invalid, differs from
             the configuration already bound in this process, or the native
             Simpler binding does not match the kernel ABI revision.
@@ -109,6 +115,7 @@ def init(
         ring_task_window,
         ring_heap,
         ring_dep_pool,
+        enable_sdma=enable_sdma,
     )
     # Every check below runs before ensure_worker claims kernel mode.
     shutdown.require_supported_framework(framework)

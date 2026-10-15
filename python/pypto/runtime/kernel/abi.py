@@ -38,6 +38,7 @@ class KernelConfig:
     ring_task_window: int | tuple[int, ...] | None = None
     ring_heap: int | tuple[int, ...] | None = None
     ring_dep_pool: int | tuple[int, ...] | None = None
+    enable_sdma: bool = False
 
     def __post_init__(self) -> None:
         from pypto.runtime.runner import _normalize_swimlane_level  # noqa: PLC0415
@@ -50,6 +51,8 @@ class KernelConfig:
         )
         if type(self.enable_dep_gen) is not bool:
             raise TypeError(f"enable_dep_gen must be bool, got {self.enable_dep_gen!r}")
+        if type(self.enable_sdma) is not bool:
+            raise TypeError(f"enable_sdma must be bool, got {self.enable_sdma!r}")
         if self.output_dir is not None:
             object.__setattr__(self, "output_dir", Path(self.output_dir).expanduser().resolve())
         if (self.enable_chip_swimlane or self.enable_dep_gen) and self.output_dir is None:
@@ -67,7 +70,9 @@ class KernelConfig:
             else:
                 value = tuple(value)
                 if len(value) != 4:
-                    raise ValueError(f"{field} must be a scalar or exactly 4 per-ring values, got {len(value)}")
+                    raise ValueError(
+                        f"{field} must be a scalar or exactly 4 per-ring values, got {len(value)}"
+                    )
             if any(type(v) is not int or v <= 0 for v in value):
                 raise ValueError(f"{field} entries must be positive ints, got {value}")
             object.__setattr__(self, field, value)
@@ -112,7 +117,7 @@ class _NativeWorker:
             config.runtime, build=False
         )
         self.worker = interface.ChipWorker()
-        self.worker.kernel_init(config.device_id, bins, cfg)
+        self.worker.kernel_init(config.device_id, bins, cfg, enable_sdma=config.enable_sdma)
         if not self.worker.kernel_mode_supported:
             raise RuntimeError(f"Simpler does not support kernel mode for {config.platform}/{config.runtime}")
 

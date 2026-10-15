@@ -106,6 +106,28 @@ def test_invalid_init_leaves_process_unclaimed_and_retryable(setup, framework, c
     state.close()
 
 
+@pytest.mark.parametrize("runtime", ["tensormap_and_ringbuffer", "host_build_graph"])
+@pytest.mark.parametrize("enable_sdma", [False, True])
+def test_init_sdma_is_immutable(setup, framework, runtime, enable_sdma):
+    state, _, calls, _ = setup
+    init(runtime=runtime, enable_sdma=enable_sdma)
+    assert state.require_config().enable_sdma is enable_sdma
+    init(runtime=runtime, enable_sdma=enable_sdma)
+    with pytest.raises(ValueError, match="configuration conflict"):
+        init(runtime=runtime, enable_sdma=not enable_sdma)
+    assert len(calls.inits) == 1
+    state.close()
+
+
+@pytest.mark.parametrize("value", [None, 0, 1, "true"])
+def test_invalid_sdma_configuration_does_not_claim_process(setup, framework, value):
+    state, _, calls, _ = setup
+    with pytest.raises(TypeError, match="enable_sdma must be bool"):
+        init(enable_sdma=value)
+    assert not calls.workers and _execution_mode._gate.mode is None
+    assert state.state is KernelState.UNINITIALIZED
+
+
 def test_concurrent_init_shares_one_worker(setup, framework):
     state, config, calls, _ = setup
     with ThreadPoolExecutor(max_workers=8) as pool:
