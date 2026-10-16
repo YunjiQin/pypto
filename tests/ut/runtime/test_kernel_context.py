@@ -739,18 +739,18 @@ def test_native_worker_forwards_dfx_config_and_uses_owner_thread(monkeypatch, tm
 
 
 def test_kernel_config_normalizes_ring_sizing():
-    # 标量广播到全部 4 个 ring，与 RunOptions 的同名字段语义一致。
+    # Scalars broadcast to all 4 rings, matching RunOptions.
     config = KernelConfig("a2a3", "tensormap_and_ringbuffer", 0, ring_heap=64 * 1024 * 1024)
     assert config.ring_heap == (64 * 1024 * 1024,) * 4
     assert config.ring_task_window is None and config.ring_dep_pool is None
-    # 逐 ring 的列表原样保留，但存成元组：KernelConfig 是 frozen dataclass，
-    # ensure_worker 用相等性判定"同一配置的重复 init 是 no-op"，必须可哈希且稳定。
+    # Per-ring lists become tuples so the frozen configuration stays hashable.
+    # ensure_worker uses equality to make repeated init with the same config a no-op.
     config = KernelConfig("a2a3", "tensormap_and_ringbuffer", 0, ring_task_window=[16, 32, 128, 256])
     assert config.ring_task_window == (16, 32, 128, 256)
     assert hash(config) == hash(
         KernelConfig("a2a3", "tensormap_and_ringbuffer", 0, ring_task_window=(16, 32, 128, 256))
     )
-    # 未设置与设置过的配置不相等，否则第二次 init 会被误判成 no-op。
+    # Explicit sizing must differ from defaults so init detects a config change.
     assert KernelConfig("a2a3", "tensormap_and_ringbuffer", 0) != config
 
 
@@ -769,11 +769,11 @@ def test_kernel_config_rejects_bad_ring_sizing(field, value, match):
 
 
 def test_native_worker_forwards_ring_sizing_only_when_set(monkeypatch, tmp_path):
-    """kernel 模式下 init 是 ring 尺寸的唯一入口，所以这一步必须真的写进 CallConfig。
+    """Kernel init must forward ring sizes through CallConfig.
 
-    arena 由 init_kernel_context -> prepare_kernel_runtime_impl 在 init 期间按
-    CallConfig.runtime_env 建好并冻结，之后的 prepare_callable / launch 都不再
-    携带 CallConfig；写漏了就只能吃编译期默认的 4 x 256 MiB。
+    init_kernel_context -> prepare_kernel_runtime_impl freezes arenas using
+    CallConfig.runtime_env. Later preparation and launches do not carry it;
+    omitting these fields would retain the default 4 x 256 MiB ring heap.
     """
     import sys  # noqa: PLC0415
 
@@ -800,7 +800,7 @@ def test_native_worker_forwards_ring_sizing_only_when_set(monkeypatch, tmp_path)
         return adapter
 
     def fresh():
-        # 真实的 RuntimeEnv 读回来是 4 元列表，未设置即全零；这里用 0 代表"没写过"。
+        # RuntimeEnv exposes four-element lists, initially zero; 0 marks an untouched field here.
         env = SimpleNamespace(ring_task_window=0, ring_heap=0, ring_dep_pool=0)
         cfg = SimpleNamespace(validate=lambda: None, runtime_env=env)
         worker = SimpleNamespace(
@@ -829,7 +829,7 @@ def test_native_worker_forwards_ring_sizing_only_when_set(monkeypatch, tmp_path)
     finally:
         adapter.close()
 
-    # 不给 ring 尺寸时一个字段都不能碰，否则 Simpler 落不到自己的编译期默认。
+    # Unspecified sizes must leave fields untouched so Simpler applies its defaults.
     cfg, env, worker = fresh()
     adapter = make_adapter(cfg, worker)
     try:

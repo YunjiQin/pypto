@@ -24,9 +24,9 @@ def init(  # noqa: PLR0913
     enable_chip_swimlane: int | bool = 0,
     enable_dep_gen: bool = False,
     output_dir: str | Path | None = None,
-    ring_task_window: int | tuple[int, ...] | None = None,
-    ring_heap: int | tuple[int, ...] | None = None,
-    ring_dep_pool: int | tuple[int, ...] | None = None,
+    ring_task_window: int | list[int] | tuple[int, ...] | None = None,
+    ring_heap: int | list[int] | tuple[int, ...] | None = None,
+    ring_dep_pool: int | list[int] | tuple[int, ...] | None = None,
     enable_sdma: bool = False,
 ) -> None:
     """Fix this process's kernel execution target and initialize its Worker.
@@ -53,8 +53,9 @@ def init(  # noqa: PLR0913
         enable_dep_gen: Collect the task graph independently of timing.
         output_dir: Artifact directory, required when either diagnostic is enabled.
         ring_task_window: Per-ring task-window depth, a scalar broadcast to every
-            scope-depth ring or exactly four values. None keeps the runtime default.
-        ring_heap: Per-ring device heap in **bytes**, same scalar/4-tuple shape.
+            scope-depth ring or a list/tuple of exactly four values.
+            None keeps the runtime default.
+        ring_heap: Per-ring device heap in **bytes**, same scalar/list/tuple shape.
             The kernel arena is built once here and frozen, so a process whose
             task graph needs less than the 256 MiB-per-ring default can reclaim
             the difference -- it is device memory the runtime holds for its life.
