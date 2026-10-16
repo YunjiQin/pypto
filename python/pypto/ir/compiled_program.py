@@ -68,6 +68,8 @@ from pypto.runtime.device_tensor import DeviceTensor, StackedDeviceTensor
 # depend on it without depending on this module. See ``param_info``.
 from .param_info import (  # noqa: F401  -- re-export
     _DATATYPE_TO_CTYPE,
+    _param_info_from_dict,
+    _param_info_to_dict,
     _ParamInfo,
     _to_torch_dtype,
     bind_complete_args,
@@ -78,6 +80,12 @@ from .param_info import (
 )
 from .param_info import (
     ParamInfo as ParamInfo,  # noqa: PLC0414
+)
+from .param_info import (
+    _datatype_from_string as _datatype_from_string,  # noqa: PLC0414
+)
+from .param_info import (
+    _is_int_list as _is_int_list,  # noqa: PLC0414
 )
 
 # Type alias for arguments accepted by CompiledProgram.__call__().
@@ -158,45 +166,6 @@ def _validate_fp4_carrier_shape(shape: Sequence[int], info: "_ParamInfo") -> Non
         )
 
 
-# Reverse map ``str(DataType) -> DataType`` for JSON round-tripping (e.g. the L3
-# ``distributed_meta.json`` consumed by ``DistributedCompiledProgram.from_dir``).
-# ``DataType`` is a non-singleton nanobind type, so reconstruction goes through
-# the canonical string (``str(DataType.FP32) == "fp32"``) rather than identity.
-# Built from the named constants exposed on ``DataType`` so it tracks the C++
-# enum without a hand-maintained literal table.
-_STR_TO_DATATYPE: dict[str, DataType] = {}
-_dt: DataType | None = None
-_dt_name: str = ""
-for _dt_name in (
-    "BOOL", "INT4", "INT8", "INT16", "INT32", "INT64", "UINT4", "UINT8", "UINT16",
-    "UINT32", "UINT64", "FP4", "FP4E2M1X2", "FP8E4M3FN", "FP8E5M2", "FP8E8M0", "FP16", "FP32", "BF16",
-    "HF4", "HF8", "INDEX", "TASK_ID",
-):  # fmt: skip
-    _dt = getattr(DataType, _dt_name, None)
-    if _dt is not None:
-        _STR_TO_DATATYPE[str(_dt)] = _dt
-del _dt_name, _dt
-
-
-def _datatype_from_string(s: str) -> DataType:
-    """Reconstruct a :class:`DataType` from its ``str()`` form (e.g. ``"fp32"``)."""
-    dt = _STR_TO_DATATYPE.get(s)
-    if dt is None:
-        raise ValueError(f"Unknown DataType string {s!r}; known: {sorted(_STR_TO_DATATYPE)}")
-    return dt
-
-
-def _param_info_to_dict(info: _ParamInfo) -> dict[str, Any]:
-    """Serialise a :class:`_ParamInfo` to a JSON-safe dict (see :func:`_param_info_from_dict`)."""
-    return {
-        "name": info.name,
-        "direction": info.direction.name,
-        "shape": info.shape,
-        "dtype": str(info.dtype),
-        "layout": info.layout,
-    }
-
-
 def _is_obj_list(v: object) -> TypeGuard[list[object]]:
     return isinstance(v, list)
 
@@ -204,65 +173,6 @@ def _is_obj_list(v: object) -> TypeGuard[list[object]]:
 def _is_str_dict(v: object) -> TypeGuard[dict[str, object]]:
     """A JSON object: ``json.loads`` only produces string keys."""
     return isinstance(v, dict)
-
-
-def _is_int_list(v: object) -> TypeGuard[list[int]]:
-    """True for a JSON array of non-bool ints (``bool`` is an ``int`` subclass)."""
-    return _is_obj_list(v) and all(isinstance(x, int) and not isinstance(x, bool) for x in v)
-
-
-def _param_info_from_dict(d: dict[str, object]) -> _ParamInfo:
-    """Reconstruct a :class:`_ParamInfo` from :func:`_param_info_to_dict` output.
-
-    Every field is validated here rather than trusted: the sidecars this parses
-    live in a user-supplied build directory, so a hand-edited or version-skewed
-    value must fail at load time with an actionable :class:`ValueError` instead
-    of surfacing much later as an unrelated ``TypeError`` from output
-    allocation or shape handling.
-
-    Raises:
-        KeyError: A required field is absent.
-        ValueError: A field is present but not a valid value for its slot.
-    """
-    name = d["name"]
-    if not isinstance(name, str):
-        raise ValueError(f"'name' must be a string, got {name!r}")
-
-    # Strict enum-member lookup, not getattr(): ``getattr(ParamDirection, "mro")``
-    # resolves to a bound method and would sail through as a bogus direction.
-    raw_direction = d["direction"]
-    direction = ParamDirection.__members__.get(raw_direction) if isinstance(raw_direction, str) else None
-    if direction is None:
-        raise ValueError(
-            f"'direction' must be one of {sorted(ParamDirection.__members__)}, got {raw_direction!r}"
-        )
-
-    # ``bool`` is an ``int`` subclass; a JSON ``true`` is never a dimension.
-    raw_shape: object = d["shape"]
-    shape: list[int] | None = None
-    if raw_shape is not None:
-        if _is_int_list(raw_shape):
-            shape = raw_shape
-        else:
-            raise ValueError(f"'shape' must be null or a list of ints, got {raw_shape!r}")
-
-    raw_dtype = d["dtype"]
-    if not isinstance(raw_dtype, str):
-        raise ValueError(f"'dtype' must be a string, got {raw_dtype!r}")
-
-    # A sidecar written before parameters carried a layout says nothing about
-    # one, which is exactly what ND means.
-    raw_layout = d.get("layout")
-    if raw_layout is not None and not isinstance(raw_layout, str):
-        raise ValueError(f"'layout' must be null or a string, got {raw_layout!r}")
-
-    return _ParamInfo(
-        name=name,
-        direction=direction,
-        shape=shape,
-        dtype=_datatype_from_string(raw_dtype),
-        layout=raw_layout,
-    )
 
 
 def _remove_meta(output_dir: Path, filename: str = _COMPILED_META_FILENAME) -> None:

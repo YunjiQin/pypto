@@ -394,5 +394,115 @@ def test_invalid_storage_descriptions_fail_before_current_context(npu, monkeypat
     npu.npu.current_device.assert_not_called()
 
 
+def test_exact_byte_alias_with_different_dtype_and_shape(npu):
+    """A full-span dtype view remains the original externally supplied object."""
+    x = _tensor((8,))
+    out = x.view(torch.bfloat16)
+    signature = interop.CallSignature(
+        [_param("x", (8,)), _param("out", (16,), DataType.BF16, ParamDirection.Out)], return_aliases=(1, 0, 1)
+    )
+    frame = signature.describe_call((x, out))
+    assert frame.tensors[0].metadata.nbytes == frame.tensors[1].metadata.nbytes
+    assert frame.return_tensors[0] is out
+    assert frame.return_tensors[1] is x
+    assert frame.return_tensors[2] is out
+    with pytest.raises(ValueError, match="writable alias"):
+        interop.CallSignature(
+            [_param("x", (8,)), _param("out", (8,), DataType.BF16, ParamDirection.Out)]
+        ).describe_call((x, out[:8]))
+
+
+@pytest.mark.parametrize("layout,platform", [(None, "a2a3"), ("NZ", None), ("NZ", "a5")])
+def test_native_nz_requires_declared_layout_and_target(npu, monkeypatch, layout, platform):
+    npu.get_npu_format.return_value = 29
+    query = Mock()
+    monkeypatch.setattr(interop, "_native_storage_shape", query)
+    param = _param(shape=(32, 64), dtype=DataType.BF16)
+    param.layout = layout
+    with pytest.raises(ValueError, match="base format"):
+        interop.CallSignature([param], platform=platform).describe_call((_tensor((32, 64), torch.bfloat16),))
+    query.assert_not_called()
+
+
+def test_native_nz_preserves_layout_and_validates_physical_storage(npu, monkeypatch):
+    npu.get_npu_format.return_value = 29
+    query = Mock(return_value=(4, 2, 16, 16))
+    monkeypatch.setattr(interop, "_native_storage_shape", query)
+    param = _param(shape=(32, 64), dtype=DataType.BF16)
+    param.layout = "NZ"
+    signature = interop.CallSignature([param], platform="a2a3")
+    param.layout = None
+    tensor = _tensor((32, 64), torch.bfloat16)
+    assert signature.describe_call((tensor,)).tensors[0].tensor is tensor
+    for invalid in ((2, 4, 16, 16), (4, 2, 16), (4, 3, 16, 16)):
+        query.return_value = invalid
+        with pytest.raises(ValueError, match="complete unpadded"):
+            signature.describe_call((tensor,))
+    query.side_effect = RuntimeError("native storage descriptor failed")
+    with pytest.raises(RuntimeError, match="descriptor failed"):
+        signature.describe_call((tensor,))
+
+
+@pytest.mark.parametrize(
+    "direction,dtype,torch_dtype",
+    [
+        (ParamDirection.Out, DataType.BF16, torch.bfloat16),
+        (ParamDirection.InOut, DataType.BF16, torch.bfloat16),
+        (ParamDirection.In, DataType.FP32, torch.float32),
+    ],
+)
+def test_native_nz_rejects_writes_and_unsupported_dtype(npu, monkeypatch, direction, dtype, torch_dtype):
+    npu.get_npu_format.return_value = 29
+    query = Mock()
+    monkeypatch.setattr(interop, "_native_storage_shape", query)
+    param = _param(shape=(32, 64), dtype=dtype, direction=direction)
+    param.layout = "NZ"
+    with pytest.raises(ValueError, match="read-only"):
+        interop.CallSignature([param], platform="a2a3").describe_call((_tensor((32, 64), torch_dtype),))
+    query.assert_not_called()
+
+
+@pytest.mark.parametrize("offset", [0, 32])
+def test_native_nz_rejects_subviews_of_larger_storage(npu, monkeypatch, offset):
+    npu.get_npu_format.return_value = 29
+    monkeypatch.setattr(interop, "_native_storage_shape", lambda tensor: (4, 2, 16, 16))
+    param = _param(shape=(32, 64), dtype=DataType.BF16)
+    param.layout = "NZ"
+    view = _tensor((64, 64), torch.bfloat16)[offset : offset + 32]
+    with pytest.raises(ValueError, match="complete unpadded"):
+        interop.CallSignature([param], platform="a2a3").describe_call((view,))
+    npu.npu.current_stream.assert_not_called()
+
+
+def test_finite_fp32_overflow_is_rejected_before_framework_queries(npu):
+    with pytest.raises(ValueError, match="overflows"):
+        interop.CallSignature([_param("scale", None, DataType.FP32)]).describe_call((1e100,))
+    npu.load.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "dtype,value,ctype",
+    [
+        (DataType.FP32, -3.5, ctypes.c_float),
+        (DataType.INT32, -7, ctypes.c_int32),
+        (DataType.UINT64, 2**64 - 1, ctypes.c_uint64),
+        (DataType.BOOL, True, ctypes.c_bool),
+    ],
+)
+def test_scalar_encoding_delegates_to_program_codec(npu, monkeypatch, dtype, value, ctype):
+    import sys  # noqa: PLC0415
+
+    codec = Mock(return_value=123)
+    monkeypatch.setitem(sys.modules, "pypto.runtime.task_interface", SimpleNamespace(scalar_to_uint64=codec))
+    frame = interop.CallSignature([_param("value", None, dtype)]).describe_call((value,))
+    assert frame.scalars[0].encode() == 123
+    arg = codec.call_args.args[0]
+    assert type(arg) is ctype
+    assert arg.value == value
+    codec.side_effect = ValueError("native codec rejected value")
+    with pytest.raises(ValueError, match="native codec"):
+        frame.scalars[0].encode()
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

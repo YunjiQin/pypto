@@ -4,6 +4,45 @@ The internal torch adapter describes borrowed NPU arguments for a future kernel
 executor. It does not add a public kernel execution entry point. Existing JIT,
 compiled-program and Worker calls keep their current behavior.
 
+## Shared signature and L2 ABI
+
+`KernelABI` in `pypto._kernel_abi` snapshots the existing `ParamInfo` records.
+Program and kernel descriptors share parameter JSON serialization; there is no
+separate kernel parameter class or duplicate native dtype-tag table. Tensor and
+scalar pool indices are derived from signature order. `bind()` requires every
+Out/InOut argument and returns the two pools plus exact external return aliases,
+including repeated aliases and read-only input returns.
+
+The descriptor records the target and the **compilation SDK revision**, supplied
+by the build context. `from_record()` rejects noncanonical records, and
+`require_compatible()` checks the entire signature, return mapping, target and SDK.
+These operations do not import an optional runtime or initialize a device.
+Kernel scalar declarations currently cover FP32, integer widths, bool and index;
+the broader program scalar map is unchanged. Descriptor dimensions are positive
+u32 extents or `-1`, with rank 1–5 and the pinned L2 pool capacities.
+
+Program submission builds address-free `TaskArgs`; Simpler materializes those
+into `ChipStorageTaskArgs`. The future Torch adapter will build the same boundary
+container from borrowed device storage. Both enter runtime-owned
+`EntryArgsStorage`, then orchestration-facing `ChipTaskArgs`. Scalar encoding
+uses Simpler's existing `scalar_to_uint64`, also used by program submission;
+`ScalarArgument.encode()` supplies a correctly typed ctypes value to that codec.
+
+`runtime.kernel._compat.inspect_kernel_capabilities(sdk_revision)` checks the
+existing runtime pin guard and requires the native build identity to match the
+compilation SDK. The audited revision is `c1f89ea4`. Its Python wrapper supports
+`handle = worker.register_callable(callable_)` and `unregister_callable(handle)`;
+PyPTO does not allocate native callable slots. Borrowed-context initialization,
+caller-stream submission and run retirement are checked separately on the native
+interface. These checks describe runtime prerequisites, not an integrated Torch
+executor. Unknown revisions require review before enabling the contract.
+
+The legacy supported bit does not disable native eager support. Graph capture
+is independently unsupported. Retained diagnostics require per-run configuration
+and flush support. Missing capabilities raise `NotImplementedError`; SDK/native
+mismatches, optional dependency failures and native exceptions retain their own
+error types. This stage adds no Worker initialization, registration or launch.
+
 ## Call metadata and ownership
 
 [`CallSignature`](../../../../python/pypto/torch/interop.py) copies the shared
@@ -45,15 +84,20 @@ borrowed storage while a frame is in use.
   nonzero storage offsets and logical data pointers. Other formats, transposed
   views, unresolved conjugate/negative views and invalid storage bounds fail
   explicitly, without copying or format conversion.
+- An explicit `layout="NZ"` and `platform="a2a3"` permit native format 29 for
+  read-only FP16/BF16/INT8 inputs. Physical dimensions must match the complete,
+  unpadded NZ matrix, with zero storage offset. The physical descriptor query is
+  lazy and requires the optional native adapter; tests replace only that query.
 - Empty views access no elements, so their nonnegative storage offsets may
   exceed storage capacity. The accessed-range upper bound applies only to
   nonempty views.
-- Accept exact tensor-view aliases and disjoint views of shared storage.
+- Accept exact byte-span aliases, including different dtype/shape views, and
+  disjoint views of shared storage.
   Overlapping read-only views are allowed. Partially overlapping views involving
   Out/InOut require a richer alias contract and are rejected.
 - Copy Python or correctly typed ctypes scalars using the program scalar type
   map. Integer values must fit their declared type; floats are not silently
-  truncated into integers. This does not change JIT runtime-scalar or constant
+  truncated into integers; finite floating-point overflow is rejected. This does not change JIT runtime-scalar or constant
   classification.
 - Reject gradient-bearing tensors when autograd is enabled. `torch.no_grad()`
   inference may borrow model parameters; no backward implementation is supplied.
