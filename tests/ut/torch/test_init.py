@@ -75,7 +75,7 @@ def test_init_binds_current_device_and_initializes_once(setup, framework, runtim
         ("runtime", ValueError, "supports"),
         ("device", ValueError, r"torch\.npu\.set_device\(1\)"),
         ("threads", ValueError, "AICPU"),
-        ("framework", RuntimeError, "verified for torch_npu 2.6.0.post2"),
+        ("framework", RuntimeError, r"Automatic kernel shutdown is verified for .*got 2\.7\.0;"),
         ("native", ValueError, "requires Simpler"),
         ("capture", RuntimeError, "outside graph capture"),
     ],
