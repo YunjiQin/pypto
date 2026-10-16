@@ -25,7 +25,7 @@ names, so nothing else has to know they moved.
 import ctypes
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, TypeVar
+from typing import Any, TypeGuard, TypeVar, cast
 
 import torch
 
@@ -149,6 +149,36 @@ def block_nz_shape(shape: Sequence[int], dtype: torch.dtype) -> list[int]:
     return [batch, cols // c0, rows // _NZ_FRACTAL_ROWS, _NZ_FRACTAL_ROWS, c0]
 
 
+def arg_shape_as_declared(arg_shape: Sequence[int], info: _ParamInfo) -> list[int]:
+    """*arg_shape* in the parameter's own terms, ready to compare with ``info.shape``.
+
+    An NZ parameter is compiled to the blocked rank-5 shape the backend
+    addresses, while its caller allocates and passes the logical one — the same
+    bytes under two spellings. Comparing them means blocking the caller's shape
+    with the rule the compiler used. Every other parameter is already in its
+    caller's terms, and a shape that does not block at all (an odd row count,
+    say) is left alone so it is reported as the mismatch it is.
+    """
+    if info.layout != "NZ":
+        return list(arg_shape)
+    # A dynamic blocked batch can only come from logical [B, R, C]: the NZ
+    # pass rejects dynamic leading extents at rank > 3. Entry code reads B
+    # directly from the incoming shapes[0], so accepting another logical rank
+    # here would disagree with that lookup even if blocking hides the mismatch.
+    if info.shape and info.shape[0] < 0 and len(arg_shape) != 3:
+        raise TypeError(
+            f"Parameter {info.name!r} with a dynamic NZ batch expects logical rank 3 "
+            f"(shape [B, R, C]); got shape {tuple(arg_shape)}"
+        )
+    expected_dtype = _to_torch_dtype(info.dtype)
+    if expected_dtype is None:
+        return list(arg_shape)
+    try:
+        return block_nz_shape(arg_shape, expected_dtype)
+    except ValueError:
+        return list(arg_shape)
+
+
 _Arg = TypeVar("_Arg")
 
 
@@ -171,4 +201,104 @@ def bind_complete_args(
 
 # ``_to_torch_dtype`` is shared (leaf-imported) by the compiled-program tiers;
 # the listing keeps pyright's unused-function check satisfied.
-__all__ = ["_to_torch_dtype"]
+__all__ = ["_to_torch_dtype", "_param_info_to_dict", "_param_info_from_dict"]
+
+
+# Reverse map ``str(DataType) -> DataType`` for JSON round-tripping (e.g. the L3
+# ``distributed_meta.json`` consumed by ``DistributedCompiledProgram.from_dir``).
+# ``DataType`` is a non-singleton nanobind type, so reconstruction goes through
+# the canonical string (``str(DataType.FP32) == "fp32"``) rather than identity.
+# Built from the named constants exposed on ``DataType`` so it tracks the C++
+# enum without a hand-maintained literal table.
+_STR_TO_DATATYPE: dict[str, DataType] = {}
+_dt: DataType | None = None
+_dt_name: str = ""
+for _dt_name in (
+    "BOOL", "INT4", "INT8", "INT16", "INT32", "INT64", "UINT4", "UINT8", "UINT16",
+    "UINT32", "UINT64", "FP4", "FP4E2M1X2", "FP8E4M3FN", "FP8E5M2", "FP8E8M0", "FP16", "FP32", "BF16",
+    "HF4", "HF8", "INDEX", "TASK_ID",
+):  # fmt: skip
+    _dt = getattr(DataType, _dt_name, None)
+    if _dt is not None:
+        _STR_TO_DATATYPE[str(_dt)] = _dt
+del _dt_name, _dt
+
+
+def _datatype_from_string(s: str) -> DataType:
+    """Reconstruct a :class:`DataType` from its ``str()`` form (e.g. ``"fp32"``)."""
+    dt = _STR_TO_DATATYPE.get(s)
+    if dt is None:
+        raise ValueError(f"Unknown DataType string {s!r}; known: {sorted(_STR_TO_DATATYPE)}")
+    return dt
+
+
+def _param_info_to_dict(info: _ParamInfo) -> dict[str, Any]:
+    """Serialise a :class:`_ParamInfo` to a JSON-safe dict (see :func:`_param_info_from_dict`)."""
+    return {
+        "name": info.name,
+        "direction": info.direction.name,
+        "shape": info.shape,
+        "dtype": str(info.dtype),
+        "layout": info.layout,
+    }
+
+
+def _is_int_list(v: object) -> TypeGuard[list[int]]:
+    """True for a JSON array of non-bool ints (``bool`` is an ``int`` subclass)."""
+    return isinstance(v, list) and all(
+        isinstance(x, int) and not isinstance(x, bool) for x in cast(list[object], v)
+    )
+
+
+def _param_info_from_dict(d: dict[str, object]) -> _ParamInfo:
+    """Reconstruct a :class:`_ParamInfo` from :func:`_param_info_to_dict` output.
+
+    Every field is validated here rather than trusted: the sidecars this parses
+    live in a user-supplied build directory, so a hand-edited or version-skewed
+    value must fail at load time with an actionable :class:`ValueError` instead
+    of surfacing much later as an unrelated ``TypeError`` from output
+    allocation or shape handling.
+
+    Raises:
+        KeyError: A required field is absent.
+        ValueError: A field is present but not a valid value for its slot.
+    """
+    name = d["name"]
+    if not isinstance(name, str):
+        raise ValueError(f"'name' must be a string, got {name!r}")
+
+    # Strict enum-member lookup, not getattr(): ``getattr(ParamDirection, "mro")``
+    # resolves to a bound method and would sail through as a bogus direction.
+    raw_direction = d["direction"]
+    direction = ParamDirection.__members__.get(raw_direction) if isinstance(raw_direction, str) else None
+    if direction is None:
+        raise ValueError(
+            f"'direction' must be one of {sorted(ParamDirection.__members__)}, got {raw_direction!r}"
+        )
+
+    # ``bool`` is an ``int`` subclass; a JSON ``true`` is never a dimension.
+    raw_shape: object = d["shape"]
+    shape: list[int] | None = None
+    if raw_shape is not None:
+        if _is_int_list(raw_shape):
+            shape = raw_shape
+        else:
+            raise ValueError(f"'shape' must be null or a list of ints, got {raw_shape!r}")
+
+    raw_dtype = d["dtype"]
+    if not isinstance(raw_dtype, str):
+        raise ValueError(f"'dtype' must be a string, got {raw_dtype!r}")
+
+    # A sidecar written before parameters carried a layout says nothing about
+    # one, which is exactly what ND means.
+    raw_layout = d.get("layout")
+    if raw_layout is not None and not isinstance(raw_layout, str):
+        raise ValueError(f"'layout' must be null or a string, got {raw_layout!r}")
+
+    return _ParamInfo(
+        name=name,
+        direction=direction,
+        shape=shape,
+        dtype=_datatype_from_string(raw_dtype),
+        layout=raw_layout,
+    )

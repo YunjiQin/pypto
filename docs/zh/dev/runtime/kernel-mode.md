@@ -3,6 +3,28 @@
 内部 torch 适配器为后续 kernel executor 描述借用的 NPU 参数，不新增公开 kernel
 执行入口。已有 JIT、编译 program 和 Worker 调用保持当前行为。
 
+## 公共签名与 L2 ABI
+
+`pypto._kernel_abi.KernelABI` 对现有 `ParamInfo` 建立快照。program 和 kernel
+共用参数 JSON 序列化，不新增 kernel 参数类型或 native dtype tag 表。Tensor/Scalar
+池索引从签名顺序派生。`bind()` 要求全部 Out/InOut 实参，并返回两个参数池及外部
+Tensor 返回别名，支持重复别名和只读输入返回。
+
+descriptor 记录目标配置和构建上下文传入的**编译 SDK revision**。
+`from_record()` 拒绝非规范记录，`require_compatible()` 核对完整签名、返回映射、目标和
+SDK；这些操作不加载可选 runtime 或初始化设备。kernel Scalar 声明目前覆盖 FP32、
+各宽度整数、bool 和 index，不改变 program 更宽的 Scalar 映射。descriptor 的维度为正
+u32 或 `-1`，rank 为 1–5，参数池容量与固定的 L2 SDK 一致。
+
+program 提交构造无地址的 `TaskArgs`，由 Simpler 解析为 `ChipStorageTaskArgs`。
+后续 Torch adapter 也通过公开 Worker 接口提交 `TaskArgs`，使用 `Buffer.wrap`
+和 Simpler Tensor 视图描述借用的设备存储。Scalar 的值和类型通过公开 `TaskArgs`
+typed scalar 接口传入，由 Simpler 完成 ABI 编码。
+`ScalarArgument` 仅保留校验后的值和 dtype，不执行编码。
+
+Runtime 能力检查将在后续接入 Torch kernel runtime 首次初始化时统一执行。
+本阶段不新增 Worker 初始化、注册或 launch。
+
 ## 调用元数据与所有权
 
 [`CallSignature`](../../../../python/pypto/torch/interop.py) 一次性复制共享的
@@ -38,12 +60,17 @@ frame 使用期间，调用方不能 resize 或使借用的 storage 失效。
 - 要求 base NCHW (0) 或 ND (2) 格式的连续 strided view，保留非零 storage offset
   和逻辑地址。其他格式、转置 view、未解析的 conjugate/negative view 及无效 storage
   边界明确报错，不进行复制或格式转换。
+- 显式 `layout="NZ"` 且 `platform="a2a3"` 时允许只读 FP16/BF16/INT8 的原生
+  format 29 输入；物理维度必须对应完整、无 padding、零 storage offset 的 NZ 矩阵。
+  物理描述符查询按需加载可选 native adapter；UT 仅替换该查询边界。
+  签名校验先将 Torch 逻辑 shape 转为 blocked shape，再与 `ParamInfo` 比较；
+  动态 NZ batch 要求逻辑 rank 为 3（`[B, R, C]`）。
 - 空 view 不访问任何元素，因此非负 storage offset 可以超过 storage 容量；
   仅对非空 view 校验访问范围上界。
-- 允许完全相同的 Tensor view 别名、同一 storage 上互不相交的 view，以及重叠的
+- 允许字节区间完全一致的别名（可具有不同 dtype/shape）、同一 storage 上互不相交的 view，以及重叠的
   只读 view。涉及 Out/InOut 的部分重叠需要更丰富的别名契约，当前明确拒绝。
 - 使用 program Scalar 类型映射复制 Python 或类型匹配的 ctypes Scalar。
-  整数必须位于声明类型范围内，不将浮点数静默截断成整数。这不改变 JIT 的运行时
+  整数必须位于声明类型范围内，不将浮点数静默截断成整数，拒绝有限浮点值溢出。这不改变 JIT 的运行时
   Scalar 或常量分类。
 - autograd 开启时拒绝需要梯度的 Tensor；`torch.no_grad()` 推理可以借用模型参数，
   但不提供 backward 实现。
