@@ -1,11 +1,72 @@
 # Kernel mode 集成基础
 
 内部 torch 适配器为后续 kernel executor 描述借用的 NPU 参数，不新增公开 kernel
-执行入口。已有 JIT、编译 program 和 Worker 调用保持当前行为。
+执行入口。已有 JIT、编译 program 和 Worker 调用共用下述参数契约。
+
+## 公共签名与 L2 ABI
+
+`ParamInfo` 是 program 执行、Torch 实参校验、注册元数据和 assembly 共用的不可变
+参数快照。shape 固化为 tuple，JSON 保留数组。共享 helper 校验名称唯一性和外部返回
+别名；索引对应包含 Scalar 的完整参数列表，允许重复。L2 参数池容量单独在单芯片边界
+检查，不限制分布式元数据。
+
+不再保留独立 kernel ABI descriptor 或 SDK 字段。编译身份复用 `ArtifactKey` 和
+`ToolchainIdentity`，包含请求的 PROGRAM 或 KERNEL 契约。参数 dtype/layout 序列化
+保持共享；IR 构造和 pass 负责参数合法性，调用适配器负责 Scalar 范围和借用存储校验。
+
+## 公共编译产物
+
+内部 `CompiledArtifact` 持有单芯片目录、平台、`ArtifactMetadata` 和延迟 callable 加载。
+`CompiledProgram` 通过组合保留 live IR、路径兼容、program 返回式分配和 runner。
+参数名称、输出分配位置和返回数量从公共 metadata 派生，不在包装层重复保存。
+目标属性使用产物的有效平台，包括恢复时显式指定的目标覆盖。
+多 orchestration 的子入口共用该产物，父对象保留入口选择；分布式执行保留现有包装层。
+公共编译器只写入一次 sidecar，包装结果时不再重写；直接从 live IR 构造的兼容路径
+仍会创建 sidecar。
+
+公开 `ir.compile()` 与内部 `_compile_artifact(contract=KERNEL)` 通过 `_compile_to_files()`
+共用 passes/codegen；该步骤仅返回 lowered IR 和构建信息，不创建执行包装对象。
+`_compile_artifact()` 只接受单芯片单入口，始终返回 `CompiledArtifact`。
+公开 `compile()` 负责单程序、多入口和分布式包装，以及无法提取规范 lowered 签名时
+的 program 兼容回退。
+公开 `compile()` 显式请求 PROGRAM；目前 KERNEL 由内部编译测试直接请求，Torch
+提交层尚未接入此路径。不新增公开 `compile_kernel()`。`contract` 选择 PROGRAM/KERNEL
+调用规则，`execution_mode` 独立选择目标平台的 SIM/ONBOARD。
+kernel 要求单芯片、单入口、显式提供 Out/InOut buffer，
+且 Tensor 返回必须别名到外部参数。现有 C++ 返回血缘分析从原始 IR 生成有序别名，
+允许重复。lowering 后核对外部参数 ABI：数量、顺序、名称、方向、dtype 和 storage。
+外部参数名称去除 SSA 版本后缀。
+HBG Host Tensor 数据读写被拒绝，设备 submit predicate 保留原语义；program 编译
+仍支持原有分配及 Host 控制流程。
+
+metadata 区分逻辑调用签名 `params` 与 assembly 签名 `lowered_params`，均使用
+`ParamInfo`。Torch 按逻辑 shape 校验；NZ lowering 按元素单位验证无 padding 的
+blocked 表示，dtype 不变，因此字节数一致。动态 NZ 支持逻辑 `[B, R, C]` 的 batch
+维度；blocked shape 不作为 Torch 的逻辑 shape。
+
+`compiled_meta.json` schema 3 保存两种签名、返回数量、别名、平台/backend 和已验证
+执行能力。生产者仅声明本次请求的能力，不自动声明双模式兼容。schema 1/2 旧 program
+metadata 仅按 PROGRAM 恢复，不推断 kernel 契约。kernel 必需字段缺失、索引非法或
+能力不一致时要求重编译。`from_dir()` 仅读取 metadata，不加载 native。
+
+`ArtifactRuntime` 仍是唯一缓存晋级/加载实现。单芯片恢复先创建 `CompiledArtifact`，
+PROGRAM 消费者再加执行包装，内部 KERNEL 消费者直接获取产物。manifest、构建锁、
+prebuilt 校验和阶段晋级完全复用。加载串行化并在 assembly 成功后发布状态，不初始化、
+注册或执行 Worker。缓存晋级保持源路径身份稳定，运行输出位于不可变缓存外；注册
+handle、stream、输入 Tensor 和运行资源不进入公共产物。
+
+program 提交构造无地址的 `TaskArgs`，由 Simpler 解析为 `ChipStorageTaskArgs`。
+后续 Torch adapter 也通过公开 Worker 接口提交 `TaskArgs`，使用 `Buffer.wrap`
+和 Simpler Tensor 视图描述借用的设备存储。Scalar 的值和类型通过公开 `TaskArgs`
+typed scalar 接口传入，由 Simpler 完成 ABI 编码。
+`ScalarArgument` 仅保留校验后的值和 dtype，不执行编码。
+
+Runtime 能力检查将在后续接入 Torch kernel runtime 首次初始化时统一执行。
+本阶段不新增 Worker 初始化、注册或 launch。
 
 ## 调用元数据与所有权
 
-[`CallSignature`](../../../../python/pypto/torch/interop.py) 一次性复制共享的
+[`CallSignature`](../../../../python/pypto/torch/interop.py) 持有共享的不可变
 `ir.param_info.ParamInfo` 签名。`describe_call(args)` 复用 `bind_complete_args`，
 所有 Out/InOut 参数必须在查询框架上下文前完整传入。返回别名（return alias）使用
 完整参数列表中的 Tensor 索引，不能指向 Scalar 或不存在的参数。
@@ -21,7 +82,7 @@
 | `return_tensors` | 经校验的返回别名选择的原始调用方对象。 |
 
 Tensor/Scalar 的排列不定义 native ABI 布局。后续 native 参数编码需同时消费这些值
-和经过校验的 kernel descriptor。地址、Scalar 实际值和 stream 属于每次调用状态，
+和经过校验的产物 metadata。地址、Scalar 实际值和 stream 属于每次调用状态，
 不进入编译 key 或持久 metadata。
 
 frame 持有每个 Tensor 及其 storage 对象。`alias_result()` 返回 `None`、单个已有
@@ -38,12 +99,17 @@ frame 使用期间，调用方不能 resize 或使借用的 storage 失效。
 - 要求 base NCHW (0) 或 ND (2) 格式的连续 strided view，保留非零 storage offset
   和逻辑地址。其他格式、转置 view、未解析的 conjugate/negative view 及无效 storage
   边界明确报错，不进行复制或格式转换。
+- 显式 `layout="NZ"` 且 `platform="a2a3"` 时允许只读 FP16/BF16/INT8 的原生
+  format 29 输入；物理维度必须对应完整、无 padding、零 storage offset 的 NZ 矩阵。
+  物理描述符查询按需加载可选 native adapter；UT 仅替换该查询边界。
+  签名校验直接比较逻辑 Torch shape 与逻辑 `ParamInfo`；物理查询独立校验
+  blocked 维度和字节容量。
 - 空 view 不访问任何元素，因此非负 storage offset 可以超过 storage 容量；
   仅对非空 view 校验访问范围上界。
-- 允许完全相同的 Tensor view 别名、同一 storage 上互不相交的 view，以及重叠的
+- 允许字节区间完全一致的别名（可具有不同 dtype/shape）、同一 storage 上互不相交的 view，以及重叠的
   只读 view。涉及 Out/InOut 的部分重叠需要更丰富的别名契约，当前明确拒绝。
 - 使用 program Scalar 类型映射复制 Python 或类型匹配的 ctypes Scalar。
-  整数必须位于声明类型范围内，不将浮点数静默截断成整数。这不改变 JIT 的运行时
+  整数必须位于声明类型范围内，不将浮点数静默截断成整数，拒绝有限浮点值溢出。这不改变 JIT 的运行时
   Scalar 或常量分类。
 - autograd 开启时拒绝需要梯度的 Tensor；`torch.no_grad()` 推理可以借用模型参数，
   但不提供 backward 实现。
@@ -55,7 +121,7 @@ frame 使用期间，调用方不能 resize 或使借用的 storage 失效。
 
 ## 内部 schema 与 Fake/Meta 辅助
 
-`pypto.torch.registration.RegistrationSignature` 复制相同的 `ParamInfo` carrier shape
+`pypto.torch.registration.RegistrationSignature` 持有相同的不可变 `ParamInfo` carrier shape
 及返回参数索引。`schema(name)` 将 Out/InOut Tensor 标记为可写，并把每个 Tensor
 返回值关联到对应输入的别名集合（alias set）。全部参数均须传入，不推导输出分配。
 Scalar 输入映射为 dispatcher 的 `SymInt`、`float` 或 `bool`。`SymInt` 接受普通整数，
@@ -101,7 +167,7 @@ API 选择测试在 PyTorch 2.6 上模拟旧注册入口，验证 Fake/Meta disp
 Simpler 或 native launch 扩展；`torch` 仍是 PyPTO 的常规依赖。真正描述 NPU 调用时
 才按需加载 `torch_npu`，缺失时给出针对性的错误信息。
 
-本基础能力覆盖 metadata 校验、Python 调用 frame 所有权及内部 schema/Fake 辅助，
+本基础能力覆盖公共编译、metadata 与缓存加载、Python 调用 frame 所有权及内部 schema/Fake 辅助，
 不表示 kernel launch、
 taskQueue 顺序、allocator 安全、eager 数值执行或 ACLGraph 已可用。公开入口切换
 必须等待 native adapter 和 runtime 集成完成。

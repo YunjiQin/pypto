@@ -14,8 +14,10 @@ import os
 import tempfile
 from contextlib import AbstractContextManager, nullcontext
 from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 
+from pypto._artifact_contract import ArtifactExecutionMode, ExecutionCapabilities
 from pypto._target import (
     ExecutionMode,
     _platform_string,
@@ -34,8 +36,10 @@ from .pass_manager import OptimizationStrategy, PassDumpLevel, PassManager
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from .compiled_artifact import CompiledArtifact
     from .compiled_program import CompiledProgram
     from .distributed_compiled_program import DistributedCompiledProgram
+    from .param_info import ParamInfo
 
 
 def _write_files(files: dict[str, str], output_dir: str) -> None:
@@ -120,6 +124,24 @@ class _PassPipelineResult(NamedTuple):
     memory_planner: _passes.MemoryPlanner
     backend_type: BackendType
     runtime: _passes.RuntimeKind
+
+
+class _CompilationResult(NamedTuple):
+    """Transient compiler output, before choosing a consumer wrapper."""
+
+    lowered_program: _ir_core.Program
+    output_dir: str
+    platform: str
+    backend_type: BackendType
+    logical_parameters: "list[ParamInfo] | None"
+    return_aliases: tuple[int, ...] | None
+
+
+def _is_distributed(program: _ir_core.Program) -> bool:
+    return any(
+        f.level is not None and _ir_core.level_to_linqu_level(f.level) >= 3
+        for f in program.functions.values()
+    )
 
 
 def _select_backend(*, backend_type: BackendType, platform: str | None) -> BackendType:
@@ -412,8 +434,158 @@ def compile(  # noqa: PLR0913
         >>> c = compiled(a, b)          # return style
         >>> compiled(a, b, c, config=RunConfig(device_id=1))  # specify device
     """
+    from ._artifact_metadata import ArtifactMetadata  # noqa: PLC0415
+    from ._compile_contract import entry_function, external_parameter_names, return_aliases  # noqa: PLC0415
+    from .compiled_artifact import CompiledArtifact  # noqa: PLC0415
+    from .compiled_program import CompiledProgram  # noqa: PLC0415
+    from .param_info import _extract_func_param_infos  # noqa: PLC0415
+
     if platform is not None:
         _warn_deprecated_platform("ir.compile")
+    result = _compile_to_files(
+        program,
+        contract=ArtifactExecutionMode.PROGRAM,
+        output_dir=output_dir,
+        strategy=strategy,
+        dump_passes=dump_passes,
+        backend_type=backend_type,
+        skip_ptoas=skip_ptoas,
+        verification_level=verification_level,
+        diagnostic_phase=diagnostic_phase,
+        disabled_diagnostics=disabled_diagnostics,
+        memory_planner=memory_planner,
+        enable_pypto_l0c_double_buffer=enable_pypto_l0c_double_buffer,
+        profiling=profiling,
+        platform=platform,
+        execution_mode=execution_mode,
+        analyze_auto_scopes_for_deps=analyze_auto_scopes_for_deps,
+        emit_source_loc=emit_source_loc,
+        dump_ptoas_passes=dump_ptoas_passes,
+        runtime=runtime,
+    )
+    lowered_program = result.lowered_program
+    # Entry selection and execution wrappers belong to the public program API.
+    # Inspect lowered IR because outlining can introduce HOST functions.
+    if _is_distributed(lowered_program):
+        from .distributed_compiled_program import (  # noqa: PLC0415
+            DistributedCompiledProgram,
+            DistributedConfig,
+        )
+
+        return DistributedCompiledProgram(
+            lowered_program,
+            result.output_dir,
+            backend_type=result.backend_type,
+            platform=result.platform,
+            distributed_config=DistributedConfig() if distributed_config is None else distributed_config,
+        )
+
+    names = multi_chip_orch_names(lowered_program)
+    if names:
+        children: dict[str, CompiledArtifact] = {}
+        for name in names:
+            original = program.get_function(name)
+            lowered_entry = lowered_program.get_function(name)
+            assert original is not None and lowered_entry is not None
+            child_logical, _, _ = _extract_func_param_infos(original)
+            child_lowered, _, returns = _extract_func_param_infos(lowered_entry)
+            child_lowered = external_parameter_names(child_logical, child_lowered)
+            metadata = ArtifactMetadata(
+                tuple(child_logical),
+                tuple(child_lowered),
+                len(returns),
+                result.platform,
+                result.backend_type,
+                return_aliases(program, original),
+            )
+            child_dir = Path(result.output_dir) / "next_levels" / name
+            metadata.write(child_dir)
+            children[name] = CompiledArtifact(child_dir, result.platform, metadata)
+        return CompiledProgram(
+            program,
+            result.output_dir,
+            backend_type=result.backend_type,
+            platform=result.platform,
+            _sub_chip_names=names,
+            _sub_artifacts=children,
+        )
+
+    try:
+        lowered, _, returns = _extract_func_param_infos(entry_function(lowered_program))
+    except (ValueError, TypeError):
+        # Standalone mixed kernels may lower to several core functions without
+        # a canonical entry. Only the public program API retains this legacy
+        # best-effort wrapper; single-chip artifact compilation fails explicitly.
+        artifact = None
+    else:
+        artifact = _make_single_chip_artifact(result, lowered, len(returns), ArtifactExecutionMode.PROGRAM)
+    return CompiledProgram(
+        program,
+        result.output_dir,
+        backend_type=result.backend_type,
+        platform=result.platform,
+        _sub_chip_names=[],
+        _artifact=artifact,
+    )
+
+
+def _compile_artifact(  # pyright: ignore[reportUnusedFunction]
+    program: _ir_core.Program,
+    *,
+    contract: ArtifactExecutionMode = ArtifactExecutionMode.PROGRAM,
+    **compile_kwargs: Any,
+) -> "CompiledArtifact":
+    """Compile one single-chip entry; always return the shared artifact.
+
+    Program container selection and legacy signature fallbacks belong to
+    :func:`compile`. Options are forwarded to the common passes/codegen path.
+    """
+    from ._compile_contract import entry_function  # noqa: PLC0415
+    from .param_info import _extract_func_param_infos  # noqa: PLC0415
+
+    if _is_distributed(program):
+        raise ValueError("Artifact compilation requires a single chip")
+    entry_function(program)
+    result = _compile_to_files(program, contract=contract, **compile_kwargs)
+    if _is_distributed(result.lowered_program):
+        raise ValueError("Artifact compilation requires a single chip after lowering")
+    lowered, _, returns = _extract_func_param_infos(entry_function(result.lowered_program))
+    return _make_single_chip_artifact(result, lowered, len(returns), contract)
+
+
+def _compile_to_files(  # noqa: PLR0913
+    program: _ir_core.Program,
+    *,
+    contract: ArtifactExecutionMode = ArtifactExecutionMode.PROGRAM,
+    output_dir: str | None = None,
+    strategy: OptimizationStrategy = OptimizationStrategy.Default,
+    dump_passes: bool | PassDumpLevel = True,
+    backend_type: BackendType = BackendType.Ascend910,
+    skip_ptoas: bool = False,
+    verification_level: _passes.VerificationLevel | None = None,
+    diagnostic_phase: _passes.DiagnosticPhase | None = None,
+    disabled_diagnostics: _passes.DiagnosticCheckSet | None = None,
+    memory_planner: _passes.MemoryPlanner | None = None,
+    enable_pypto_l0c_double_buffer: bool | None = None,
+    profiling: bool = False,
+    platform: str | None = None,
+    execution_mode: ExecutionMode | None = None,
+    analyze_auto_scopes_for_deps: bool = False,
+    emit_source_loc: bool | None = None,
+    dump_ptoas_passes: bool = False,
+    runtime: _passes.RuntimeKind | None = None,
+) -> _CompilationResult:
+    """Run shared contract analysis, passes and codegen without execution wrappers."""
+    from ._compile_contract import (  # noqa: PLC0415
+        analyze_contract,
+        entry_function,
+        external_parameter_names,
+        validate_kernel_host_access,
+        validate_lowered_signature,
+    )
+    from .param_info import _extract_func_param_infos  # noqa: PLC0415
+
+    logical, aliases = analyze_contract(program, contract)
     backend_type, mode = _resolve_target(backend_type, execution_mode, platform)
     platform = _platform_string(backend_type, mode)
     _select_backend(backend_type=backend_type, platform=platform)
@@ -471,6 +643,14 @@ def compile(  # noqa: PLR0913
         effective_backend_type = pipeline.backend_type
         effective_runtime = pipeline.runtime
 
+        if contract is ArtifactExecutionMode.KERNEL:
+            lowered, _, _ = _extract_func_param_infos(entry_function(transformed_program))
+            assert logical is not None
+            lowered = external_parameter_names(logical, lowered)
+            validate_lowered_signature(logical, lowered)
+            if effective_runtime == _passes.RuntimeKind.HOST_BUILD_GRAPH:
+                validate_kernel_host_access(transformed_program)
+
         # Codegen target selection is owned by the per-backend BackendHandler;
         # any value of the ``BackendType`` enum is a valid PTO codegen target.
         try:
@@ -494,40 +674,38 @@ def compile(  # noqa: PLR0913
             prof.__exit__(None, None, None)
             prof.write_report(report_dir)
 
-    from .compiled_program import CompiledProgram  # noqa: PLC0415
-
-    # Detect distributed programs: any function with level >= HOST (Linqu level 3).
-    # Use the post-pass program so functions promoted to HOST by outlining
-    # (e.g. via ``with pl.at(level=pl.Level.HOST, ...)``) are still detected.
-    is_distributed = any(
-        f.level is not None and _ir_core.level_to_linqu_level(f.level) >= 3
-        for f in transformed_program.functions.values()
+    return _CompilationResult(
+        transformed_program, output_dir, platform, effective_backend_type, logical, aliases
     )
 
-    if is_distributed:
-        from .distributed_compiled_program import (  # noqa: PLC0415
-            DistributedCompiledProgram,
-            DistributedConfig,
-        )
 
-        if distributed_config is None:
-            distributed_config = DistributedConfig()
-        return DistributedCompiledProgram(
-            transformed_program,
-            output_dir,
-            backend_type=effective_backend_type,
-            platform=platform,
-            distributed_config=distributed_config,
-        )
-
-    # Hand over the layout codegen just produced instead of letting
-    # CompiledProgram re-derive it from the directory: a reused ``output_dir``
-    # may still hold a ``next_levels/`` from an earlier multi-orch compile, and
-    # a disk scan would mistake this build for that one.
-    return CompiledProgram(
-        program,
-        output_dir,
-        backend_type=effective_backend_type,
-        platform=platform,
-        _sub_chip_names=multi_chip_orch_names(transformed_program),
+def _make_single_chip_artifact(
+    result: _CompilationResult,
+    lowered: "list[ParamInfo]",
+    num_return_types: int,
+    contract: ArtifactExecutionMode,
+) -> "CompiledArtifact":
+    """Persist one signature and create its artifact without program adaptation."""
+    from ._artifact_metadata import (  # noqa: PLC0415
+        _COMPILED_META_FILENAME,
+        ArtifactMetadata,
+        _drop_foreign_build_markers,
     )
+    from ._compile_contract import external_parameter_names  # noqa: PLC0415
+    from .compiled_artifact import CompiledArtifact  # noqa: PLC0415
+
+    logical = lowered if result.logical_parameters is None else result.logical_parameters
+    lowered = external_parameter_names(logical, lowered)
+    metadata = ArtifactMetadata(
+        tuple(logical),
+        tuple(lowered),
+        num_return_types,
+        result.platform,
+        result.backend_type,
+        result.return_aliases,
+        ExecutionCapabilities((contract,)),
+    )
+    directory = Path(result.output_dir)
+    _drop_foreign_build_markers(directory, keep=(_COMPILED_META_FILENAME, "kernel_config.py"))
+    metadata.write(directory)
+    return CompiledArtifact(directory, result.platform, metadata)

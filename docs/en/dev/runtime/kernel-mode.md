@@ -2,12 +2,92 @@
 
 The internal torch adapter describes borrowed NPU arguments for a future kernel
 executor. It does not add a public kernel execution entry point. Existing JIT,
-compiled-program and Worker calls keep their current behavior.
+compiled-program and Worker calls share the parameter contract described below.
+
+## Shared signature and L2 ABI
+
+`ParamInfo` is the immutable parameter snapshot shared by program execution,
+Torch call validation, registration metadata and assembly. Shape lists become
+tuples; JSON retains arrays. Shared helpers validate unique names and external
+return aliases. Aliases index the complete signature (including scalar slots)
+and may repeat. L2 pool capacities are checked separately at the single-chip
+boundary, so distributed metadata is not restricted by those limits.
+
+There is no separate kernel ABI descriptor or SDK field. Compilation identity
+uses the existing `ArtifactKey` and `ToolchainIdentity`, including the requested
+PROGRAM or KERNEL contract. Parameter dtype/layout serialization remains shared.
+IR construction and passes own parameter legality; call adapters validate scalar
+ranges and borrowed storage at their boundaries.
+
+## Shared compilation product
+
+The internal `CompiledArtifact` owns one single-chip directory, platform,
+`ArtifactMetadata` and lazy callable loading. `CompiledProgram` composes it and
+retains live IR, path compatibility, program return-style allocation and the
+program runner. Parameter names, output allocation slots and return count are
+computed from shared metadata, not stored again in the wrapper. Target accessors
+use the artifact's effective platform, including explicit reload overrides.
+Multi-orchestration children use the same product; the parent retains entry
+selection. Distributed execution retains its existing wrapper. The shared
+compiler writes each sidecar once; wrapping its result does not rewrite it.
+Legacy direct construction from live IR still creates a sidecar for compatibility.
+
+Public `ir.compile()` and internal `_compile_artifact(contract=KERNEL)` run the
+same passes and codegen through `_compile_to_files()`, which returns lowered IR
+and build metadata without an execution wrapper. `_compile_artifact()` accepts
+one single-chip entry and always returns `CompiledArtifact`. Public `compile()`
+owns single-program, multi-entry and distributed wrapping, including the legacy
+fallback for programs without a canonical lowered signature.
+Public `compile()` explicitly requests PROGRAM; KERNEL
+is currently requested directly by internal compilation tests. Torch submission
+has not yet been connected to that path. There is no public `compile_kernel()`.
+The `contract` selects PROGRAM/KERNEL calling rules; `execution_mode` independently
+selects SIM/ONBOARD for the target platform. Kernel validation requires one chip
+and entry, caller-supplied Out/InOut buffers, and tensor returns
+that alias external parameters. The existing C++ return-lineage analysis derives
+the ordered aliases from the original IR, including duplicates. Post-lowering
+checks validate the external parameter ABI: count, order, names, directions,
+dtype and storage. SSA version suffixes are removed from external parameter names.
+HBG host tensor data reads/writes are rejected; device submit
+predicates retain their existing semantics. Program compilation keeps its
+allocation and host-control behavior.
+
+Metadata distinguishes `params` (logical caller signature) from `lowered_params`
+(assembly signature); both use `ParamInfo`. Torch validates logical shapes.
+NZ lowering is checked against the unpadded blocked representation in element
+units with unchanged dtype, preserving byte size. Dynamic NZ supports the logical
+`[B, R, C]` batch dimension. A blocked shape is never treated as a Torch shape.
+
+`compiled_meta.json` schema 3 persists both signatures, return count, aliases,
+platform/backend and verified execution capabilities. Producers declare only the
+requested capability, never implicit dual-mode support. Schema 1/2 program
+metadata can reload as PROGRAM only; it does not establish a kernel contract.
+Missing kernel fields, invalid indices or mismatched capabilities require
+recompilation. `from_dir()` reads metadata without loading native code.
+
+`ArtifactRuntime` remains the sole cache promotion/loading engine. Single-chip
+cache restoration first creates a `CompiledArtifact`, then wraps it for a PROGRAM
+consumer. The internal KERNEL consumer receives the artifact directly. Manifest,
+build locks, prebuilt validation and stage promotion are shared. Loading is
+serialized, publishes success only after assembly, and does not initialize,
+register with or execute a Worker. Cache promotion preserves source-path identity;
+run output remains outside the immutable cache. Handles, streams, input tensors
+and per-run resources never enter the common product.
+
+Program submission builds address-free `TaskArgs`; Simpler materializes those
+into `ChipStorageTaskArgs`. The future Torch adapter will also submit `TaskArgs`
+through the public Worker interface, using `Buffer.wrap` and Simpler Tensor views
+for borrowed device storage. Scalar values and types will use the public
+`TaskArgs` typed scalar interface, leaving ABI encoding to Simpler.
+`ScalarArgument` retains the validated value and dtype without encoding it.
+
+Runtime capability checks will be integrated into the first Torch kernel runtime
+initialization. This stage adds no Worker initialization, registration or launch.
 
 ## Call metadata and ownership
 
-[`CallSignature`](../../../../python/pypto/torch/interop.py) copies the shared
-`ir.param_info.ParamInfo` signature once. `describe_call(args)` uses
+[`CallSignature`](../../../../python/pypto/torch/interop.py) retains the shared immutable
+`ir.param_info.ParamInfo` signature. `describe_call(args)` uses
 `bind_complete_args`, so every Out/InOut parameter must be supplied before any
 framework-context query. Return aliases are tensor indices in the complete
 parameter list; an alias cannot refer to a scalar or an absent argument.
@@ -23,7 +103,7 @@ Each call produces a new immutable `CallFrame`:
 | `return_tensors` | The exact caller objects selected by validated return aliases. |
 
 Tensor and scalar ordering does not define a native ABI layout. Native argument
-encoding will consume these values together with a validated kernel descriptor.
+encoding will consume these values together with validated artifact metadata.
 Addresses, scalar values and streams are per-call state, not compilation keys or
 persistent metadata.
 
@@ -45,15 +125,22 @@ borrowed storage while a frame is in use.
   nonzero storage offsets and logical data pointers. Other formats, transposed
   views, unresolved conjugate/negative views and invalid storage bounds fail
   explicitly, without copying or format conversion.
+- An explicit `layout="NZ"` and `platform="a2a3"` permit native format 29 for
+  read-only FP16/BF16/INT8 inputs. Physical dimensions must match the complete,
+  unpadded NZ matrix, with zero storage offset. The physical descriptor query is
+  lazy and requires the optional native adapter; tests replace only that query.
+  Signature validation compares the logical Torch shape directly with logical
+  `ParamInfo`; the physical query separately checks blocking and byte capacity.
 - Empty views access no elements, so their nonnegative storage offsets may
   exceed storage capacity. The accessed-range upper bound applies only to
   nonempty views.
-- Accept exact tensor-view aliases and disjoint views of shared storage.
+- Accept exact byte-span aliases, including different dtype/shape views, and
+  disjoint views of shared storage.
   Overlapping read-only views are allowed. Partially overlapping views involving
   Out/InOut require a richer alias contract and are rejected.
 - Copy Python or correctly typed ctypes scalars using the program scalar type
   map. Integer values must fit their declared type; floats are not silently
-  truncated into integers. This does not change JIT runtime-scalar or constant
+  truncated into integers; finite floating-point overflow is rejected. This does not change JIT runtime-scalar or constant
   classification.
 - Reject gradient-bearing tensors when autograd is enabled. `torch.no_grad()`
   inference may borrow model parameters; no backward implementation is supplied.
@@ -67,7 +154,7 @@ Simpler/PyPTO Worker.
 
 ## Internal schema and Fake/Meta helpers
 
-`pypto.torch.registration.RegistrationSignature` copies the same `ParamInfo` carrier
+`pypto.torch.registration.RegistrationSignature` retains the same immutable `ParamInfo` carrier
 shapes and return-slot indices. Its `schema(name)` method marks Out/InOut tensor
 arguments writable and connects each tensor return to the corresponding input
 alias set. All arguments remain required; no output allocation is inferred.
@@ -128,8 +215,8 @@ extension.
 `torch` remains a normal PyPTO dependency. A real call description loads
 `torch_npu` on demand and reports a targeted error if it is unavailable.
 
-This foundation covers metadata validation, Python call-frame ownership, and
-internal schema/Fake helpers.
+This foundation covers shared compilation, metadata and cache loading, Python
+call-frame ownership, and internal schema/Fake helpers.
 It does not claim kernel launch, taskQueue ordering, allocator safety, eager
 numerical execution or ACLGraph support. Those need the native adapter and
 runtime integration before a public entry-point switch.

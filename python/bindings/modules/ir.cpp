@@ -55,6 +55,7 @@
 #include "pypto/ir/transforms/utils/deep_clone_utils.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/transforms/utils/parent_stmt_analysis.h"
+#include "pypto/ir/transforms/utils/return_lineage_utils.h"
 #include "pypto/ir/transforms/utils/tensor_view_semantics.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/type.h"
@@ -2462,6 +2463,9 @@ void BindIR(nb::module_& m) {
       "(original_var, cloned_var) pairs for the definition sites freshly cloned by\n"
       "the traversal. Seeded entries from var_map are NOT included — use the\n"
       "caller's own substitution map for those.");
+
+  ir.def("returned_param_indices", &return_lineage::ReturnedParamIndices, nb::arg("func"), nb::arg("program"),
+         "Trace each return to its external parameter.");
 
   // Cross-function call return type deduction
   ir.def("deduce_call_return_type", &DeduceCallReturnType, nb::arg("callee_params"), nb::arg("args"),

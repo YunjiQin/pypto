@@ -24,6 +24,7 @@ users take in practice.
 import pypto.language as pl
 import pytest
 from pypto.ir.compile import compile as ir_compile
+from pypto.ir.compiled_artifact import CompiledArtifact
 from pypto.pypto_core import passes
 
 DEFAULT_RUNTIME = passes.RuntimeKind.TENSORMAP_AND_RINGBUFFER
@@ -137,6 +138,285 @@ def test_context_runtime_reaches_kernel_config(tmp_path, runtime, stub_ptoas):
 def test_compile_without_explicit_runtime_defaults_to_tensormap(tmp_path, stub_ptoas):
     config = _compile_and_read_config(tmp_path / "default")
     assert f'"runtime": "{passes.runtime_kind_to_name(DEFAULT_RUNTIME)}"' in config
+
+
+@pytest.mark.parametrize("runtime", [DEFAULT_RUNTIME, GRAPH_EXECUTION_RUNTIME])
+@pytest.mark.parametrize("contract", ["PROGRAM", "KERNEL"])
+def test_program_and_artifact_share_real_pipeline(tmp_path, runtime, contract, monkeypatch):
+    from pypto._artifact_contract import ArtifactExecutionMode  # noqa: PLC0415
+    from pypto.ir._artifact_metadata import ArtifactMetadata  # noqa: PLC0415
+    from pypto.ir.compile import _compile_artifact  # noqa: PLC0415
+    from pypto.ir.compiled_program import CompiledProgram  # noqa: PLC0415
+
+    # The compiler persists each artifact once. Adding the program execution
+    # wrapper must not rewrite metadata that the shared producer already owns.
+    writes = []
+    write = ArtifactMetadata.write
+
+    def record_write(metadata, directory):
+        writes.append(directory)
+        write(metadata, directory)
+
+    monkeypatch.setattr(ArtifactMetadata, "write", record_write)
+    with passes.PassContext([], runtime=runtime):
+        program = ir_compile(VectorAdd, output_dir=str(tmp_path / "program"), skip_ptoas=True)
+        artifact = _compile_artifact(
+            VectorAdd,
+            output_dir=str(tmp_path / "artifact"),
+            skip_ptoas=True,
+            contract=ArtifactExecutionMode[contract],
+        )
+    assert isinstance(program, CompiledProgram)
+    assert isinstance(artifact, CompiledArtifact)
+    assert writes == [program.output_dir, artifact.output_dir]
+    assert artifact.metadata is not None
+    assert program._artifact.metadata is not None
+    assert artifact.metadata.return_aliases == (2,)
+    assert artifact.metadata.parameters == program._artifact.metadata.parameters
+    assert artifact.metadata.lowered_parameters == program._artifact.metadata.lowered_parameters
+    assert program.execution_capabilities.record() == ["program"]
+    assert artifact.execution_capabilities.record() == [contract.lower()]
+    assert artifact._chip_callable is None
+    # Real DSL -> IR -> passes -> codegen, with no device/compiler boundary mocked.
+    program_sources = {
+        p.relative_to(program.output_dir): p.read_text() for p in program.output_dir.rglob("*.pto")
+    }
+    artifact_sources = {
+        p.relative_to(artifact.output_dir): p.read_text() for p in artifact.output_dir.rglob("*.pto")
+    }
+    assert program_sources and program_sources == artifact_sources
+    restored = CompiledArtifact.from_dir(artifact.output_dir)
+    assert restored.metadata == artifact.metadata
+
+
+def test_kernel_rejects_implicit_output_but_program_compiles(tmp_path):
+    from pypto._artifact_contract import ArtifactExecutionMode  # noqa: PLC0415
+    from pypto.ir.compile import _compile_artifact  # noqa: PLC0415
+
+    @pl.program
+    class FreshOutput:
+        @pl.function
+        def main(self, a: pl.Tensor[[16, 16], pl.FP32]) -> pl.Tensor[[16, 16], pl.FP32]:
+            with pl.at(level=pl.Level.CORE_GROUP):
+                out = pl.add(a, a)
+            return out
+
+    ir_compile(FreshOutput, output_dir=str(tmp_path / "program"), skip_ptoas=True)
+    with pytest.raises(ValueError, match="explicit Out/InOut"):
+        _compile_artifact(
+            FreshOutput,
+            output_dir=str(tmp_path / "kernel"),
+            skip_ptoas=True,
+            contract=ArtifactExecutionMode.KERNEL,
+        )
+
+
+def test_kernel_rejects_hbg_host_data_access_but_program_compiles(tmp_path):
+    from pypto._artifact_contract import ArtifactExecutionMode  # noqa: PLC0415
+    from pypto.ir.compile import _compile_artifact  # noqa: PLC0415
+
+    @pl.program
+    class HostControl:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(self, control: pl.InOut[pl.Tensor[[2], pl.INT32]], n: pl.Scalar[pl.INT32]):
+            value = pl.tensor.read(control, [0])
+            pl.tensor.write(control, [1], value + n)
+
+    with passes.PassContext([], runtime=GRAPH_EXECUTION_RUNTIME):
+        ir_compile(HostControl, output_dir=str(tmp_path / "program"), skip_ptoas=True)
+        with pytest.raises(ValueError, match="HBG Host"):
+            _compile_artifact(
+                HostControl,
+                output_dir=str(tmp_path / "kernel"),
+                skip_ptoas=True,
+                contract=ArtifactExecutionMode.KERNEL,
+            )
+
+
+def test_kernel_persists_logical_and_lowered_nz_signatures(tmp_path):
+    from pypto._artifact_contract import ArtifactExecutionMode  # noqa: PLC0415
+    from pypto.ir.compile import _compile_artifact  # noqa: PLC0415
+
+    @pl.program
+    class NzMatmul:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(
+            self,
+            a: pl.Tensor[[64, 128], pl.FP16, pl.NZ],
+            b: pl.Tensor[[16, 128], pl.FP16],
+            c: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+        ) -> pl.Tensor[[16, 64], pl.FP32]:
+            with pl.at(level=pl.Level.CORE_GROUP):
+                weight = pl.load(a, [0, 0], [64, 128], target_memory=pl.Mem.Mat)
+                tile = pl.load(b, [0, 0], [16, 128], target_memory=pl.Mem.Mat)
+                acc = pl.matmul(tile, pl.tile.transpose_view(weight), out_dtype=pl.FP32)
+                pl.store(acc, [0, 0], c)
+            return c
+
+    kernel = _compile_artifact(
+        NzMatmul, output_dir=str(tmp_path), skip_ptoas=True, contract=ArtifactExecutionMode.KERNEL
+    )
+    assert isinstance(kernel, CompiledArtifact) and kernel.metadata is not None
+    assert kernel.metadata.parameters[0].shape == (64, 128)
+    assert kernel.metadata.lowered_parameters[0].shape == (1, 8, 4, 16, 16)
+    assert kernel.metadata.return_aliases == (2,)
+
+
+def test_kernel_multiple_returns_keep_full_parameter_indices(tmp_path):
+    from pypto._artifact_contract import ArtifactExecutionMode  # noqa: PLC0415
+    from pypto.ir.compile import _compile_artifact  # noqa: PLC0415
+
+    @pl.program
+    class MultipleReturns:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(
+            self,
+            a: pl.Tensor[[16, 16], pl.FP32],
+            n: pl.Scalar[pl.INT32],
+            c: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> tuple[pl.Tensor[[16, 16], pl.FP32], pl.Tensor[[16, 16], pl.FP32]]:
+            with pl.at(level=pl.Level.CORE_GROUP):
+                tile = pl.load(a, [0, 0], [16, 16])
+                pl.store(tile, [0, 0], c)
+            return c, c
+
+    kernel = _compile_artifact(
+        MultipleReturns, output_dir=str(tmp_path), skip_ptoas=True, contract=ArtifactExecutionMode.KERNEL
+    )
+    assert isinstance(kernel, CompiledArtifact) and kernel.metadata is not None
+    assert kernel.metadata.parameters[1].shape is None
+    assert kernel.metadata.return_aliases == (2, 2)
+
+
+@pytest.mark.parametrize("contract", ["PROGRAM", "KERNEL"])
+def test_single_chip_artifact_rejects_multiple_entries_before_codegen(tmp_path, contract):
+    from pypto._artifact_contract import ArtifactExecutionMode  # noqa: PLC0415
+    from pypto.ir.compile import _compile_artifact  # noqa: PLC0415
+
+    @pl.program
+    class MultiEntry:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def first(self, a: pl.Tensor[[16, 16], pl.FP32]):
+            pass
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def second(self, a: pl.Tensor[[16, 16], pl.FP32]):
+            pass
+
+    with pytest.raises(ValueError, match="exactly one single-chip entry"):
+        _compile_artifact(
+            MultiEntry, output_dir=str(tmp_path), skip_ptoas=True, contract=ArtifactExecutionMode[contract]
+        )
+    assert not (tmp_path / "compiled_meta.json").exists()
+
+
+@pytest.mark.parametrize("contract", ["PROGRAM", "KERNEL"])
+def test_single_chip_artifact_rejects_distributed_entry_before_codegen(tmp_path, contract):
+    from pypto._artifact_contract import ArtifactExecutionMode  # noqa: PLC0415
+    from pypto.ir.compile import _compile_artifact  # noqa: PLC0415
+
+    @pl.program
+    class DistributedEntry:
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def main(self, a: pl.Tensor[[16, 16], pl.FP32]):
+            pass
+
+    with pytest.raises(ValueError, match="single chip"):
+        _compile_artifact(
+            DistributedEntry,
+            output_dir=str(tmp_path),
+            skip_ptoas=True,
+            contract=ArtifactExecutionMode[contract],
+        )
+    assert not (tmp_path / "compiled_meta.json").exists()
+
+
+def test_kernel_preserves_dynamic_shape_and_scalar_slots(tmp_path):
+    from pypto._artifact_contract import ArtifactExecutionMode  # noqa: PLC0415
+    from pypto.ir.compile import _compile_artifact  # noqa: PLC0415
+
+    rows = pl.dynamic("rows")
+
+    @pl.program
+    class DynamicCopy:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(
+            self,
+            a: pl.Tensor[[rows, 16], pl.FP32],
+            n: pl.Scalar[pl.INT32],
+            c: pl.Out[pl.Tensor[[rows, 16], pl.FP32]],
+        ) -> pl.Tensor[[rows, 16], pl.FP32]:
+            for i in pl.range(0, n):
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    tile = pl.load(a, [i * 16, 0], [16, 16])
+                    pl.store(tile, [i * 16, 0], c)
+            return c
+
+    kernel = _compile_artifact(
+        DynamicCopy, output_dir=str(tmp_path), skip_ptoas=True, contract=ArtifactExecutionMode.KERNEL
+    )
+    assert isinstance(kernel, CompiledArtifact) and kernel.metadata is not None
+    assert kernel.metadata.parameters[0].shape == (-1, 16)
+    assert kernel.metadata.parameters[1].shape is None
+    assert kernel.metadata.parameters == kernel.metadata.lowered_parameters
+    assert kernel.metadata.return_aliases == (2,)
+
+
+def test_kernel_requires_explicit_direction_for_mutated_parameter(tmp_path):
+    from pypto._artifact_contract import ArtifactExecutionMode  # noqa: PLC0415
+    from pypto.ir.compile import _compile_artifact  # noqa: PLC0415
+
+    @pl.program
+    class UndeclaredOutput:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(self, a: pl.Tensor[[16, 16], pl.FP32], c: pl.Tensor[[16, 16], pl.FP32]):
+            with pl.at(level=pl.Level.CORE_GROUP):
+                tile = pl.load(a, [0, 0], [16, 16])
+                pl.store(tile, [0, 0], c)
+
+    with pytest.raises(ValueError, match="explicit Out/InOut"):
+        _compile_artifact(
+            UndeclaredOutput, output_dir=str(tmp_path), skip_ptoas=True, contract=ArtifactExecutionMode.KERNEL
+        )
+
+
+def test_kernel_cannot_return_a_narrowed_external_view(tmp_path):
+    from pypto._artifact_contract import ArtifactExecutionMode  # noqa: PLC0415
+    from pypto.ir.compile import _compile_artifact  # noqa: PLC0415
+
+    @pl.program
+    class NarrowedReturn:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(self, a: pl.Tensor[[16, 16], pl.FP32]) -> pl.Tensor[[8, 16], pl.FP32]:
+            return pl.slice(a, [8, 16], [0, 0])
+
+    with pytest.raises(ValueError, match="returns must alias external"):
+        _compile_artifact(
+            NarrowedReturn, output_dir=str(tmp_path), skip_ptoas=True, contract=ArtifactExecutionMode.KERNEL
+        )
+
+
+def test_kernel_rejects_input_write_through_returned_tuple():
+    from pypto._artifact_contract import ArtifactExecutionMode  # noqa: PLC0415
+    from pypto.ir._compile_contract import analyze_contract  # noqa: PLC0415
+
+    @pl.program
+    class BorrowedTuple:
+        @pl.function(type=pl.FunctionType.InCore)
+        def forward(
+            self, a: pl.Tensor[[16, 16], pl.FP32], b: pl.Tensor[[16, 16], pl.FP32]
+        ) -> tuple[pl.Tensor[[16, 16], pl.FP32], pl.Tensor[[16, 16], pl.FP32]]:
+            return a, b
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(self, a: pl.Tensor[[16, 16], pl.FP32], b: pl.Tensor[[16, 16], pl.FP32]):
+            left, right = self.forward(a, b)
+            with pl.at(level=pl.Level.CORE_GROUP):
+                tile = pl.load(left, [0, 0], [16, 16])
+                pl.store(tile, [0, 0], right)
+
+    with pytest.raises(ValueError, match="explicit Out/InOut"):
+        analyze_contract(BorrowedTuple, ArtifactExecutionMode.KERNEL)
 
 
 if __name__ == "__main__":

@@ -29,7 +29,6 @@ class ArtifactRuntime:
     """
 
     def __init__(self, store: ArtifactStore, handle: ArtifactHandle, platform: str, run_directory: Path):
-        handle.spec.execution_capabilities.require(ArtifactExecutionMode.PROGRAM)
         if store.root != handle.cache_root:
             raise ValueError("Artifact handle and store have different cache roots")
         run_directory = run_directory.resolve()
@@ -52,7 +51,9 @@ class ArtifactRuntime:
         """
         if self._manifest is None:
             manifest = read_manifest(self.handle.directory, self.handle.key, self.handle.spec)
-            _restore_program_metadata(self.handle)
+            restored = _restore_artifact_metadata(self.handle)
+            if restored.platform != self.platform:
+                raise ValueError("Artifact metadata platform does not match the requested runtime")
             self._manifest = manifest
         return self._manifest
 
@@ -77,7 +78,7 @@ class ArtifactRuntime:
                 if result.handle is not None:
                     handle = result.handle
                     manifest = read_manifest(handle.directory, handle.key, handle.spec)
-                    _restore_program_metadata(handle)
+                    _restore_artifact_metadata(handle)
                     self.handle = handle
                     self.directory = handle.directory
                     self._manifest = manifest
@@ -97,15 +98,16 @@ class ArtifactRuntime:
             return chips
 
 
-def _restore_program_metadata(handle: ArtifactHandle) -> Any:
+def _restore_artifact_metadata(handle: ArtifactHandle) -> Any:
     """Restore the consumer contract before importing generated/runtime code."""
-    from pypto.ir.compiled_program import CompiledProgram  # noqa: PLC0415
+    from pypto.ir.compiled_artifact import CompiledArtifact  # noqa: PLC0415
     from pypto.ir.distributed_compiled_program import DistributedCompiledProgram  # noqa: PLC0415
 
-    cls = CompiledProgram if handle.spec.build_kind is BuildKind.SINGLE_CHIP else DistributedCompiledProgram
+    cls = CompiledArtifact if handle.spec.build_kind is BuildKind.SINGLE_CHIP else DistributedCompiledProgram
     compiled = cls.from_dir(handle.directory)
     if compiled.execution_capabilities != handle.spec.execution_capabilities:
         raise ValueError("Artifact manifest capabilities do not match compiled metadata")
+    compiled.execution_capabilities.require(handle.key.contract)
     return compiled
 
 
@@ -116,30 +118,35 @@ def bind_artifact(compiled: Any, store: ArtifactStore, handle: ArtifactHandle, r
     The caller owns matching the compiled program's input snapshot to the key.
     All attached metadata must be recoverable and match the persisted platform.
     """
+    from pypto.ir.compiled_artifact import CompiledArtifact  # noqa: PLC0415
     from pypto.ir.compiled_program import CompiledProgram  # noqa: PLC0415
     from pypto.ir.distributed_compiled_program import DistributedCompiledProgram  # noqa: PLC0415
 
-    if not isinstance(compiled, CompiledProgram | DistributedCompiledProgram):
+    if not isinstance(compiled, CompiledArtifact | CompiledProgram | DistributedCompiledProgram):
         raise TypeError(f"Unsupported artifact-backed program: {type(compiled).__name__}")
     runtime = ArtifactRuntime(store, handle, compiled.platform, run_directory)
     manifest = read_manifest(handle.directory, handle.key, handle.spec)
-    restored = _restore_program_metadata(handle)
+    restored = _restore_artifact_metadata(handle)
     if compiled.execution_capabilities != restored.execution_capabilities:
         raise ValueError("Artifact capabilities do not match the compiled program")
+    owner = compiled._artifact if isinstance(compiled, CompiledProgram) else compiled
+    if isinstance(owner, CompiledArtifact) and owner.metadata != restored.metadata:
+        raise ValueError("Artifact metadata does not match the compiled signature")
     _attach(compiled, runtime, restored.platform)
     runtime._manifest = manifest
 
 
 def _attach(compiled: Any, runtime: ArtifactRuntime, persisted_platform: str) -> None:
     """Bind after the caller has validated the payload and restored its metadata."""
+    from pypto.ir.compiled_artifact import CompiledArtifact  # noqa: PLC0415
     from pypto.ir.compiled_program import CompiledProgram  # noqa: PLC0415
     from pypto.ir.distributed_compiled_program import DistributedCompiledProgram  # noqa: PLC0415
 
     handle = runtime.handle
     if isinstance(compiled, DistributedCompiledProgram):
         expected = BuildKind.DISTRIBUTED
-    elif isinstance(compiled, CompiledProgram):
-        if compiled.orchestration_names:
+    elif isinstance(compiled, CompiledArtifact | CompiledProgram):
+        if isinstance(compiled, CompiledProgram) and compiled.orchestration_names:
             raise ValueError("Persist individual single-chip builds instead of a multi-orchestration parent")
         if compiled._chip_callable is not None:
             raise ValueError("Attach an artifact before loading or registering the compiled program")
@@ -150,12 +157,16 @@ def _attach(compiled: Any, runtime: ArtifactRuntime, persisted_platform: str) ->
         raise ValueError("Artifact manifest capabilities do not match compiled metadata")
     if handle.spec.build_kind is not expected or persisted_platform != compiled.platform:
         raise ValueError("Artifact build kind/platform does not match the compiled program")
-    if vars(compiled).get("_artifact_runtime") is not None:
+    owner = compiled._artifact if isinstance(compiled, CompiledProgram) else compiled
+    if owner._artifact_runtime is not None:
         raise ValueError("Compiled program already has an artifact runtime")
     # This is the only rebind. Later promotion retains this immutable source
     # directory and changes only the runtime's binary handle, never object hashes.
-    compiled._output_dir = handle.directory
-    compiled._artifact_runtime = runtime
+    if isinstance(owner, CompiledArtifact):
+        owner.output_dir = handle.directory
+    else:
+        owner._output_dir = handle.directory
+    owner._artifact_runtime = runtime
 
 
 def restore_artifact(
@@ -164,6 +175,7 @@ def restore_artifact(
     run_directory: Path,
     *,
     _validated_manifest: dict[str, Any] | None = None,
+    consumer: ArtifactExecutionMode = ArtifactExecutionMode.PROGRAM,
 ) -> Any:
     """Restore metadata without IR, and attach the explicit artifact loading policy."""
     manifest = (
@@ -171,10 +183,22 @@ def restore_artifact(
         if _validated_manifest is None
         else _validated_manifest
     )
-    compiled = _restore_program_metadata(handle)
+    compiled = _restore_artifact_metadata(handle)
+    compiled.execution_capabilities.require(consumer)
     runtime = ArtifactRuntime(store, handle, compiled.platform, run_directory)
     runtime._manifest = manifest
     _attach(compiled, runtime, compiled.platform)
+    if handle.spec.build_kind is BuildKind.SINGLE_CHIP and consumer is ArtifactExecutionMode.PROGRAM:
+        from pypto.ir.compiled_program import CompiledProgram  # noqa: PLC0415
+
+        return CompiledProgram(
+            None,
+            str(compiled.output_dir),
+            backend_type=compiled.metadata.backend_type,
+            platform=compiled.platform,
+            _artifact=compiled,
+            _sub_chip_names=[],
+        )
     return compiled
 
 
@@ -182,5 +206,6 @@ def runtime_output_directory(compiled: Any) -> Path:
     """Return writable run storage without changing the immutable artifact root."""
     # vars(), not getattr: read the instance dict directly so a __getattr__/property
     # on the compiled object cannot interpose.
-    runtime: Any = cast("dict[str, Any]", vars(compiled)).get("_artifact_runtime")
+    owner = cast("dict[str, Any]", vars(compiled)).get("_artifact", compiled)
+    runtime: Any = cast("dict[str, Any]", vars(owner)).get("_artifact_runtime")
     return compiled.output_dir if runtime is None else runtime.run_directory

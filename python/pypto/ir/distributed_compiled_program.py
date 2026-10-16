@@ -36,28 +36,30 @@ from pypto.backend import BackendType
 from pypto.pypto_core.ir import ParamDirection, Program, Role, level_to_linqu_level
 from pypto.runtime.device_tensor import DeviceTensor, StackedDeviceTensor
 
-from .compiled_program import (
+from ._artifact_metadata import (
     _DISTRIBUTED_META_FILENAME,
+    _drop_foreign_build_markers,
+    _load_meta,
+    _meta_error,
+    _remove_meta,
+    _write_meta_atomically,
+)
+from .compiled_program import (
     CallArg,
     _default_platform,
-    _drop_foreign_build_markers,
     _extract_func_param_infos,
     _extract_param_infos,
     _is_int_list,
-    _load_meta,
-    _meta_error,
     _param_info_to_dict,
     _ParamInfo,
     _reload_platform,
-    _remove_meta,
     _to_torch_dtype,
     _write_debug_runner,
-    _write_meta_atomically,
 )
 from .param_info import bind_complete_args
 
 # The sidecar filename itself lives beside its L2 counterpart in
-# ``compiled_program`` (both feed the build-kind marker table there) and is
+# ``_artifact_metadata`` (both feed the build-kind marker table there) and is
 # re-exported here, where the rest of the L3 metadata contract lives. Bump
 # ``_META_SCHEMA`` on any incompatible format change.
 _META_SCHEMA = 3
