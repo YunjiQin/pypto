@@ -33,7 +33,9 @@
 
 namespace {
 
-static constexpr int64_t kTileCount = 256;
+// Budget each buffer in bytes so wider dtypes also use only 64 KiB of UB in total.
+static constexpr int64_t kTileBytes = 32 * 1024;
+static constexpr int64_t kTileCount = kTileBytes / sizeof({{dtype_cpp}});
 
 // Counts protocol: a peer PULL plus a TWO-ROUND credit barrier.
 // Every rank stages its own per-destination send vector into its OWN
@@ -225,10 +227,13 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
   using Global = pto::GlobalTensor<{{dtype_cpp}}, ShapeDyn, StrideDyn, pto::Layout::ND>;
   using TileData = pto::Tile<pto::TileType::Vec, {{dtype_cpp}}, 1, kTileCount, pto::BLayout::RowMajor, -1, -1>;
 
-  // Staging tile width is kTileCount; TPUT_IMPL chunks larger payloads against
-  // GetValidCol(), so one TPUT per destination is enough (RFC #2521 K1).
+  // Separate ping/pong buffers overlap the next load with the previous store.
+  // Valid columns below cap small payloads and tails; TPUT uses a single
+  // transfer when the payload fits, without copying unused buffer capacity.
   TileData send_tile(1, kTileCount);
+  TileData send_tile_pong(1, kTileCount);
   TASSIGN(send_tile, 0x0);
+  TASSIGN(send_tile_pong, kTileBytes);
 
   // ==================================================================
   // Phase 1 - Barrier A: all counts staged AND everyone done consuming the
@@ -380,6 +385,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
       // [end - begin] block internally against the staging tile.
       int64_t block_numel = end - begin;
       send_tile.ColMaskInternal = static_cast<int>(block_numel <= kTileCount ? block_numel : kTileCount);
+      send_tile_pong.ColMaskInternal = send_tile.ColMaskInternal;
 
       ShapeDyn shape(1, 1, 1, 1, block_numel);
       StrideDyn stride(block_numel, block_numel, block_numel, block_numel, 1);
@@ -387,7 +393,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
       Global dst_g(remote_block, shape, stride);
 
       pipe_barrier(PIPE_ALL);
-      pto::comm::TPUT(dst_g, src_g, send_tile);
+      pto::comm::TPUT(dst_g, src_g, send_tile, send_tile_pong);
       pipe_barrier(PIPE_ALL);
     }
   } else {
@@ -408,6 +414,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
       int64_t block_numel = rows64 * row_numel;
       if (block_numel > 0) {
         send_tile.ColMaskInternal = static_cast<int>(block_numel <= kTileCount ? block_numel : kTileCount);
+        send_tile_pong.ColMaskInternal = send_tile.ColMaskInternal;
 
         ShapeDyn shape(1, 1, 1, 1, block_numel);
         StrideDyn stride(block_numel, block_numel, block_numel, block_numel, 1);
@@ -415,7 +422,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
         Global dst_g(remote_block, shape, stride);
 
         pipe_barrier(PIPE_ALL);
-        pto::comm::TPUT(dst_g, src_g, send_tile);
+        pto::comm::TPUT(dst_g, src_g, send_tile, send_tile_pong);
         pipe_barrier(PIPE_ALL);
       }
     }

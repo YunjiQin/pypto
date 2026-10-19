@@ -440,6 +440,11 @@ InCore 路径是一个 `pld.tile.put`，其传输形状为运行时计数，通�
 launched_core_num=B active_lanes=min(B, stride) lanes_per_peer=K`（`B < NR` 的 stride 模式下为 `0`）以及 rank 数，位于默认日志阈值——
 因此启动宽度可直接从设备日志读出，而无需从数据通路上推断。
 
+HOST/CHIP 共用的 builtin 在每个 AIV 上使用两个 32 KiB UB 暂存缓冲区
+（共 64 KiB，与载荷 dtype 无关）。大传输通过 TPUT 双缓冲（ping-pong）
+重叠下一块的读取与上一块的写出。能放入单个缓冲区的小传输走单次搬运路径；
+两个缓冲区的有效列数都受实际载荷或尾块长度限制，不会传输未使用的容量。
+
 已准入的 block 会**划分工作**（RFC #2521 K3）：
 
 - `B >= NR` —— peer × length：每个 peer 有 `K = B / NR` 个 lane，block `idx` 拥有

@@ -514,6 +514,13 @@ launched_core_num=B active_lanes=min(B, stride) lanes_per_peer=K` (`0` in the
 the launch width is observable from
 the device log alone instead of being inferred from the data path.
 
+The shared HOST/CHIP builtin uses two 32-KiB UB staging buffers per AIV
+(64 KiB total, independent of payload dtype). Large transfers use TPUT
+ping-pong buffering to overlap the next chunk's load with the previous
+chunk's store. Small transfers that fit in one buffer take the single-transfer
+path; valid columns limit both buffers to the actual payload or tail extent,
+so unused capacity is never transferred.
+
 The admitted blocks **partition the work** (RFC #2521 K3):
 
 - `B >= NR` — peer × length: `K = B / NR` lanes per peer, block `idx` owns

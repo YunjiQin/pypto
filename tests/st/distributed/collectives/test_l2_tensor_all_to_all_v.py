@@ -66,6 +66,7 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 import pytest
 import torch
+from pypto import DataType
 from pypto.ir import DistributedConfig
 from pypto.runtime import RunConfig
 
@@ -87,7 +88,9 @@ def _admitted_blocks(n_ranks: int, core_num: int) -> int:
 _CORE_NUMS = (1, 2, 4)
 
 
-def _build_l2_all_to_all_v_program(n_ranks: int, max_recv: int, core_num: int = 1):
+def _build_l2_all_to_all_v_program(
+    n_ranks: int, max_recv: int, core_num: int = 1, *, payload_dtype: DataType = pl.FP32
+):
     """Build an N-rank CHIP-pipeline variable-size all-to-all program.
 
     Signal/counts shapes are per-rank-count, so the program is built by a
@@ -102,12 +105,12 @@ def _build_l2_all_to_all_v_program(n_ranks: int, max_recv: int, core_num: int = 
 
     @pl.jit.incore
     def stage_step(
-        inp: pl.Tensor[[total, SIZE], pl.FP32],
+        inp: pl.Tensor[[total, SIZE], payload_dtype],
         counts_row: pl.Tensor[[nr, 1], pl.INT32],
-        stage: pl.InOut[pld.DistributedTensor[[total, SIZE], pl.FP32]],
+        stage: pl.InOut[pld.DistributedTensor[[total, SIZE], payload_dtype]],
         counts: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
     ) -> tuple[
-        pld.DistributedTensor[[total, SIZE], pl.FP32],
+        pld.DistributedTensor[[total, SIZE], payload_dtype],
         pld.DistributedTensor[[nr, 1], pl.INT32],
     ]:
         """Publish this rank's payload and send counts into their windows.
@@ -129,13 +132,13 @@ def _build_l2_all_to_all_v_program(n_ranks: int, max_recv: int, core_num: int = 
 
     @pl.jit.incore
     def consume_step(
-        data: pl.InOut[pld.DistributedTensor[[total, SIZE], pl.FP32]],
+        data: pl.InOut[pld.DistributedTensor[[total, SIZE], payload_dtype]],
         # Written by the collective (pulled from each source's send_counts
         # window); recv_counts[src, 0] is the count the consumer reads.
         recv_counts: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
-        out: pl.Out[pl.Tensor[[total, SIZE], pl.FP32]],
+        out: pl.Out[pl.Tensor[[total, SIZE], payload_dtype]],
         recv_out: pl.Out[pl.Tensor[[nr, 1], pl.INT32]],
-    ) -> tuple[pl.Tensor[[total, SIZE], pl.FP32], pl.Tensor[[nr, 1], pl.INT32]]:
+    ) -> tuple[pl.Tensor[[total, SIZE], payload_dtype], pl.Tensor[[nr, 1], pl.INT32]]:
         """Read back each source's block, bounded by its published count.
 
         Both loops target ``out`` and their row ranges partition each
@@ -163,16 +166,16 @@ def _build_l2_all_to_all_v_program(n_ranks: int, max_recv: int, core_num: int = 
 
     @pl.jit
     def chip_pipeline(
-        inp: pl.Tensor[[total, SIZE], pl.FP32],
+        inp: pl.Tensor[[total, SIZE], payload_dtype],
         counts_row: pl.Tensor[[nr, 1], pl.INT32],
-        out: pl.Out[pl.Tensor[[total, SIZE], pl.FP32]],
+        out: pl.Out[pl.Tensor[[total, SIZE], payload_dtype]],
         recv_out: pl.Out[pl.Tensor[[nr, 1], pl.INT32]],
-        stage: pl.InOut[pld.DistributedTensor[[total, SIZE], pl.FP32]],
-        data: pl.InOut[pld.DistributedTensor[[total, SIZE], pl.FP32]],
+        stage: pl.InOut[pld.DistributedTensor[[total, SIZE], payload_dtype]],
+        data: pl.InOut[pld.DistributedTensor[[total, SIZE], payload_dtype]],
         signal: pl.InOut[pld.DistributedTensor[[nr, stride], pl.INT32]],
         counts: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
         recv: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
-    ) -> tuple[pl.Tensor[[total, SIZE], pl.FP32], pl.Tensor[[nr, 1], pl.INT32]]:
+    ) -> tuple[pl.Tensor[[total, SIZE], payload_dtype], pl.Tensor[[nr, 1], pl.INT32]]:
         """One per-rank pipeline: stage -> collective -> consume.
 
         The three tasks are ordered by real TensorMap dependencies —
@@ -186,14 +189,14 @@ def _build_l2_all_to_all_v_program(n_ranks: int, max_recv: int, core_num: int = 
 
     @pl.jit.host
     def host_orch(
-        inputs: pl.Tensor[[nr, total, SIZE], pl.FP32],
+        inputs: pl.Tensor[[nr, total, SIZE], payload_dtype],
         send_counts: pl.Tensor[[nr, nr, 1], pl.INT32],
-        outputs: pl.Out[pl.Tensor[[nr, total, SIZE], pl.FP32]],
+        outputs: pl.Out[pl.Tensor[[nr, total, SIZE], payload_dtype]],
         recv_outputs: pl.Out[pl.Tensor[[nr, nr, 1], pl.INT32]],
-    ) -> tuple[pl.Tensor[[nr, total, SIZE], pl.FP32], pl.Tensor[[nr, nr, 1], pl.INT32]]:
+    ) -> tuple[pl.Tensor[[nr, total, SIZE], payload_dtype], pl.Tensor[[nr, nr, 1], pl.INT32]]:
         """Allocate the five windows once, dispatch one pipeline per rank."""
-        stage_buf = pld.alloc_window_buffer(total * SIZE * pl.FP32.get_byte())
-        data_buf = pld.alloc_window_buffer(total * SIZE * pl.FP32.get_byte())
+        stage_buf = pld.alloc_window_buffer(total * SIZE * payload_dtype.get_byte())
+        data_buf = pld.alloc_window_buffer(total * SIZE * payload_dtype.get_byte())
         signal_buf = pld.alloc_window_buffer(nr * stride * pl.INT32.get_byte())
         # Peers pull ONE word per rank from this window (scalar ld_dev read),
         # so the [NR, 1] INT32 vector is the whole requirement — no fixed-
@@ -202,8 +205,8 @@ def _build_l2_all_to_all_v_program(n_ranks: int, max_recv: int, core_num: int = 
         recv_buf = pld.alloc_window_buffer(nr * pl.INT32.get_byte())
 
         for r in pl.range(pld.world_size()):
-            stage = pld.window(stage_buf, [total, SIZE], dtype=pl.FP32)
-            data = pld.window(data_buf, [total, SIZE], dtype=pl.FP32)
+            stage = pld.window(stage_buf, [total, SIZE], dtype=payload_dtype)
+            data = pld.window(data_buf, [total, SIZE], dtype=payload_dtype)
             sig = pld.window(signal_buf, [nr, stride], dtype=pl.INT32)
             counts = pld.window(counts_buf, [nr, 1], dtype=pl.INT32)
             recv = pld.window(recv_buf, [nr, 1], dtype=pl.INT32)
@@ -447,6 +450,55 @@ class TestL2TensorAllToAllVSkew:
                         f"not zero — the CHIP transfer is not bounded by the runtime count "
                         f"(got {got_row[:4].tolist()}...)"
                     )
+
+
+@pytest.mark.parametrize("dtype_name", ["int8", "fp32"])
+@pytest.mark.parametrize("core_num", [1, 4], ids=["multi-peer", "split-peer"])
+@pytest.mark.parametrize(
+    "peer_bytes",
+    [8 * 1024, 64 * 1024, 192 * 1024 + 512],
+    ids=["small", "tile-boundary", "pipeline-tail"],
+)
+def test_l2_all_to_all_v_staging_chunks(test_config, device_ids, dtype_name, core_num, peer_bytes):
+    """Check byte-sized staging, ping/pong reuse, and partial final chunks."""
+    nr = 2
+    if len(device_ids) < nr:
+        pytest.skip(f"Staging regression needs {nr} devices, got {device_ids}")
+    payload_dtype, torch_dtype = {
+        "int8": (pl.INT8, torch.int8),
+        "fp32": (pl.FP32, torch.float32),
+    }[dtype_name]
+    mr = peer_bytes // (SIZE * payload_dtype.get_byte())
+    total = nr * mr
+    pattern = torch.arange(nr * total * SIZE, dtype=torch.int32).reshape(nr, total, SIZE)
+    inputs = torch.zeros_like(pattern, dtype=torch_dtype).share_memory_()
+    # Keep rank 0 -> rank 1 full to test an exact buffer boundary remotely;
+    # asymmetric counts on the other paths exercise tails and count routing.
+    counts = torch.tensor([[[mr - 1], [mr]], [[mr - 2], [mr - 3]]], dtype=torch.int32).share_memory_()
+    outputs = torch.zeros_like(inputs).share_memory_()
+    recv = torch.zeros_like(counts).share_memory_()
+    program = _build_l2_all_to_all_v_program(nr, mr, core_num, payload_dtype=payload_dtype)
+    config = RunConfig(
+        platform=test_config.platform,
+        distributed_config=DistributedConfig(device_ids=device_ids[:nr], num_sub_workers=0),
+    )
+    compiled = program.compile(inputs, counts, outputs, recv, config=config)
+    # Large cases span multiple ping/pong turns plus a partial final chunk,
+    # in both the multi-peer-per-core and the two-lanes-per-peer branches.
+    # Different payloads on reused windows expose stale or undrained buffers.
+    with compiled.prepare(config=config, persistent=True, reset_persistent_windows=False) as worker:
+        for iteration in range(3):
+            inputs.copy_(((pattern + iteration * 17) % 251 - 125).to(torch_dtype))
+            expected = torch.zeros_like(outputs)
+            for dest in range(nr):
+                for src in range(nr):
+                    rows = int(counts[src, dest, 0])
+                    expected[dest, src * mr : src * mr + rows] = inputs[src, dest * mr : dest * mr + rows]
+            worker.run(compiled, inputs, counts, outputs, recv, config=config)
+            assert torch.equal(outputs, expected), (
+                f"Payload or untouched tail differs at iteration {iteration}"
+            )
+            assert torch.equal(recv, counts.transpose(0, 1)), f"Counts differ at iteration {iteration}"
 
 
 if __name__ == "__main__":
