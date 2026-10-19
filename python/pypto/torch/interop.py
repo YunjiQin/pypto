@@ -269,11 +269,8 @@ class CallSignature:
         caller_name: str = "torch call",
         platform: str | None = None,
     ) -> None:
-        """Copy stable parameter metadata and validate declared return aliases."""
-        self._params = tuple(
-            ParamInfo(p.name, p.direction, list(p.shape) if p.shape is not None else None, p.dtype, p.layout)
-            for p in params
-        )
+        """Retain immutable parameter metadata and validate declared return aliases."""
+        self._params = tuple(params)
         self._caller_name = caller_name
         self._platform = platform
         self._return_aliases = tuple(return_aliases)
@@ -281,8 +278,6 @@ class CallSignature:
         for p, dtype in zip(self._params, self._torch_dtypes, strict=True):
             if p.shape is not None and dtype is None:
                 raise TypeError(f"Parameter {p.name!r} has unsupported tensor dtype {p.dtype}")
-            if p.shape is None and str(p.dtype) not in _DATATYPE_TO_CTYPE:
-                raise TypeError(f"Parameter {p.name!r} has unsupported scalar dtype {p.dtype}")
         for index in self._return_aliases:
             if (
                 type(index) is not int

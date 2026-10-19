@@ -176,7 +176,7 @@ def test_invalid_return_aliases(alias):
 
 @pytest.mark.parametrize("name", ["", "x, Tensor y", "foo.bar", "ns::op", "1x", "class"])
 def test_invalid_names_cannot_inject_schema(name):
-    with pytest.raises(ValueError, match="identifier"):
+    with pytest.raises(ValueError, match="nonempty name" if not name else "identifier"):
         registration.RegistrationSignature([_param(name)])
     with pytest.raises(ValueError, match="identifier"):
         registration.RegistrationSignature([_param()]).schema(name)
@@ -217,11 +217,10 @@ def test_invalid_scalar_metadata(dtype, value, error):
 
 
 def test_signature_owns_copied_metadata():
-    param = _param(direction=ParamDirection.InOut)
+    shape = [-1, 3]
+    param = ParamInfo("x", ParamDirection.InOut, shape, DataType.FP32)
     signature = registration.RegistrationSignature([param], return_aliases=(0,))
-    assert param.shape is not None
-    param.shape[1] = 8
-    param.name = "changed"
+    shape[1] = 8
     assert " x)" in signature.schema("op")
     value = torch.empty((2, 3), device="meta")
     assert signature.fake(value) is value

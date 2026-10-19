@@ -17,6 +17,7 @@ import pathlib
 import sys
 import types
 import warnings
+from dataclasses import FrozenInstanceError, replace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -25,6 +26,7 @@ import torch
 from pypto import DataType, backend, ir
 from pypto._artifact_contract import ArtifactExecutionMode, ExecutionCapabilities
 from pypto.backend import BackendType
+from pypto.ir import param_info
 from pypto.ir.compiled_program import (
     _COMPILED_META_FILENAME,
     _COMPILED_META_SCHEMA,
@@ -269,12 +271,12 @@ class TestExtractParamInfos:
     def test_shape_extraction(self):
         prog = _make_program_with_orchestration()
         infos, _, _ = _extract_param_infos(prog)
-        assert infos[0].shape == [128, 128]
+        assert infos[0].shape == (128, 128)
         assert infos[0].dtype == DataType.FP32
 
     def test_fp4_metadata_uses_torch_x2_carrier_shape(self):
         infos, out_idx, _ = _extract_param_infos(_make_fp4_output_program())
-        assert [info.shape for info in infos] == [[8, 8], [8, 8]]
+        assert [info.shape for info in infos] == [(8, 8), (8, 8)]
         assert all(info.dtype == DataType.FP4 for info in infos)
         assert out_idx == [1]
 
@@ -1258,7 +1260,7 @@ class TestCompiledMetaAndFromDir:
             infos, _, _ = cp._get_metadata()
             return [p.shape for p in infos]
 
-        assert _shapes(live) == [[8, 8], [8, 8]]
+        assert _shapes(live) == [(8, 8), (8, 8)]
         assert _shapes(reloaded) == _shapes(live)
 
     def test_from_dir_missing_meta_raises(self, tmp_path):
@@ -1830,3 +1832,55 @@ def test_reload_platform_warns_but_explicit_mode_and_metadata_are_silent(tmp_pat
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"name": ""},
+        {"direction": "In"},
+        {"dtype": "fp32"},
+        {"shape": []},
+        {"shape": [1] * 6},
+        {"shape": [0]},
+        {"shape": [-2]},
+        {"shape": [True]},
+        {"shape": [2**32]},
+        {"layout": "unknown"},
+        {"dtype": DataType.TASK_ID},
+        {"shape": None, "layout": "ND"},
+        {"shape": None, "direction": ir.ParamDirection.Out},
+        {"shape": None, "dtype": DataType.FP8E4M3FN},
+    ],
+)
+def test_param_info_rejects_invalid_declarations_at_construction(changes):
+    param = _ParamInfo("x", ir.ParamDirection.In, [8], DataType.FP32)
+    with pytest.raises(ValueError):
+        replace(param, **changes)
+
+
+def test_param_info_owns_immutable_shape_and_serializes_json_arrays():
+    shape = [-1, 2**32 - 1]
+    param = _ParamInfo("x", ir.ParamDirection.In, shape, DataType.FP32)
+    shape[0] = 7
+    assert param.shape == (-1, 2**32 - 1)
+    with pytest.raises(FrozenInstanceError):
+        setattr(param, "name", "changed")
+    assert isinstance(param.shape, tuple)
+    record = _param_info_to_dict(param)
+    assert record["shape"] == [-1, 2**32 - 1]
+    record["shape"][0] = 8
+    assert param.shape[0] == -1
+    assert _param_info_from_dict(_param_info_to_dict(param)) == param
+
+
+@pytest.mark.parametrize("layout", [None, "ND", "DN", "NZ", "MX_A_ZZ", "MX_B_NN"])
+def test_param_info_layout_does_not_require_lowered_rank_five(layout):
+    param = _ParamInfo("x", ir.ParamDirection.In, [16, 32], DataType.FP8E8M0, layout)
+    assert _param_info_from_dict(_param_info_to_dict(param)) == param
+
+
+def test_param_info_tensor_dtype_independent_of_torch_version(monkeypatch):
+    monkeypatch.setattr(param_info, "_DATATYPE_TO_TORCH", {})
+    param = _ParamInfo("x", ir.ParamDirection.In, [8], DataType.FP8E8M0)
+    assert _param_info_from_dict(_param_info_to_dict(param)) == param

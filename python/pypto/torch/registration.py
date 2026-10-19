@@ -82,11 +82,8 @@ class RegistrationSignature:
     """
 
     def __init__(self, params: Sequence[ParamInfo], *, return_aliases: Sequence[int] = ()) -> None:
-        """Copy the signature and reject contracts the helper cannot express."""
-        self._params = tuple(
-            ParamInfo(p.name, p.direction, list(p.shape) if p.shape is not None else None, p.dtype)
-            for p in params
-        )
+        """Retain immutable parameters and reject contracts the helper cannot express."""
+        self._params = tuple(params)
         self._return_aliases = tuple(return_aliases)
         names: set[str] = set()
         tensor_count = 0
@@ -95,18 +92,12 @@ class RegistrationSignature:
             if info.name in names:
                 raise ValueError(f"Duplicate parameter name {info.name!r}")
             names.add(info.name)
-            if info.direction not in (ParamDirection.In, ParamDirection.Out, ParamDirection.InOut):
-                raise ValueError(f"Parameter {info.name!r} has unsupported direction {info.direction}")
             if info.shape is None:
-                if info.direction != ParamDirection.In:
-                    raise ValueError(f"Scalar parameter {info.name!r} must have direction In")
                 _scalar_schema(info)
             else:
                 tensor_count += 1
                 if _to_torch_dtype(info.dtype) is None:
                     raise TypeError(f"Parameter {info.name!r} has unsupported tensor dtype {info.dtype}")
-                if any(type(dim) is not int or dim < -1 for dim in info.shape):
-                    raise ValueError(f"Parameter {info.name!r} requires nonnegative dimensions or -1")
         if not tensor_count:
             raise ValueError("Dispatcher metadata registration requires at least one tensor parameter")
         for index in self._return_aliases:

@@ -2,7 +2,7 @@
 
 The internal torch adapter describes borrowed NPU arguments for a future kernel
 executor. It does not add a public kernel execution entry point. Existing JIT,
-compiled-program and Worker calls keep their current behavior.
+compiled-program and Worker calls share the parameter contract described below.
 
 ## Shared signature and L2 ABI
 
@@ -17,9 +17,15 @@ The descriptor records the target and the **compilation SDK revision**, supplied
 by the build context. `from_record()` rejects noncanonical records, and
 `require_compatible()` checks the entire signature, return mapping, target and SDK.
 These operations do not import an optional runtime or initialize a device.
-Kernel scalar declarations currently cover FP32, integer widths, bool and index;
-the broader program scalar map is unchanged. Descriptor dimensions are positive
-u32 extents or `-1`, with rank 1–5 and the pinned L2 pool capacities.
+`ParamInfo` is immutable and validates each declaration at construction for both
+program and kernel modes: nonempty name, direction, IR dtype, layout, and shape.
+Shapes are copied to tuples, with rank 1–5 and positive u32 extents or `-1`.
+Tensor layouts include ND, DN, NZ, MX_A_ZZ and MX_B_NN; logical NZ/MX shapes need
+not be rank 5. Scalars must be inputs without a layout and use the shared program
+ctypes dtype map, including FP16 and BF16. Tensor declaration validity does not
+depend on which dtypes the installed Torch version exposes; Torch adapters still
+check their own conversion support. JSON shapes remain arrays. `KernelABI` checks
+signature-wide constraints, including unique names, L2 pool capacities and aliases.
 
 Program submission builds address-free `TaskArgs`; Simpler materializes those
 into `ChipStorageTaskArgs`. The future Torch adapter will also submit `TaskArgs`
@@ -33,8 +39,8 @@ initialization. This stage adds no Worker initialization, registration or launch
 
 ## Call metadata and ownership
 
-[`CallSignature`](../../../../python/pypto/torch/interop.py) copies the shared
-`ir.param_info.ParamInfo` signature once. `describe_call(args)` uses
+[`CallSignature`](../../../../python/pypto/torch/interop.py) retains the shared immutable
+`ir.param_info.ParamInfo` signature. `describe_call(args)` uses
 `bind_complete_args`, so every Out/InOut parameter must be supplied before any
 framework-context query. Return aliases are tensor indices in the complete
 parameter list; an alias cannot refer to a scalar or an absent argument.
@@ -101,7 +107,7 @@ Simpler/PyPTO Worker.
 
 ## Internal schema and Fake/Meta helpers
 
-`pypto.torch.registration.RegistrationSignature` copies the same `ParamInfo` carrier
+`pypto.torch.registration.RegistrationSignature` retains the same immutable `ParamInfo` carrier
 shapes and return-slot indices. Its `schema(name)` method marks Out/InOut tensor
 arguments writable and connects each tensor return to the corresponding input
 alias set. All arguments remain required; no output allocation is inferred.

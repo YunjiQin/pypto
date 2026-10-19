@@ -16,8 +16,8 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from pypto._kernel_abi import MAX_KERNEL_RANK, MAX_KERNEL_SCALARS, MAX_KERNEL_TENSORS, KernelABI
-from pypto.ir.param_info import ParamInfo
+from pypto._kernel_abi import MAX_KERNEL_SCALARS, MAX_KERNEL_TENSORS, KernelABI
+from pypto.ir.param_info import MAX_TENSOR_RANK, ParamInfo
 from pypto.pypto_core import DataType
 from pypto.pypto_core.ir import ParamDirection
 
@@ -63,12 +63,9 @@ def test_round_trip_and_signature_snapshot(params):
     abi = contract(params)
     record = json.loads(json.dumps(abi.record()))
     KernelABI.from_record(record).require_compatible(abi)
-    params[0].shape[0] = 9
-    copied = abi.parameters[0]
-    assert copied.shape is not None
-    copied.shape[0] = 10
+    params[0] = replace(params[0], shape=[9])
     abi.record()["params"][0]["shape"][0] = 11
-    assert abi.parameters[0].shape == [8]
+    assert abi.parameters[0].shape == (8,)
     with pytest.raises(ValueError, match="does not match"):
         abi.require_compatible(contract(params))
 
@@ -136,14 +133,21 @@ def test_artifact_identity_is_checked_separately_from_capabilities(params, chang
 
 def test_scalar_contract_and_dynamic_layout(params):
     for dtype in (DataType.FP16, DataType.BF16):
-        with pytest.raises(ValueError, match="scalar"):
-            contract([replace(params[1], dtype=dtype)], return_aliases=())
-    with pytest.raises(ValueError, match="scalar"):
+        contract([replace(params[1], dtype=dtype)], return_aliases=())
+    with pytest.raises(ValueError, match="Scalar"):
         contract([replace(params[1], direction=ParamDirection.Out)], return_aliases=())
     abi = contract([replace(params[0], shape=[-1, 16], layout="NZ")], return_aliases=(0,))
     restored = KernelABI.from_record(abi.record())
     assert restored.parameters[0].layout == "NZ"
-    assert restored.parameters[0].shape == [-1, 16]
+    assert restored.parameters[0].shape == (-1, 16)
+
+
+@pytest.mark.parametrize("layout", ["MX_A_ZZ", "MX_B_NN"])
+def test_mx_kernel_signature_round_trip(params, layout):
+    param = replace(params[0], shape=[16, 32], dtype=DataType.FP8E8M0, layout=layout)
+    abi = contract([param], return_aliases=(0,))
+    KernelABI.from_record(abi.record()).require_compatible(abi)
+    assert abi.parameters[0] is param
 
 
 @pytest.mark.parametrize("scalar,limit", [(False, MAX_KERNEL_TENSORS), (True, MAX_KERNEL_SCALARS)])
@@ -163,7 +167,7 @@ def test_limits_match_actual_pinned_sdk(tmp_path):
         '#include "task_args.h"\n#include <iostream>\n'
         f"static_assert(CHIP_MAX_TENSOR_ARGS == {MAX_KERNEL_TENSORS});\n"
         f"static_assert(CHIP_MAX_SCALAR_ARGS == {MAX_KERNEL_SCALARS});\n"
-        f"static_assert(MAX_TENSOR_DIMS == {MAX_KERNEL_RANK});\n"
+        f"static_assert(MAX_TENSOR_DIMS == {MAX_TENSOR_RANK});\n"
         "static_assert(sizeof(((ChipStorageTaskArgs*)nullptr)->scalars_[0]) == 8);\n"
         "int main() { std::cout << to_u64(float(-3.5)) << ' ' << to_u64(int32_t(-7)) "
         "<< ' ' << to_u64(int8_t(-1)); }\n"

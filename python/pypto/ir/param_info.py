@@ -30,7 +30,7 @@ from typing import Any, TypeGuard, TypeVar, cast
 import torch
 
 from pypto.pypto_core import DataType
-from pypto.pypto_core.ir import ParamDirection
+from pypto.pypto_core.ir import ParamDirection, TensorLayout
 
 # IR DataType -> torch.dtype mapping.
 # Keyed by string because nanobind DataType instances are not singletons,
@@ -101,19 +101,46 @@ def _to_torch_dtype(dtype: DataType) -> torch.dtype | None:
     return _DATATYPE_TO_TORCH.get(str(dtype))
 
 
-@dataclass
+MAX_TENSOR_RANK = 5
+
+
+@dataclass(frozen=True)
 class _ParamInfo:
     """Metadata for a single orchestration function parameter."""
 
     name: str
     direction: ParamDirection
-    shape: list[int] | None  # None for scalar params
+    shape: Sequence[int] | None  # Normalized to tuple; None for scalar params
     dtype: DataType
-    # ``TensorLayout`` name ("ND", "NZ", ...) for a tensor param, None for a
-    # scalar. An NZ param's ``shape`` is the *blocked* rank-5 one the backend
-    # addresses, not the logical shape its caller allocates, so a consumer
-    # comparing shapes has to block the caller's shape first (``block_nz_shape``).
+    # Layout describes either logical or lowered metadata; NZ/MX need not
+    # already have their blocked rank-5 shape here.
     layout: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(cast(object, self.name), str) or not self.name:
+            raise ValueError(f"Parameter requires a nonempty name, got {self.name!r}")
+        if not isinstance(cast(object, self.direction), ParamDirection):
+            raise ValueError(f"Invalid direction for parameter {self.name!r}: {self.direction!r}")
+        if not isinstance(cast(object, self.dtype), DataType) or str(self.dtype) not in _STR_TO_DATATYPE:
+            raise ValueError(f"Unsupported parameter dtype for {self.name!r}: {self.dtype!r}")
+        if self.layout is not None and self.layout not in TensorLayout.__members__:
+            raise ValueError(f"Invalid layout for parameter {self.name!r}: {self.layout!r}")
+        if self.shape is None:
+            if self.direction != ParamDirection.In:
+                raise ValueError(f"Scalar parameter {self.name!r} must have direction In")
+            if self.layout is not None or str(self.dtype) not in _DATATYPE_TO_CTYPE:
+                raise ValueError(f"Unsupported scalar parameter {self.name!r}: {self.dtype}/{self.layout}")
+        else:
+            # Metadata validity must not depend on the installed Torch version.
+            # TASK_ID is an opaque runtime handle, not tensor element data.
+            if self.dtype == DataType.TASK_ID:
+                raise ValueError(f"Unsupported tensor dtype for {self.name!r}: {self.dtype}")
+            shape = tuple(self.shape)
+            if not 1 <= len(shape) <= MAX_TENSOR_RANK or any(
+                type(dim) is not int or not (dim == -1 or 0 < dim < 2**32) for dim in shape
+            ):
+                raise ValueError(f"Parameter {self.name!r} requires rank 1..5 and positive u32/-1 dimensions")
+            object.__setattr__(self, "shape", shape)
 
 
 # Public spelling for code outside ``pypto.ir`` (the replay-script writer, and
@@ -237,7 +264,7 @@ def _param_info_to_dict(info: _ParamInfo) -> dict[str, Any]:
     return {
         "name": info.name,
         "direction": info.direction.name,
-        "shape": info.shape,
+        "shape": list(info.shape) if info.shape is not None else None,
         "dtype": str(info.dtype),
         "layout": info.layout,
     }

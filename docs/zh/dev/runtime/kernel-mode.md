@@ -1,7 +1,7 @@
 # Kernel mode 集成基础
 
 内部 torch 适配器为后续 kernel executor 描述借用的 NPU 参数，不新增公开 kernel
-执行入口。已有 JIT、编译 program 和 Worker 调用保持当前行为。
+执行入口。已有 JIT、编译 program 和 Worker 调用共用下述参数契约。
 
 ## 公共签名与 L2 ABI
 
@@ -12,9 +12,14 @@ Tensor 返回别名，支持重复别名和只读输入返回。
 
 descriptor 记录目标配置和构建上下文传入的**编译 SDK revision**。
 `from_record()` 拒绝非规范记录，`require_compatible()` 核对完整签名、返回映射、目标和
-SDK；这些操作不加载可选 runtime 或初始化设备。kernel Scalar 声明目前覆盖 FP32、
-各宽度整数、bool 和 index，不改变 program 更宽的 Scalar 映射。descriptor 的维度为正
-u32 或 `-1`，rank 为 1–5，参数池容量与固定的 L2 SDK 一致。
+SDK；这些操作不加载可选 runtime 或初始化设备。
+`ParamInfo` 不可变，program 和 kernel 在构造时共用名称非空、方向、IR dtype、layout
+和 shape 校验。shape 复制为 tuple，rank 为 1–5，维度为正 u32 或 `-1`。
+Tensor layout 支持 ND、DN、NZ、MX_A_ZZ 和 MX_B_NN；NZ/MX 的逻辑 shape 不要求
+rank 5。Scalar 只能是没有 layout 的输入，共用 program 的 ctypes dtype 映射，包含
+FP16 和 BF16。Tensor 形参合法性不依赖当前 Torch 版本的 dtype 支持，Torch 适配器
+仍检查自身的转换能力。JSON shape 保持数组格式。`KernelABI` 检查名称唯一性、L2
+参数池容量和返回别名等整个签名的约束。
 
 program 提交构造无地址的 `TaskArgs`，由 Simpler 解析为 `ChipStorageTaskArgs`。
 后续 Torch adapter 也通过公开 Worker 接口提交 `TaskArgs`，使用 `Buffer.wrap`
@@ -27,7 +32,7 @@ Runtime 能力检查将在后续接入 Torch kernel runtime 首次初始化时�
 
 ## 调用元数据与所有权
 
-[`CallSignature`](../../../../python/pypto/torch/interop.py) 一次性复制共享的
+[`CallSignature`](../../../../python/pypto/torch/interop.py) 持有共享的不可变
 `ir.param_info.ParamInfo` 签名。`describe_call(args)` 复用 `bind_complete_args`，
 所有 Out/InOut 参数必须在查询框架上下文前完整传入。返回别名（return alias）使用
 完整参数列表中的 Tensor 索引，不能指向 Scalar 或不存在的参数。
@@ -82,7 +87,7 @@ frame 使用期间，调用方不能 resize 或使借用的 storage 失效。
 
 ## 内部 schema 与 Fake/Meta 辅助
 
-`pypto.torch.registration.RegistrationSignature` 复制相同的 `ParamInfo` carrier shape
+`pypto.torch.registration.RegistrationSignature` 持有相同的不可变 `ParamInfo` carrier shape
 及返回参数索引。`schema(name)` 将 Out/InOut Tensor 标记为可写，并把每个 Tensor
 返回值关联到对应输入的别名集合（alias set）。全部参数均须传入，不推导输出分配。
 Scalar 输入映射为 dispatcher 的 `SymInt`、`float` 或 `bool`。`SymInt` 接受普通整数，

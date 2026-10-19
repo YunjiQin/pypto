@@ -23,19 +23,12 @@ from pypto.ir.param_info import (
     ParamInfo,
     _param_info_from_dict,
     _param_info_to_dict,
-    _to_torch_dtype,
     bind_complete_args,
 )
-from pypto.pypto_core.ir import ParamDirection
 
 # Shared L2 limits, checked against the pinned SDK by the host-only ABI UT.
 MAX_KERNEL_TENSORS = 256
 MAX_KERNEL_SCALARS = 128
-MAX_KERNEL_RANK = 5
-# These are supported orchestration scalar types, not a bit-encoding table.
-_KERNEL_SCALARS = frozenset(
-    {"fp32", "int8", "uint8", "int16", "uint16", "int32", "uint32", "int64", "uint64", "bool", "index"}
-)
 _Arg = TypeVar("_Arg")
 
 
@@ -61,38 +54,12 @@ class KernelABI:
             raise ValueError(f"Unsupported kernel runtime {runtime!r}")
         if type(sdk_revision) is not str or re.fullmatch(r"[0-9a-f]{40}", sdk_revision) is None:
             raise ValueError(f"Kernel SDK revision must be a full git revision, got {sdk_revision!r}")
-        self._params = tuple(
-            ParamInfo(p.name, p.direction, list(p.shape) if p.shape is not None else None, p.dtype, p.layout)
-            for p in params
-        )
+        self._params = tuple(params)
         self._platform, self._runtime, self._sdk_revision = platform, runtime, sdk_revision
         self._return_aliases = tuple(return_aliases)
         names = [p.name for p in self._params]
-        if any(type(name) is not str or not name for name in names) or len(set(names)) != len(names):
-            raise ValueError("Kernel parameter names must be nonempty and unique")
-        for p in self._params:
-            if p.direction not in (ParamDirection.In, ParamDirection.Out, ParamDirection.InOut):
-                raise ValueError(f"Invalid direction for kernel parameter {p.name!r}: {p.direction}")
-            if p.shape is None:
-                if (
-                    p.direction != ParamDirection.In
-                    or str(p.dtype) not in _KERNEL_SCALARS
-                    or p.layout is not None
-                ):
-                    raise ValueError(
-                        f"Unsupported kernel scalar {p.name!r}: {p.dtype}/{p.direction}/{p.layout}"
-                    )
-            else:
-                if _to_torch_dtype(p.dtype) is None:
-                    raise ValueError(f"Unsupported kernel tensor dtype {p.dtype} for {p.name!r}")
-                if p.layout not in (None, "ND", "DN", "NZ"):
-                    raise ValueError(f"Unsupported kernel layout {p.layout!r} for {p.name!r}")
-                if not 1 <= len(p.shape) <= MAX_KERNEL_RANK or any(
-                    type(dim) is not int or not (dim == -1 or 0 < dim < 2**32) for dim in p.shape
-                ):
-                    raise ValueError(
-                        f"Kernel parameter {p.name!r} requires rank 1..5 and positive u32/-1 dimensions"
-                    )
+        if len(set(names)) != len(names):
+            raise ValueError("Kernel parameter names must be unique")
         if len(self.tensor_indices) > MAX_KERNEL_TENSORS or len(self.scalar_indices) > MAX_KERNEL_SCALARS:
             raise ValueError("Kernel signature exceeds L2 argument capacity")
         for index in self._return_aliases:
@@ -105,11 +72,8 @@ class KernelABI:
 
     @property
     def parameters(self) -> tuple[ParamInfo, ...]:
-        """Return copies so callers cannot mutate the descriptor's signature."""
-        return tuple(
-            ParamInfo(p.name, p.direction, list(p.shape) if p.shape is not None else None, p.dtype, p.layout)
-            for p in self._params
-        )
+        """Return the immutable shared parameter records."""
+        return self._params
 
     @property
     def tensor_indices(self) -> tuple[int, ...]:
@@ -138,10 +102,7 @@ class KernelABI:
             "platform": self._platform,
             "runtime": self._runtime,
             "sdk_revision": self._sdk_revision,
-            "params": [
-                _param_info_to_dict(p) | {"shape": list(p.shape) if p.shape is not None else None}
-                for p in self._params
-            ],
+            "params": [_param_info_to_dict(p) for p in self._params],
             "return_aliases": list(self._return_aliases),
         }
 
