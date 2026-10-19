@@ -486,6 +486,13 @@ variant 混入。暂不支持在 `host_orch` 的 `for`/`while` 循环内调用�
 信号本身的性质：信用屏障可跨顺序调用复用——与 `LowerCompositeOps` 在 InCore
 路径上强制的限制相同。
 
+在 A5 上，Simpler 提供 URMA workspace 时，HOST 和 CHIP builtin 使用
+`TPUT_ASYNC<URMA>` 发送远端 payload。workspace 必须为 `PER_PEER`，每个 peer
+使用一个队列，`core_num` 不得超过 rank 数。远端地址由已注册的 peer 内存基址加窗口内
+偏移得到。发送方等待 CQ 完成后才发布完成屏障；会话初始化、内存注册信息或完成检查
+失败时，即使 release 构建也会触发 trap。本地复制、其他架构以及没有 URMA workspace
+的执行保持 MTE 路径。counts 与信用屏障继续使用现有协议。
+
 ### `pld.tensor.allreduce`
 
 ```text

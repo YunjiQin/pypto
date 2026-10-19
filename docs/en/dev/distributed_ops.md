@@ -571,6 +571,15 @@ it up front; the same restriction `LowerCompositeOps` enforces on the InCore
 path), not a property of the signal: the credit barrier is reusable across
 sequential calls.
 
+On A5, the HOST and CHIP builtins use `TPUT_ASYNC<URMA>` for remote payloads
+when Simpler supplies an URMA workspace. The workspace must use `PER_PEER`,
+with one queue per peer; `core_num` must not exceed the rank count. Remote
+addresses use the registered peer memory base plus the window-relative offset.
+Each sender waits for CQ completion before publishing the completion barrier;
+session, registration, or completion failures trap even in release builds.
+Self-copy, other architectures, and execution without an URMA workspace retain
+the MTE path. Counts and credit barriers keep their existing protocol.
+
 ### `pld.tensor.allreduce`
 
 ```text

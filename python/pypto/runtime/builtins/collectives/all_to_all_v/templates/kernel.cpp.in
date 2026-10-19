@@ -67,6 +67,53 @@ AICORE inline __gm__ T *CommRemotePtr(__gm__ CommContext *ctx, __gm__ T *local_p
   return reinterpret_cast<__gm__ T *>(ctx->windowsIn[pe] + offset);
 }
 
+template <typename T>
+AICORE inline __gm__ T *PayloadRemotePtr(__gm__ CommContext *ctx, __gm__ T *local_ptr, int peer) {
+#if defined(PTO_URMA_SUPPORTED)
+  if (ctx->workSpace != 0 && peer != static_cast<int>(ctx->rankId)) {
+    const uint64_t offset = reinterpret_cast<uint64_t>(local_ptr) - ctx->windowsIn[ctx->rankId];
+    const uint64_t remote_base = pto::comm::urma::UrmaPeerMrBaseAddr(
+        reinterpret_cast<__gm__ uint8_t *>(ctx->workSpace), static_cast<uint32_t>(peer));
+    if (remote_base == 0) {
+      PTO_ASSERT(false, "all_to_all_v URMA peer memory is not registered");
+      trap();
+      return nullptr;
+    }
+    return reinterpret_cast<__gm__ T *>(remote_base + offset);
+  }
+#endif
+  return CommRemotePtr(ctx, local_ptr, peer);
+}
+
+template <typename GlobalData, typename TileData>
+AICORE inline void PushPayload(GlobalData &dst, GlobalData &src, TileData &tile,
+                               __gm__ CommContext *ctx, int peer) {
+#if defined(PTO_URMA_SUPPORTED)
+  if (ctx->workSpace != 0 && peer != static_cast<int>(ctx->rankId)) {
+    auto *workspace = reinterpret_cast<__gm__ uint8_t *>(ctx->workSpace);
+    pto::comm::AsyncSession session;
+    const bool valid = pto::comm::BuildAsyncSession<pto::comm::DmaEngine::URMA>(
+        workspace, static_cast<uint32_t>(peer), session);
+    if (!valid) {
+      PTO_ASSERT(false, "all_to_all_v URMA session initialization failed");
+      trap();
+      return;
+    }
+    const auto event = pto::comm::TPUT_ASYNC<pto::comm::DmaEngine::URMA>(
+        dst, src, session, static_cast<uint32_t>(peer));
+    // Publish the completion barrier only after the payload write completes.
+    // These checks must remain active when PTO_ASSERT is disabled.
+    if (!event.valid() || !event.Wait(session)) {
+      PTO_ASSERT(false, "all_to_all_v URMA payload completion failed");
+      trap();
+      return;
+    }
+    return;
+  }
+#endif
+  pto::comm::TPUT(dst, src, tile);
+}
+
 // N-way credit barrier on the private per-block lane at
 // `peer * signal_stride + block_idx`: AtomicAdd(+1) into every peer's lane,
 // then Wait(GE `threshold`) on each peer's lane. `threshold` is the caller's
@@ -143,6 +190,17 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
   }
 
   int my_rank = static_cast<int>(comm_ctx->rankId);
+#if defined(PTO_URMA_SUPPORTED)
+  if (comm_ctx->workSpace != 0) {
+    auto *urma_info = reinterpret_cast<__gm__ pto::comm::urma::UrmaInfo *>(comm_ctx->workSpace);
+    // Per-peer queues admit one writer each; a wider launch shares queue state.
+    if (urma_info->layout != pto::comm::urma::UrmaLayout::PER_PEER || block_num > nranks) {
+      PTO_ASSERT(false, "all_to_all_v requires PER_PEER URMA and core_num <= rank count");
+      trap();
+      return;
+    }
+  }
+#endif
 
   // Block-aware barrier (RFC #2521 K2): signal is [NR, S] with any S >= 1
   // (the deducer enforces a positive compile-time S) and is barrier-only —
@@ -225,8 +283,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
   using Global = pto::GlobalTensor<{{dtype_cpp}}, ShapeDyn, StrideDyn, pto::Layout::ND>;
   using TileData = pto::Tile<pto::TileType::Vec, {{dtype_cpp}}, 1, kTileCount, pto::BLayout::RowMajor, -1, -1>;
 
-  // Staging tile width is kTileCount; TPUT_IMPL chunks larger payloads against
-  // GetValidCol(), so one TPUT per destination is enough (RFC #2521 K1).
+  // MTE uses the original staging tile; URMA transfers directly between GM windows.
   TileData send_tile(1, kTileCount);
   TASSIGN(send_tile, 0x0);
 
@@ -374,10 +431,10 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     if (end > begin) {
       int64_t src_row_offset = static_cast<int64_t>(dest) * max_recv * row_numel + begin;
       int64_t dst_row_offset = static_cast<int64_t>(my_rank) * max_recv * row_numel + begin;
-      __gm__ {{dtype_cpp}} *remote_block = CommRemotePtr(comm_ctx, target + dst_row_offset, dest);
+      __gm__ {{dtype_cpp}} *remote_block = PayloadRemotePtr(comm_ctx, target + dst_row_offset, dest);
 
-      // K1 shape preserved: ONE TPUT per block; TPUT_IMPL re-chunks the flat
-      // [end - begin] block internally against the staging tile.
+      // One payload operation covers this block's flat [end - begin] slice.
+      // URMA posts it directly; the MTE path re-chunks against the staging tile.
       int64_t block_numel = end - begin;
       send_tile.ColMaskInternal = static_cast<int>(block_numel <= kTileCount ? block_numel : kTileCount);
 
@@ -387,7 +444,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
       Global dst_g(remote_block, shape, stride);
 
       pipe_barrier(PIPE_ALL);
-      pto::comm::TPUT(dst_g, src_g, send_tile);
+      PushPayload(dst_g, src_g, send_tile, comm_ctx, dest);
       pipe_barrier(PIPE_ALL);
     }
   } else {
@@ -399,7 +456,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
 
       int64_t src_row_offset = static_cast<int64_t>(dest) * max_recv * row_numel;
       int64_t dst_row_offset = static_cast<int64_t>(my_rank) * max_recv * row_numel;
-      __gm__ {{dtype_cpp}} *remote_block = CommRemotePtr(comm_ctx, target + dst_row_offset, dest);
+      __gm__ {{dtype_cpp}} *remote_block = PayloadRemotePtr(comm_ctx, target + dst_row_offset, dest);
 
       // K1: ONE TPUT per destination. TPUT_IMPL re-chunks the flat [rows * SIZE]
       // block internally against the staging tile, so there is no caller-managed
@@ -415,7 +472,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
         Global dst_g(remote_block, shape, stride);
 
         pipe_barrier(PIPE_ALL);
-        pto::comm::TPUT(dst_g, src_g, send_tile);
+        PushPayload(dst_g, src_g, send_tile, comm_ctx, dest);
         pipe_barrier(PIPE_ALL);
       }
     }
