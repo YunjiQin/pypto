@@ -5,10 +5,11 @@
 
 ## 公共签名与 L2 ABI
 
-`pypto._kernel_abi.KernelABI` 对现有 `ParamInfo` 建立快照。program 和 kernel
-共用参数 JSON 序列化，不新增 kernel 参数类型或 native dtype tag 表。Tensor/Scalar
-池索引从签名顺序派生。`bind()` 要求全部 Out/InOut 实参，并返回两个参数池及外部
-Tensor 返回别名，支持重复别名和只读输入返回。
+`pypto._kernel_abi.KernelABI` 是 frozen dataclass，将现有 `ParamInfo` 和返回别名
+固化为 tuple。构造后不能重新赋值其签名、目标和 SDK 身份。program 和 kernel
+共用参数 JSON 序列化，不新增 kernel 参数类型或 native dtype tag 表。
+`parameters` 字段保留签名顺序，返回别名使用该签名中的参数索引，支持重复别名和
+只读输入返回。实参绑定和 Worker `TaskArgs` 构造由执行适配器负责。
 
 descriptor 记录目标配置和构建上下文传入的**编译 SDK revision**。
 `from_record()` 拒绝非规范记录，`require_compatible()` 核对完整签名、返回映射、目标和

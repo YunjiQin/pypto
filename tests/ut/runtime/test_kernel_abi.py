@@ -12,7 +12,7 @@
 import json
 import struct
 import subprocess
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 
 import pytest
@@ -43,20 +43,12 @@ def contract(
     )
 
 
-def test_interleaved_pools_and_duplicate_external_returns(params):
+def test_interleaved_parameters_and_duplicate_external_returns(params):
     abi = contract(params)
-    x, out, cache = object(), object(), object()
-    for scale, step in ((1.25, 0), (-3.5, 9)):
-        tensors, scalars, returns = abi.bind([x, scale, out, step, cache])
-        assert tensors == [x, out, cache]
-        assert scalars == [scale, step]
-        assert returns == [out, cache, out]
-        assert returns[0] is returns[2]
-    assert abi.tensor_indices == (0, 2, 4)
-    assert abi.scalar_indices == (1, 3)
-    assert contract(params, return_aliases=(0,)).bind([x, 1.0, out, 0, cache])[2][0] is x
-    with pytest.raises(TypeError, match="including all Out/InOut"):
-        abi.bind([x, 1.0, out, 0])
+    restored = KernelABI.from_record(abi.record())
+    assert restored.parameters == tuple(params)
+    assert restored.return_aliases == (2, 4, 2)
+    assert contract(params, return_aliases=(0,)).return_aliases == (0,)
 
 
 def test_round_trip_and_signature_snapshot(params):
@@ -68,6 +60,27 @@ def test_round_trip_and_signature_snapshot(params):
     assert abi.parameters[0].shape == (8,)
     with pytest.raises(ValueError, match="does not match"):
         abi.require_compatible(contract(params))
+
+
+@pytest.mark.parametrize("field", ["parameters", "platform", "runtime", "sdk_revision", "return_aliases"])
+def test_descriptor_fields_are_frozen(params, field):
+    abi = contract(params)
+    with pytest.raises(FrozenInstanceError):
+        setattr(abi, field, getattr(abi, field))
+
+
+def test_descriptor_snapshots_aliases_and_revalidates_replacement(params):
+    aliases = [2, 4, 2]
+    abi = contract(params, return_aliases=aliases)
+    aliases[0] = 1
+    assert abi.return_aliases == (2, 4, 2)
+    assert isinstance(abi.parameters, tuple)
+    assert KernelABI.from_record(abi.record()) == abi
+    changed = replace(abi, platform="a5")
+    assert changed.platform == "a5"
+    assert abi.platform == "a2a3"
+    with pytest.raises(ValueError, match="Return alias"):
+        replace(abi, return_aliases=(1,))
 
 
 @pytest.mark.parametrize(
@@ -201,8 +214,7 @@ from pypto.pypto_core.ir import ParamDirection
 abi = KernelABI([ParamInfo('x', ParamDirection.In, [8], DataType.FP32)],
                 platform='a2a3', runtime='host_build_graph', sdk_revision='a'*40, return_aliases=(0,))
 KernelABI.from_record(abi.record()).require_compatible(abi)
-x = object()
-assert abi.bind([x])[2][0] is x
+assert abi.return_aliases == (0,)
 """)
     assert result.returncode == 0, result.stderr
 

@@ -6,12 +6,14 @@ compiled-program and Worker calls share the parameter contract described below.
 
 ## Shared signature and L2 ABI
 
-`KernelABI` in `pypto._kernel_abi` snapshots the existing `ParamInfo` records.
+`KernelABI` in `pypto._kernel_abi` is a frozen dataclass that snapshots the
+existing `ParamInfo` records and return aliases as tuples. Its signature, target
+and SDK identity cannot be reassigned after construction.
 Program and kernel descriptors share parameter JSON serialization; there is no
-separate kernel parameter class or duplicate native dtype-tag table. Tensor and
-scalar pool indices are derived from signature order. `bind()` requires every
-Out/InOut argument and returns the two pools plus exact external return aliases,
-including repeated aliases and read-only input returns.
+separate kernel parameter class or duplicate native dtype-tag table. The
+`parameters` field preserves signature order; return aliases are indices into
+that signature, including repeated aliases and read-only input returns.
+Execution adapters bind actual arguments and construct Worker `TaskArgs`.
 
 The descriptor records the target and the **compilation SDK revision**, supplied
 by the build context. `from_record()` rejects noncanonical records, and

@@ -16,22 +16,22 @@ snapshot for artifact validation, not a second parameter type system.
 
 import re
 from collections.abc import Sequence
-from typing import Any, TypeVar, cast
+from dataclasses import KW_ONLY, dataclass
+from typing import Any, cast
 
 from pypto._identity import encode_record
 from pypto.ir.param_info import (
     ParamInfo,
     _param_info_from_dict,
     _param_info_to_dict,
-    bind_complete_args,
 )
 
 # Shared L2 limits, checked against the pinned SDK by the host-only ABI UT.
 MAX_KERNEL_TENSORS = 256
 MAX_KERNEL_SCALARS = 128
-_Arg = TypeVar("_Arg")
 
 
+@dataclass(frozen=True)
 class KernelABI:
     """Snapshot a common signature and its kernel-specific return contract.
 
@@ -39,71 +39,48 @@ class KernelABI:
     from an unrelated checkout or replaced by the installed runtime revision.
     """
 
-    def __init__(
-        self,
-        params: Sequence[ParamInfo],
-        *,
-        platform: str,
-        runtime: str,
-        sdk_revision: str,
-        return_aliases: Sequence[int] = (),
-    ) -> None:
-        if platform not in ("a2a3", "a5"):
-            raise ValueError(f"Unsupported kernel platform {platform!r}")
-        if runtime not in ("host_build_graph", "tensormap_and_ringbuffer"):
-            raise ValueError(f"Unsupported kernel runtime {runtime!r}")
-        if type(sdk_revision) is not str or re.fullmatch(r"[0-9a-f]{40}", sdk_revision) is None:
-            raise ValueError(f"Kernel SDK revision must be a full git revision, got {sdk_revision!r}")
-        self._params = tuple(params)
-        self._platform, self._runtime, self._sdk_revision = platform, runtime, sdk_revision
-        self._return_aliases = tuple(return_aliases)
-        names = [p.name for p in self._params]
+    parameters: Sequence[ParamInfo]
+    _: KW_ONLY
+    platform: str
+    runtime: str
+    sdk_revision: str
+    return_aliases: Sequence[int] = ()
+
+    def __post_init__(self) -> None:
+        if self.platform not in ("a2a3", "a5"):
+            raise ValueError(f"Unsupported kernel platform {self.platform!r}")
+        if self.runtime not in ("host_build_graph", "tensormap_and_ringbuffer"):
+            raise ValueError(f"Unsupported kernel runtime {self.runtime!r}")
+        if type(self.sdk_revision) is not str or re.fullmatch(r"[0-9a-f]{40}", self.sdk_revision) is None:
+            raise ValueError(f"Kernel SDK revision must be a full git revision, got {self.sdk_revision!r}")
+        # Frozen fields must also own immutable sequences, so later mutations
+        # to the caller's lists cannot change the artifact identity.
+        object.__setattr__(self, "parameters", tuple(self.parameters))
+        object.__setattr__(self, "return_aliases", tuple(self.return_aliases))
+        names = [p.name for p in self.parameters]
         if len(set(names)) != len(names):
             raise ValueError("Kernel parameter names must be unique")
-        if len(self.tensor_indices) > MAX_KERNEL_TENSORS or len(self.scalar_indices) > MAX_KERNEL_SCALARS:
+        tensor_count = sum(p.shape is not None for p in self.parameters)
+        if tensor_count > MAX_KERNEL_TENSORS or len(self.parameters) - tensor_count > MAX_KERNEL_SCALARS:
             raise ValueError("Kernel signature exceeds L2 argument capacity")
-        for index in self._return_aliases:
+        for index in self.return_aliases:
             if (
                 type(index) is not int
-                or not 0 <= index < len(self._params)
-                or self._params[index].shape is None
+                or not 0 <= index < len(self.parameters)
+                or self.parameters[index].shape is None
             ):
                 raise ValueError(f"Return alias must reference an external tensor parameter, got {index!r}")
-
-    @property
-    def parameters(self) -> tuple[ParamInfo, ...]:
-        """Return the immutable shared parameter records."""
-        return self._params
-
-    @property
-    def tensor_indices(self) -> tuple[int, ...]:
-        """Original signature positions, in L2 tensor-pool order."""
-        return tuple(i for i, p in enumerate(self._params) if p.shape is not None)
-
-    @property
-    def scalar_indices(self) -> tuple[int, ...]:
-        """Original signature positions, in L2 scalar-pool order."""
-        return tuple(i for i, p in enumerate(self._params) if p.shape is None)
-
-    def bind(self, args: Sequence[_Arg]) -> tuple[list[_Arg], list[_Arg], list[_Arg]]:
-        """Bind all external arguments without allocation, conversion or native imports."""
-        bound = bind_complete_args(args, self._params, caller_name="Kernel call")
-        return (
-            [bound[i] for i in self.tensor_indices],
-            [bound[i] for i in self.scalar_indices],
-            [bound[i] for i in self._return_aliases],
-        )
 
     def record(self) -> dict[str, Any]:
         """Derive a canonical artifact descriptor from the common signature."""
         return {
             "schema": 1,
             "argument_abi": "ChipStorageTaskArgs",
-            "platform": self._platform,
-            "runtime": self._runtime,
-            "sdk_revision": self._sdk_revision,
-            "params": [_param_info_to_dict(p) for p in self._params],
-            "return_aliases": list(self._return_aliases),
+            "platform": self.platform,
+            "runtime": self.runtime,
+            "sdk_revision": self.sdk_revision,
+            "params": [_param_info_to_dict(p) for p in self.parameters],
+            "return_aliases": list(self.return_aliases),
         }
 
     @classmethod
@@ -129,5 +106,5 @@ class KernelABI:
 
     def require_compatible(self, expected: "KernelABI") -> None:
         """Check signature, target and SDK identity before loading an artifact."""
-        if encode_record(self.record()) != encode_record(expected.record()):
+        if self != expected:
             raise ValueError("Kernel artifact ABI/signature or SDK does not match; recompile")
