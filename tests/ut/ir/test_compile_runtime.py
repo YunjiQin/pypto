@@ -362,22 +362,55 @@ def test_kernel_preserves_dynamic_shape_and_scalar_slots(tmp_path):
     assert kernel.metadata.return_aliases == (2,)
 
 
-def test_kernel_requires_explicit_direction_for_mutated_parameter(tmp_path):
+def test_kernel_contract_allows_omitted_internal_out():
     from pypto._artifact_contract import ArtifactExecutionMode  # noqa: PLC0415
-    from pypto.ir.compile import _compile_artifact  # noqa: PLC0415
+    from pypto.ir._compile_contract import analyze_contract  # noqa: PLC0415
 
     @pl.program
-    class UndeclaredOutput:
-        @pl.function(type=pl.FunctionType.Orchestration)
-        def main(self, a: pl.Tensor[[16, 16], pl.FP32], c: pl.Tensor[[16, 16], pl.FP32]):
-            with pl.at(level=pl.Level.CORE_GROUP):
-                tile = pl.load(a, [0, 0], [16, 16])
-                pl.store(tile, [0, 0], c)
+    class InternalOutput:
+        @pl.function(type=pl.FunctionType.InCore)
+        def copy(
+            self, a: pl.Tensor[[16, 16], pl.FP32], out: pl.Out[pl.Tensor[[16, 16], pl.FP32]]
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            tile = pl.load(a, [0, 0], [16, 16])
+            pl.store(tile, [0, 0], out)
+            return out
 
-    with pytest.raises(ValueError, match="explicit Out/InOut"):
-        _compile_artifact(
-            UndeclaredOutput, output_dir=str(tmp_path), skip_ptoas=True, contract=ArtifactExecutionMode.KERNEL
-        )
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(
+            self, a: pl.Tensor[[16, 16], pl.FP32], out: pl.Out[pl.Tensor[[16, 16], pl.FP32]]
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            with pl.manual_scope():
+                scratch, first = pl.submit(self.copy, a)
+                out, second = pl.submit(self.copy, scratch, out, deps=[first])
+            return out
+
+    params, aliases = analyze_contract(InternalOutput, ArtifactExecutionMode.KERNEL)
+    assert params is not None
+    assert [param.name for param in params] == ["a", "out"]
+    assert aliases == (1,)
+
+
+def test_kernel_contract_preserves_single_submit_return_alias():
+    from pypto._artifact_contract import ArtifactExecutionMode  # noqa: PLC0415
+    from pypto.ir._compile_contract import analyze_contract  # noqa: PLC0415
+
+    @pl.program
+    class SubmittedAlias:
+        @pl.function(type=pl.FunctionType.InCore)
+        def forward(self, out: pl.InOut[pl.Tensor[[16, 16], pl.FP32]]) -> pl.Tensor[[16, 16], pl.FP32]:
+            return out
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(self, out: pl.InOut[pl.Tensor[[16, 16], pl.FP32]]) -> pl.Tensor[[16, 16], pl.FP32]:
+            with pl.manual_scope():
+                result, task_id = pl.submit(self.forward, out)
+            return result
+
+    params, aliases = analyze_contract(SubmittedAlias, ArtifactExecutionMode.KERNEL)
+    assert params is not None
+    assert [param.name for param in params] == ["out"]
+    assert aliases == (0,)
 
 
 def test_kernel_cannot_return_a_narrowed_external_view(tmp_path):
@@ -394,29 +427,6 @@ def test_kernel_cannot_return_a_narrowed_external_view(tmp_path):
         _compile_artifact(
             NarrowedReturn, output_dir=str(tmp_path), skip_ptoas=True, contract=ArtifactExecutionMode.KERNEL
         )
-
-
-def test_kernel_rejects_input_write_through_returned_tuple():
-    from pypto._artifact_contract import ArtifactExecutionMode  # noqa: PLC0415
-    from pypto.ir._compile_contract import analyze_contract  # noqa: PLC0415
-
-    @pl.program
-    class BorrowedTuple:
-        @pl.function(type=pl.FunctionType.InCore)
-        def forward(
-            self, a: pl.Tensor[[16, 16], pl.FP32], b: pl.Tensor[[16, 16], pl.FP32]
-        ) -> tuple[pl.Tensor[[16, 16], pl.FP32], pl.Tensor[[16, 16], pl.FP32]]:
-            return a, b
-
-        @pl.function(type=pl.FunctionType.Orchestration)
-        def main(self, a: pl.Tensor[[16, 16], pl.FP32], b: pl.Tensor[[16, 16], pl.FP32]):
-            left, right = self.forward(a, b)
-            with pl.at(level=pl.Level.CORE_GROUP):
-                tile = pl.load(left, [0, 0], [16, 16])
-                pl.store(tile, [0, 0], right)
-
-    with pytest.raises(ValueError, match="explicit Out/InOut"):
-        analyze_contract(BorrowedTuple, ArtifactExecutionMode.KERNEL)
 
 
 if __name__ == "__main__":

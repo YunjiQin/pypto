@@ -13,7 +13,7 @@ import re
 from collections.abc import Sequence
 from dataclasses import replace
 
-from pypto.backend._host_tensor_args import _HostAccess, host_tensor_indices
+from pypto.backend._host_tensor_args import host_tensor_indices
 from pypto.pypto_core import ir
 
 from .param_info import (
@@ -47,70 +47,6 @@ def return_aliases(program: ir.Program, entry: ir.Function) -> tuple[int, ...] |
     return tuple(i for i in indices if i is not None)
 
 
-class _KernelWrites(_HostAccess):
-    """Conservative alias components for declared writes at the entry boundary.
-
-    Reuse the host-access traversal's view/branch/loop alias tracking. Unioning
-    possible aliases can reject ambiguous writes, but cannot hide a write to an
-    input behind a branch. Callee directions and operator effects remain the IR
-    source of truth; this does not invent a second operator effect table.
-    """
-
-    def __init__(self, program: ir.Program) -> None:
-        super().__init__()
-        self.program = program
-        self.writes: set[ir.Var] = set()
-        self.return_maps: dict[str, list[int | None]] = {}
-        self.tuple_aliases: dict[int, tuple[ir.Expr | None, ...]] = {}
-
-    def record_call(self, op: ir.Call | ir.Submit) -> None:
-        callee = self.program.get_function(op.op.name) if isinstance(op.op, ir.GlobalVar) else None
-        directions = callee.param_directions if callee is not None else None
-        for index, arg in enumerate(op.args):
-            if not isinstance(arg, ir.Var) or not isinstance(arg.type, ir.TensorType):
-                continue
-            if directions is not None:
-                writes = directions[index] != ir.ParamDirection.In
-            else:
-                writes = ir.get_op_arg_effect(op.op.name, index, **op.kwargs) != ir.ArgEffect.Read
-            if writes:
-                self.writes.add(arg)
-
-    def visit_assign_stmt(self, op: ir.AssignStmt) -> None:
-        if isinstance(op.value, ir.Call | ir.Submit) and isinstance(op.value.op, ir.GlobalVar):
-            callee = self.program.get_function(op.value.op.name)
-            if callee is not None:
-                if callee.name not in self.return_maps:
-                    self.return_maps[callee.name] = ir.returned_param_indices(callee, self.program)
-                args = op.value.args
-                values = tuple(None if i is None else args[i] for i in self.return_maps[callee.name])
-                if len(values) == 1 and values[0] is not None:
-                    self.alias(op.var, values[0])
-                elif len(values) > 1:
-                    self.tuple_aliases[op.var.unique_id] = values
-        elif isinstance(op.value, ir.MakeTuple):
-            self.tuple_aliases[op.var.unique_id] = tuple(op.value.elements)
-        elif isinstance(op.value, ir.Var) and op.value.unique_id in self.tuple_aliases:
-            self.tuple_aliases[op.var.unique_id] = self.tuple_aliases[op.value.unique_id]
-        elif isinstance(op.value, ir.TupleGetItemExpr) and isinstance(op.value.tuple, ir.Var):
-            elements = self.tuple_aliases.get(op.value.tuple.unique_id, ())
-            if 0 <= op.value.index < len(elements):
-                source = elements[op.value.index]
-                if source is not None:
-                    self.alias(op.var, source)
-        super().visit_assign_stmt(op)
-
-
-def validate_explicit_outputs(program: ir.Program, entry: ir.Function) -> None:
-    access = _KernelWrites(program)
-    access.visit_stmt(entry.body)
-    writes = {access.root(var) for var in access.writes}
-    for param, direction in zip(entry.params, entry.param_directions, strict=True):
-        if isinstance(param.type, ir.TensorType) and direction == ir.ParamDirection.In:
-            if access.root(param) in writes:
-                raise ValueError(f"Kernel writes parameter {param.name_hint!r}; declare explicit Out/InOut")
-
-
 def validate_kernel_parameters(params: Sequence[ParamInfo]) -> None:
     """Validate signature restrictions on compilation and metadata restoration."""
     validate_parameter_names(params)
@@ -125,7 +61,6 @@ def validate_kernel_program(program: ir.Program, params: Sequence[ParamInfo]) ->
         raise ValueError("Kernel contract requires a single chip, not a distributed program")
     entry = entry_function(program)
     validate_kernel_parameters(params)
-    validate_explicit_outputs(program, entry)
     aliases = return_aliases(program, entry)
     if aliases is None:
         raise ValueError("Kernel returns must alias external tensor parameters; supply explicit Out/InOut")

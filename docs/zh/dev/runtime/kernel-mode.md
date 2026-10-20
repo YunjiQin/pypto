@@ -34,7 +34,9 @@
 调用规则，`execution_mode` 独立选择目标平台的 SIM/ONBOARD。
 kernel 要求单芯片、单入口、显式提供 Out/InOut buffer，
 且 Tensor 返回必须别名到外部参数。现有 C++ 返回血缘分析从原始 IR 生成有序别名，
-允许重复。lowering 后核对外部参数 ABI：数量、顺序、名称、方向、dtype 和 storage。
+允许重复。该契约检查外部入口签名，不增加独立的内部写入及别名扫描；内部 submit
+仍可省略由 runtime 分配的 Out 参数。lowering 后核对外部参数 ABI：数量、顺序、
+名称、方向、dtype 和 storage。
 外部参数名称去除 SSA 版本后缀。
 HBG Host Tensor 数据读写被拒绝，设备 submit predicate 保留原语义；program 编译
 仍支持原有分配及 Host 控制流程。

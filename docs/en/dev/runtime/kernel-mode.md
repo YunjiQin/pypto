@@ -45,7 +45,9 @@ The `contract` selects PROGRAM/KERNEL calling rules; `execution_mode` independen
 selects SIM/ONBOARD for the target platform. Kernel validation requires one chip
 and entry, caller-supplied Out/InOut buffers, and tensor returns
 that alias external parameters. The existing C++ return-lineage analysis derives
-the ordered aliases from the original IR, including duplicates. Post-lowering
+the ordered aliases from the original IR, including duplicates. This contract
+checks the external entry signature, without a separate internal write/alias scan.
+Internal submits may omit runtime-allocated Out parameters. Post-lowering
 checks validate the external parameter ABI: count, order, names, directions,
 dtype and storage. SSA version suffixes are removed from external parameter names.
 HBG host tensor data reads/writes are rejected; device submit
