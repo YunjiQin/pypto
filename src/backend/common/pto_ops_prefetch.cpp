@@ -15,14 +15,15 @@
  *
  * Maps the PyPTO ``prefetch.*`` ops onto their PTOAS counterparts::
  *
- *     prefetch.make_context    -> pto.make_prefetch_async_context
+ *     prefetch.make_context    -> func.call @pypto_make_prefetch_context
  *     prefetch.async_prefetch  -> pto.tprefetch_async
  *     prefetch.session         -> pto.get_prefetch_async_session
  *     prefetch.wait            -> pto.comm.wait_async_event
  *
  * Emitted shape for the full sequence::
  *
- *     %ctx = pto.make_prefetch_async_context(%arg2 : !pto.ptr<i8>)
+ *     %ctx = func.call @pypto_make_prefetch_context(%workspace, %channel, %scratch)
+ *         : (!pto.ptr<i8>, i32, i32)
  *         -> !pto.prefetch_async_context
  *     %x_pview = pto.partition_view %x_view, offsets = [%c0], sizes = [%c4096]
  *         : !pto.tensor_view<4096xf32> -> !pto.partition_tensor_view<4096xf32>
@@ -137,17 +138,17 @@ void RegisterPrefetchOps(Backend& backend, const std::unordered_set<std::string>
     backend.RegisterOp(op_name).f_codegen(std::move(fn));
   };
 
-  // prefetch.make_context() -> pto.make_prefetch_async_context.
-  // PTOCodegen injects the runtime-owned `!pto.ptr<i8>` function parameter.
+  // Bind the runtime-owned workspace/channel to compiler-reserved UB scratch.
   reg("prefetch.make_context", [](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) -> std::string {
     auto& cg = AsPto(codegen_base);
-    pto_ops_detail::CheckArity(op, "pto.make_prefetch_async_context", 0);
+    pto_ops_detail::CheckArity(op, "prefetch.make_context", 0);
     const std::string ws_ptr = cg.GetSdmaWorkspaceArgSSA();
     INTERNAL_CHECK_SPAN(!ws_ptr.empty(), op->span_)
         << "Internal error: prefetch.make_context was not detected by PTOCodegen's function pre-scan";
 
     const std::string ctx = ResultSSA(cg);
-    cg.Emit(ctx + " = pto.make_prefetch_async_context(" + ws_ptr + " : !pto.ptr<i8>) -> " + kCtxType);
+    cg.Emit(ctx + " = func.call @pypto_make_prefetch_context(" + ws_ptr + ", %__pypto_sdma_channel, " +
+            cg.GetPrefetchScratchSSA(op) + ") : (!pto.ptr<i8>, i32, i32) -> " + kCtxType);
     cg.SetCurrentExprValue(ctx);
     return "";
   });
