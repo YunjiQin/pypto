@@ -42,7 +42,9 @@ HBG Host Tensor 数据读写被拒绝，设备 submit predicate 保留原语义�
 仍支持原有分配及 Host 控制流程。
 
 metadata 区分逻辑调用签名 `params` 与 assembly 签名 `lowered_params`，均使用
-`ParamInfo`。Torch 按逻辑 shape 校验；NZ lowering 按元素单位验证无 padding 的
+`ParamInfo`。PROGRAM 参数绑定和输出分配使用 lowering 前的原始 `params`，
+从产物恢复以及选择多 orchestration 子入口时也保持这一行为；`lowered_params`
+仍用于 assembly ABI 校验。Torch 按逻辑 shape 校验；NZ lowering 按元素单位验证无 padding 的
 blocked 表示，dtype 不变，因此字节数一致。动态 NZ 支持逻辑 `[B, R, C]` 的 batch
 维度；blocked shape 不作为 Torch 的逻辑 shape。
 

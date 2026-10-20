@@ -55,7 +55,10 @@ predicates retain their existing semantics. Program compilation keeps its
 allocation and host-control behavior.
 
 Metadata distinguishes `params` (logical caller signature) from `lowered_params`
-(assembly signature); both use `ParamInfo`. Torch validates logical shapes.
+(assembly signature); both use `ParamInfo`. PROGRAM argument binding and output
+allocation use the original, pre-lowering `params`, including after reloading
+an artifact and when selecting a multi-orchestration child. `lowered_params`
+remains available for assembly ABI validation. Torch validates logical shapes.
 NZ lowering is checked against the unpadded blocked representation in element
 units with unchanged dtype, preserving byte size. Dynamic NZ supports the logical
 `[B, R, C]` batch dimension. A blocked shape is never treated as a Torch shape.

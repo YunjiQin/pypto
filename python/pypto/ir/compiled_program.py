@@ -480,10 +480,12 @@ class _RuntimeFacade:
 
         The runner only inspects the return count. Reconstruct its placeholders
         and Out indices here instead of retaining a second mutable signature.
+        Preserve the original caller signature for PROGRAM binding and allocation;
+        lowered parameters describe the assembly ABI.
         """
         metadata = self._artifact.metadata
         assert metadata is not None
-        params = list(metadata.lowered_parameters)
+        params = list(metadata.parameters)
         return (
             params,
             [i for i, p in enumerate(params) if p.direction == ParamDirection.Out],

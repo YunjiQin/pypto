@@ -362,6 +362,87 @@ def test_kernel_preserves_dynamic_shape_and_scalar_slots(tmp_path):
     assert kernel.metadata.return_aliases == (2,)
 
 
+@pytest.mark.parametrize("multi_entry", [False, True])
+def test_program_preserves_original_mx_parameters(tmp_path, multi_entry):
+    import torch  # noqa: PLC0415
+    from pypto import ir  # noqa: PLC0415
+    from pypto.backend import BackendType  # noqa: PLC0415
+    from pypto.ir.compiled_program import (  # noqa: PLC0415
+        CompiledProgram,
+        _coerce_args,
+        _extract_func_param_infos,
+    )
+    from pypto.runtime import DeviceTensor  # noqa: PLC0415
+
+    scale_dtype = getattr(torch, "float8_e8m0fnu", None)
+    if scale_dtype is None:
+        pytest.skip("torch.float8_e8m0fnu is required for MX DeviceTensor arguments")
+
+    @pl.program
+    class MxInputs:
+        @pl.function(type=pl.FunctionType.InCore)
+        def load_scales(
+            self,
+            a: pl.Tensor[[64, 4], pl.FP8E8M0, pl.MX_A_ZZ],
+            b: pl.Tensor[[4, 64], pl.FP8E8M0, pl.MX_B_NN],
+        ):
+            _a_tile = pl.load(a, [0, 0], [16, 2], target_memory=pl.Mem.Mat)
+            _b_tile = pl.load(b, [0, 0], [2, 16], target_memory=pl.Mem.Mat)
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def first(
+            self,
+            a: pl.Tensor[[64, 4], pl.FP8E8M0, pl.MX_A_ZZ],
+            b: pl.Tensor[[4, 64], pl.FP8E8M0, pl.MX_B_NN],
+        ):
+            self.load_scales(a, b)
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def second(
+            self,
+            a: pl.Tensor[[64, 4], pl.FP8E8M0, pl.MX_A_ZZ],
+            b: pl.Tensor[[4, 64], pl.FP8E8M0, pl.MX_B_NN],
+        ):
+            self.load_scales(a, b)
+
+    source = MxInputs
+    if not multi_entry:
+        source = ir.Program(
+            [func for func in source.functions.values() if func.name != "second"],
+            source.name,
+            source.span,
+        )
+    compiled = ir_compile(
+        source,
+        output_dir=str(tmp_path),
+        backend_type=BackendType.Ascend950,
+        skip_ptoas=True,
+        dump_passes=False,
+    )
+    assert isinstance(compiled, CompiledProgram)
+    entries = [compiled["first"], compiled["second"]] if multi_entry else [compiled]
+    original_entry = source.get_function("first")
+    assert original_entry is not None
+    expected_params, expected_outputs, expected_returns = _extract_func_param_infos(original_entry)
+    for entry in entries:
+        metadata = entry._artifact.metadata
+        assert metadata is not None
+        assert [param.shape for param in metadata.lowered_parameters] == [(1, 4, 2, 16, 2)] * 2
+        for program in (entry, CompiledProgram.from_dir(entry.output_dir)):
+            params, outputs, returns = program._get_metadata()
+            assert params == expected_params
+            assert outputs == expected_outputs
+            assert len(returns) == len(expected_returns)
+            assert program.param_names == ["a", "b"]
+            args = (
+                DeviceTensor(0x1000, (64, 4), scale_dtype),
+                DeviceTensor(0x2000, (4, 64), scale_dtype),
+            )
+            coerced, return_style = _coerce_args(args, params, outputs, returns, caller_name="program")
+            assert all(actual is original for actual, original in zip(coerced, args, strict=True))
+            assert not return_style
+
+
 def test_kernel_contract_allows_omitted_internal_out():
     from pypto._artifact_contract import ArtifactExecutionMode  # noqa: PLC0415
     from pypto.ir._compile_contract import analyze_contract  # noqa: PLC0415
