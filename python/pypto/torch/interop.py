@@ -278,6 +278,8 @@ class CallSignature:
         for p, dtype in zip(self._params, self._torch_dtypes, strict=True):
             if p.shape is not None and dtype is None:
                 raise TypeError(f"Parameter {p.name!r} has unsupported tensor dtype {p.dtype}")
+            if p.shape is None and str(p.dtype) not in _DATATYPE_TO_CTYPE:
+                raise TypeError(f"Parameter {p.name!r} has unsupported scalar dtype {p.dtype}")
         for index in self._return_aliases:
             if (
                 type(index) is not int

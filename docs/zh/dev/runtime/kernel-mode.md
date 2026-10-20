@@ -13,13 +13,14 @@ Tensor 返回别名，支持重复别名和只读输入返回。
 descriptor 记录目标配置和构建上下文传入的**编译 SDK revision**。
 `from_record()` 拒绝非规范记录，`require_compatible()` 核对完整签名、返回映射、目标和
 SDK；这些操作不加载可选 runtime 或初始化设备。
-`ParamInfo` 不可变，program 和 kernel 在构造时共用名称非空、方向、IR dtype、layout
-和 shape 校验。shape 复制为 tuple，rank 为 1–5，维度为正 u32 或 `-1`。
-Tensor layout 支持 ND、DN、NZ、MX_A_ZZ 和 MX_B_NN；NZ/MX 的逻辑 shape 不要求
-rank 5。Scalar 只能是没有 layout 的输入，共用 program 的 ctypes dtype 映射，包含
-FP16 和 BF16。Tensor 形参合法性不依赖当前 Torch 版本的 dtype 支持，Torch 适配器
-仍检查自身的转换能力。JSON shape 保持数组格式。`KernelABI` 检查名称唯一性、L2
-参数池容量和返回别名等整个签名的约束。
+`ParamInfo` 是类型化 IR 参数的不可变快照，构造器只将 shape 固化为 tuple。
+参数合法性（包括 rank 和维度）由 IR 构造和编译 pass 负责。L3 元数据可以保留
+提交 L2 前才切除的外层分布维度。
+JSON 加载时校验字符串，并还原 IR dtype 和 direction；layout 名称支持
+ND、DN、NZ、MX_A_ZZ 和 MX_B_NN。NZ/MX 的逻辑 shape 不要求 rank 5。
+JSON shape 保持数组格式。Torch 适配器在自身边界检查转换及 dispatcher 支持，
+共用 program 的 Scalar 映射（包含 FP16 和 BF16）。`KernelABI` 检查名称唯一性、
+L2 参数池容量和返回别名等整个签名的约束。
 
 program 提交构造无地址的 `TaskArgs`，由 Simpler 解析为 `ChipStorageTaskArgs`。
 后续 Torch adapter 也通过公开 Worker 接口提交 `TaskArgs`，使用 `Buffer.wrap`

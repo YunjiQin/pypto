@@ -176,7 +176,7 @@ def test_invalid_return_aliases(alias):
 
 @pytest.mark.parametrize("name", ["", "x, Tensor y", "foo.bar", "ns::op", "1x", "class"])
 def test_invalid_names_cannot_inject_schema(name):
-    with pytest.raises(ValueError, match="nonempty name" if not name else "identifier"):
+    with pytest.raises(ValueError, match="identifier"):
         registration.RegistrationSignature([_param(name)])
     with pytest.raises(ValueError, match="identifier"):
         registration.RegistrationSignature([_param()]).schema(name)
@@ -193,8 +193,6 @@ def test_unsupported_contracts():
         registration.RegistrationSignature([_param(), _param("n", None, DataType.UINT64)])
     with pytest.raises(ValueError, match="direction In"):
         registration.RegistrationSignature([_param(), _param("n", None, DataType.INT32, ParamDirection.Out)])
-    with pytest.raises(ValueError, match="dimensions"):
-        registration.RegistrationSignature([_param(shape=(-2, 3))])
     with pytest.raises(ValueError, match="Return alias"):
         registration.RegistrationSignature([_param(), _param("n", None, DataType.INT32)], return_aliases=(1,))
 

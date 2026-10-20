@@ -17,7 +17,7 @@ import pathlib
 import sys
 import types
 import warnings
-from dataclasses import FrozenInstanceError, replace
+from dataclasses import FrozenInstanceError
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -32,6 +32,7 @@ from pypto.ir.compiled_program import (
     _COMPILED_META_SCHEMA,
     CompiledProgram,
     _build_full_args,
+    _extract_func_param_infos,
     _extract_param_infos,
     _param_info_from_dict,
     _param_info_to_dict,
@@ -1830,35 +1831,6 @@ def test_reload_platform_warns_but_explicit_mode_and_metadata_are_silent(tmp_pat
     assert (tmp_path / _COMPILED_META_FILENAME).read_bytes() == metadata
 
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
-
-
-@pytest.mark.parametrize(
-    "changes",
-    [
-        {"name": ""},
-        {"direction": "In"},
-        {"dtype": "fp32"},
-        {"shape": []},
-        {"shape": [1] * 6},
-        {"shape": [0]},
-        {"shape": [-2]},
-        {"shape": [True]},
-        {"shape": [2**32]},
-        {"layout": "unknown"},
-        {"dtype": DataType.TASK_ID},
-        {"shape": None, "layout": "ND"},
-        {"shape": None, "direction": ir.ParamDirection.Out},
-        {"shape": None, "dtype": DataType.FP8E4M3FN},
-    ],
-)
-def test_param_info_rejects_invalid_declarations_at_construction(changes):
-    param = _ParamInfo("x", ir.ParamDirection.In, [8], DataType.FP32)
-    with pytest.raises(ValueError):
-        replace(param, **changes)
-
-
 def test_param_info_owns_immutable_shape_and_serializes_json_arrays():
     shape = [-1, 2**32 - 1]
     param = _ParamInfo("x", ir.ParamDirection.In, shape, DataType.FP32)
@@ -1884,3 +1856,27 @@ def test_param_info_tensor_dtype_independent_of_torch_version(monkeypatch):
     monkeypatch.setattr(param_info, "_DATATYPE_TO_TORCH", {})
     param = _ParamInfo("x", ir.ParamDirection.In, [8], DataType.FP8E8M0)
     assert _param_info_from_dict(_param_info_to_dict(param)) == param
+
+
+@pytest.mark.parametrize("shape", [(2, 40, 8, 128, 1, 512), (2, 2, 4, 128, 4, 4096)])
+def test_l3_parameter_extraction_preserves_rank_six(shape):
+    """L3 caches and segmented inputs shed outer axes before chip submission."""
+    span = ir.Span.unknown()
+    tensor_type = ir.TensorType(list(shape), DataType.FP32)
+    value = ir.Var("distributed_input", tensor_type, span)
+    func = ir.Function(
+        "host_orch",
+        [(value, ir.ParamDirection.In)],
+        [],
+        ir.SeqStmts([], span),
+        span,
+        ir.FunctionType.Orchestration,
+    )
+    infos, _, _ = _extract_func_param_infos(func)
+    assert infos[0].shape == shape
+    record = json.loads(json.dumps(_param_info_to_dict(infos[0])))
+    assert _param_info_from_dict(record).shape == shape
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

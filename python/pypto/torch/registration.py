@@ -93,6 +93,8 @@ class RegistrationSignature:
                 raise ValueError(f"Duplicate parameter name {info.name!r}")
             names.add(info.name)
             if info.shape is None:
+                if info.direction != ParamDirection.In:
+                    raise ValueError(f"Scalar parameter {info.name!r} must have direction In")
                 _scalar_schema(info)
             else:
                 tensor_count += 1

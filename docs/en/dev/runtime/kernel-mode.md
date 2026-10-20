@@ -17,15 +17,16 @@ The descriptor records the target and the **compilation SDK revision**, supplied
 by the build context. `from_record()` rejects noncanonical records, and
 `require_compatible()` checks the entire signature, return mapping, target and SDK.
 These operations do not import an optional runtime or initialize a device.
-`ParamInfo` is immutable and validates each declaration at construction for both
-program and kernel modes: nonempty name, direction, IR dtype, layout, and shape.
-Shapes are copied to tuples, with rank 1–5 and positive u32 extents or `-1`.
-Tensor layouts include ND, DN, NZ, MX_A_ZZ and MX_B_NN; logical NZ/MX shapes need
-not be rank 5. Scalars must be inputs without a layout and use the shared program
-ctypes dtype map, including FP16 and BF16. Tensor declaration validity does not
-depend on which dtypes the installed Torch version exposes; Torch adapters still
-check their own conversion support. JSON shapes remain arrays. `KernelABI` checks
-signature-wide constraints, including unique names, L2 pool capacities and aliases.
+`ParamInfo` is an immutable snapshot of typed IR parameters; its constructor
+only normalizes shapes to tuples. IR construction and compiler passes own
+parameter legality, including ranks and dimensions. L3 metadata can retain
+outer distribution axes that are sliced off before L2 submission.
+JSON loading validates strings and reconstructs IR dtype and direction values;
+layout names include ND, DN, NZ, MX_A_ZZ and MX_B_NN. Logical NZ/MX shapes need
+not be rank 5. JSON shapes remain arrays. Torch adapters check conversion and
+dispatcher support at their own boundaries, using the shared program scalar map
+(including FP16 and BF16). `KernelABI` checks signature-wide constraints,
+including unique names, L2 pool capacities and aliases.
 
 Program submission builds address-free `TaskArgs`; Simpler materializes those
 into `ChipStorageTaskArgs`. The future Torch adapter will also submit `TaskArgs`

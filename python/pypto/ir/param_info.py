@@ -101,9 +101,6 @@ def _to_torch_dtype(dtype: DataType) -> torch.dtype | None:
     return _DATATYPE_TO_TORCH.get(str(dtype))
 
 
-MAX_TENSOR_RANK = 5
-
-
 @dataclass(frozen=True)
 class _ParamInfo:
     """Metadata for a single orchestration function parameter."""
@@ -117,30 +114,10 @@ class _ParamInfo:
     layout: str | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(cast(object, self.name), str) or not self.name:
-            raise ValueError(f"Parameter requires a nonempty name, got {self.name!r}")
-        if not isinstance(cast(object, self.direction), ParamDirection):
-            raise ValueError(f"Invalid direction for parameter {self.name!r}: {self.direction!r}")
-        if not isinstance(cast(object, self.dtype), DataType) or str(self.dtype) not in _STR_TO_DATATYPE:
-            raise ValueError(f"Unsupported parameter dtype for {self.name!r}: {self.dtype!r}")
-        if self.layout is not None and self.layout not in TensorLayout.__members__:
-            raise ValueError(f"Invalid layout for parameter {self.name!r}: {self.layout!r}")
-        if self.shape is None:
-            if self.direction != ParamDirection.In:
-                raise ValueError(f"Scalar parameter {self.name!r} must have direction In")
-            if self.layout is not None or str(self.dtype) not in _DATATYPE_TO_CTYPE:
-                raise ValueError(f"Unsupported scalar parameter {self.name!r}: {self.dtype}/{self.layout}")
-        else:
-            # Metadata validity must not depend on the installed Torch version.
-            # TASK_ID is an opaque runtime handle, not tensor element data.
-            if self.dtype == DataType.TASK_ID:
-                raise ValueError(f"Unsupported tensor dtype for {self.name!r}: {self.dtype}")
-            shape = tuple(self.shape)
-            if not 1 <= len(shape) <= MAX_TENSOR_RANK or any(
-                type(dim) is not int or not (dim == -1 or 0 < dim < 2**32) for dim in shape
-            ):
-                raise ValueError(f"Parameter {self.name!r} requires rank 1..5 and positive u32/-1 dimensions")
-            object.__setattr__(self, "shape", shape)
+        # IR construction and passes own parameter legality. Metadata only
+        # snapshots the shape, including L3 axes removed before L2 submission.
+        if self.shape is not None:
+            object.__setattr__(self, "shape", tuple(self.shape))
 
 
 # Public spelling for code outside ``pypto.ir`` (the replay-script writer, and
@@ -291,8 +268,8 @@ def _param_info_from_dict(d: dict[str, object]) -> _ParamInfo:
         ValueError: A field is present but not a valid value for its slot.
     """
     name = d["name"]
-    if not isinstance(name, str):
-        raise ValueError(f"'name' must be a string, got {name!r}")
+    if not isinstance(name, str) or not name:
+        raise ValueError(f"'name' must be a nonempty string, got {name!r}")
 
     # Strict enum-member lookup, not getattr(): ``getattr(ParamDirection, "mro")``
     # resolves to a bound method and would sail through as a bogus direction.
@@ -319,8 +296,10 @@ def _param_info_from_dict(d: dict[str, object]) -> _ParamInfo:
     # A sidecar written before parameters carried a layout says nothing about
     # one, which is exactly what ND means.
     raw_layout = d.get("layout")
-    if raw_layout is not None and not isinstance(raw_layout, str):
-        raise ValueError(f"'layout' must be null or a string, got {raw_layout!r}")
+    if raw_layout is not None and (
+        not isinstance(raw_layout, str) or raw_layout not in TensorLayout.__members__
+    ):
+        raise ValueError(f"'layout' must be null or a TensorLayout name, got {raw_layout!r}")
 
     return _ParamInfo(
         name=name,
