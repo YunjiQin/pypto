@@ -236,6 +236,21 @@ def _resident(
 
 
 class TestSetupOnce:
+    @pytest.mark.parametrize("one_shot", [True, False])
+    def test_kernel_mode_blocks_distributed_initialization(self, kernel_env, patched_setup, one_shot):
+        from pypto.runtime.distributed_runner import _execute_distributed  # noqa: PLC0415
+
+        kernel_env.state.ensure_worker(kernel_env.config)
+        compiled = _fake_compiled([_param("a", [8, 8])], [])
+        with pytest.raises(RuntimeError, match="already claimed kernel"):
+            if one_shot:
+                _execute_distributed(compiled, [torch.zeros(8, 8)])
+            else:
+                DistributedWorker(compiled)
+        patched_setup["worker"].init.assert_not_called()
+        patched_setup["dispatch"].assert_not_called()
+        kernel_env.state.close()
+
     def test_setup_runs_once_dispatch_many(self, patched_setup):
         m = patched_setup
         compiled = _fake_compiled([_param("a", [128, 128]), _param("b", [128, 128])], [])
