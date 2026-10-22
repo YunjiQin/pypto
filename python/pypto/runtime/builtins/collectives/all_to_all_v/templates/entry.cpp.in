@@ -66,6 +66,13 @@ void submit_all_to_all_v_kernel(const ChipTaskArgs &orch_args) {
   const int32_t nranks = static_cast<int32_t>(requested_nranks);
   const int32_t core_num = static_cast<int32_t>(requested_core_num);
   const int32_t admitted_blocks = CalAllToAllVBlocks(nranks, core_num);
+#if {{transport_urma}}
+  if (admitted_blocks > nranks) {
+    rt_report_fatal(SIMPLER_ERROR_INVALID_ARGS,
+                    "all_to_all_v transport=urma requires admitted block count <= rank count");
+    return;
+  }
+#endif
 
   // signal is 2D [NR, S] (collective.cpp's deducer enforces a positive
   // compile-time S) or 1D [NR] (S == 1, all_to_all_v's own composite deducer

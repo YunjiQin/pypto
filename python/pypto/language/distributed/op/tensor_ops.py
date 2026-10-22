@@ -992,8 +992,14 @@ def all_to_all_v(
     recv_counts: DistributedTensor,
     *,
     core_num: IntLike = 1,
+    transport: str = "mte",
 ) -> DistributedTensor:
     """All-to-all: variable-size personalized exchange (push-based, window-as-result).
+
+    ``transport`` is a compile-time choice: ``"mte"`` (default) or ``"urma"``.
+    Forced URMA requires A5, a PER_PEER workspace, and at most one AIV per rank.
+    It never falls back to MTE for remote payloads; self-copies use MTE.
+    URMA is supported on managed HOST/CHIP rails only.
 
     5-arg form: ``pld.tensor.all_to_all_v(input, target, signal, send_counts,
     recv_counts)``.
@@ -1109,7 +1115,7 @@ def all_to_all_v(
     counts_expr = _unwrap(send_counts)
     core_num_expr = _unwrap(core_num)
     call = _ir_tensor.all_to_all_v(
-        input_expr, target_expr, signal_expr, counts_expr, recv_expr, core_num_expr
+        input_expr, target_expr, signal_expr, counts_expr, recv_expr, core_num_expr, transport=transport
     )
     return DistributedTensor(expr=call)
 

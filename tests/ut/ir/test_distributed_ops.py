@@ -2668,7 +2668,7 @@ def test_all_to_all_v_rejects_core_num_kwarg():
     """
     span = ir.Span.unknown()
     args = _make_all_to_all_v_args(span)
-    with pytest.raises(ValueError, match="does not accept a 'core_num' keyword argument"):
+    with pytest.raises(ValueError, match="Unknown kwarg 'core_num'"):
         ir.create_op_call("pld.tensor.all_to_all_v", args, {"core_num": 8}, span)
 
 
@@ -2771,3 +2771,20 @@ def test_all_to_all_v_rejects_partial_valid_shape_target():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.parametrize("transport", ["mte", "urma"])
+def test_all_to_all_v_transport_attribute(transport):
+    span = ir.Span.unknown()
+    args = _make_all_to_all_v_args(span)
+    call = ir.create_op_call("pld.tensor.all_to_all_v", args, {"transport": transport}, span)
+    assert dict(call.kwargs)["transport"] == transport
+
+
+@pytest.mark.parametrize("transport", ["auto", "invalid"])
+def test_all_to_all_v_rejects_invalid_transport_in_raw_ir(transport):
+    span = ir.Span.unknown()
+    with pytest.raises(ValueError, match="transport"):
+        ir.create_op_call(
+            "pld.tensor.all_to_all_v", _make_all_to_all_v_args(span), {"transport": transport}, span
+        )

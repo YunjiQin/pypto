@@ -409,9 +409,16 @@ keyword attributes.
 
 ```text
 pld.tensor.all_to_all_v(
-    input, target, signal, send_counts, recv_counts, *, core_num: int | Scalar[INDEX] = 1
+    input, target, signal, send_counts, recv_counts, *, core_num: int | Scalar[INDEX] = 1, transport: str = "mte"
 ) -> DistributedTensorType(target)
 ```
+
+`transport="mte"` (default) or `transport="urma"` selects the payload engine at compile time.
+The generated kernel has no runtime engine selection. URMA requires an A5 target,
+an initialized PER_PEER workspace, and an admitted AIV block count no greater than
+the rank count. It is supported on managed HOST/CHIP rails and never falls back
+for remote payloads. Self-copies and the counts/barrier protocol still use MTE.
+Different transport choices generate distinct kernel variants and may coexist.
 
 Variable-size all-to-all (MPI_Alltoallv). Flat 2D layouts:
 

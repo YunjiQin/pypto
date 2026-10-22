@@ -465,9 +465,15 @@ def all_to_all_v(
     recv_counts: Expr,
     core_num: int | Expr = 1,
     *,
+    transport: str = "mte",
     span: Span | None = None,
 ) -> Call:
     """Build a ``pld.tensor.all_to_all_v(...)`` Call.
+
+    ``transport`` selects ``"mte"`` (default) or ``"urma"`` at compile time.
+    URMA requires a managed HOST/CHIP rail, A5, a PER_PEER workspace and an
+    admitted block count no greater than the rank count. Remote URMA never
+    falls back to MTE. Both choices generate distinct kernel variants.
 
     5-arg window-as-result intrinsic: 2D Tensor or DistributedTensor
     [NR*MAX_RECV, SIZE] input, DistributedTensor [NR*MAX_RECV, SIZE] target
@@ -519,10 +525,14 @@ def all_to_all_v(
     if isinstance(core_num, int) and core_num <= 0:
         raise ValueError(f"pld.tensor.all_to_all_v core_num must be positive, got {core_num}")
 
+    if not isinstance(transport, str):
+        raise TypeError("pld.tensor.all_to_all_v transport must be a compile-time string")
+    if transport not in ("mte", "urma"):
+        raise ValueError(f"pld.tensor.all_to_all_v transport must be 'mte' or 'urma', got {transport!r}")
     actual_span = _get_span_or_capture(span, frame_offset=1)
     core_num_expr = _normalize_expr(core_num, actual_span)
     _args: list[Expr] = [input, target, signal, send_counts, recv_counts, core_num_expr]
-    return _ir_core.create_op_call("pld.tensor.all_to_all_v", _args, {}, actual_span)
+    return _ir_core.create_op_call("pld.tensor.all_to_all_v", _args, {"transport": transport}, actual_span)
 
 
 __all__ = [

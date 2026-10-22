@@ -87,7 +87,7 @@ def _admitted_blocks(n_ranks: int, core_num: int) -> int:
 _CORE_NUMS = (1, 2, 4)
 
 
-def _build_l2_all_to_all_v_program(n_ranks: int, max_recv: int, core_num: int = 1):
+def _build_l2_all_to_all_v_program(n_ranks: int, max_recv: int, core_num: int = 1, transport: str = "mte"):
     """Build an N-rank CHIP-pipeline variable-size all-to-all program.
 
     Signal/counts shapes are per-rank-count, so the program is built by a
@@ -181,7 +181,9 @@ def _build_l2_all_to_all_v_program(n_ranks: int, max_recv: int, core_num: int = 
         not by an injected ordering token.
         """
         stage, counts = stage_step(inp, counts_row, stage, counts)
-        data = pld.tensor.all_to_all_v(stage, data, signal, counts, recv, core_num=core_num)
+        data = pld.tensor.all_to_all_v(
+            stage, data, signal, counts, recv, core_num=core_num, transport=transport
+        )
         return consume_step(data, recv, out, recv_out)
 
     @pl.jit.host
@@ -248,9 +250,10 @@ def _golden_inputs(nr: int, mr: int) -> tuple[torch.Tensor, torch.Tensor]:
 class TestL2TensorAllToAllV:
     """L2 managed all_to_all_v: one chip pipeline per rank, no nested dispatch."""
 
+    @pytest.mark.parametrize("transport", ["mte", "urma"])
     @pytest.mark.parametrize("core_num", _CORE_NUMS)
     @pytest.mark.parametrize("n_ranks", [2, 4])
-    def test_l2_all_to_all_v(self, test_config, device_ids, n_ranks, core_num):
+    def test_l2_all_to_all_v(self, test_config, device_ids, n_ranks, core_num, transport):
         """Compile and run the CHIP-pipeline all_to_all_v for P in {2, 4}, L in {1, 2, 4}.
 
         ``L > 1`` must produce results identical to ``L = 1``: the golden below
@@ -258,6 +261,9 @@ class TestL2TensorAllToAllV:
         """
         if len(device_ids) < n_ranks:
             pytest.skip(f"L2 all_to_all_v P={n_ranks} needs {n_ranks} devices, got {device_ids}")
+
+        if transport == "urma" and (test_config.platform != "a5" or core_num > n_ranks):
+            pytest.skip("URMA requires A5 and at most one AIV per rank")
 
         nr = n_ranks
         mr = MAX_RECV
@@ -267,7 +273,7 @@ class TestL2TensorAllToAllV:
         outputs = torch.zeros((nr, total, SIZE), dtype=torch.float32)
         recv_outputs = torch.zeros((nr, nr, 1), dtype=torch.int32)
 
-        program = _build_l2_all_to_all_v_program(nr, mr, core_num)
+        program = _build_l2_all_to_all_v_program(nr, mr, core_num, transport=transport)
         compiled = program.compile(
             inputs,
             send_counts,
@@ -290,7 +296,10 @@ class TestL2TensorAllToAllV:
         assert not any(p.name.startswith("builtin.tensor.") for p in next_levels.iterdir()), (
             "managed L2 all_to_all_v must not emit a builtin chip dispatch"
         )
-        kernel_src = next_levels / "chip_pipeline" / "kernels" / "aiv" / "__builtin_all_to_all_v__fp32.cpp"
+        suffix = "__urma" if transport == "urma" else ""
+        kernel_src = (
+            next_levels / "chip_pipeline" / "kernels" / "aiv" / f"__builtin_all_to_all_v__fp32{suffix}.cpp"
+        )
         assert kernel_src.is_file(), f"expected the rendered builtin kernel at {kernel_src}"
 
         compiled(inputs, send_counts, outputs, recv_outputs, config=RunConfig(platform=test_config.platform))

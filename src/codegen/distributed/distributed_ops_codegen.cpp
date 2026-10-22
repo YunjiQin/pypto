@@ -429,12 +429,15 @@ REGISTER_DISTRIBUTED_OP(builtin_tensor_all_to_all_v, "builtin.tensor.all_to_all_
   auto* dist_codegen = dynamic_cast<DistributedCodegen*>(&codegen);
   INTERNAL_CHECK(dist_codegen) << "builtin.tensor.all_to_all_v codegen requires DistributedCodegen";
   const auto dtype = op->GetAttr<DataType>("dtype");
-  const std::string variant = op->op_->name_ + "__" + dtype.ToString();
+  const auto transport = op->GetAttr<std::string>("transport", "mte");
+  const std::string variant =
+      op->op_->name_ + "__" + dtype.ToString() + (transport == "urma" ? "__urma" : "");
 
   if (dist_codegen->MarkBuiltinEmitted(variant)) {
     dist_codegen->RecordBuiltinNextLevel(
         op, variant,
         {{"dtype_cpp", dtype.ToCTypeString()},
+         {"transport_urma", transport == "urma" ? "1" : "0"},
          {"launch_core_count_method",
           pypto::backend::GetBackend()->GetHandler()->GetLaunchSpecCoreCountMethod()}});
   }

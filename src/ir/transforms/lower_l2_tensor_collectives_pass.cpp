@@ -173,11 +173,12 @@ struct BuiltinKernelSpec {
   std::vector<bool> param_distributed;
 };
 
-[[nodiscard]] BuiltinKernelSpec MakeAllToAllVKernelSpec(const DataType& dtype, const Span& span) {
+[[nodiscard]] BuiltinKernelSpec MakeAllToAllVKernelSpec(const DataType& dtype, const std::string& transport,
+                                                        const Span& span) {
   const auto element = ResolveBuiltinDType(dtype, span);
-  // The only substitution either rail makes: both reach the same argument
-  // layout, so the rendered kernel source is byte-identical between them.
-  auto template_vars = EncodeTemplateVars({{"dtype_cpp", element.cpp}});
+  // Both rails use the same dtype and compile-time transport substitutions.
+  auto template_vars =
+      EncodeTemplateVars({{"dtype_cpp", element.cpp}, {"transport_urma", transport == "urma" ? "1" : "0"}});
   // Read the template package off the builtin op rather than repeating the
   // string, so both rails render the same source by construction.
   const auto& template_dir =
@@ -185,7 +186,7 @@ struct BuiltinKernelSpec {
   INTERNAL_CHECK_SPAN(template_dir.has_value(), span)
       << "LowerL2TensorCollectives: builtin.tensor.all_to_all_v declares no template_dir";
   return BuiltinKernelSpec{
-      std::string("__builtin_all_to_all_v__") + element.suffix,
+      std::string("__builtin_all_to_all_v__") + element.suffix + (transport == "urma" ? "__urma" : ""),
       *template_dir,
       std::move(template_vars),
       {ParamDirection::In, ParamDirection::InOut, ParamDirection::InOut, ParamDirection::In,
@@ -196,8 +197,8 @@ struct BuiltinKernelSpec {
       // source). `send_counts` is required to be window-bound at the call site
       // on this rail (peers pull it through CommRemotePtr; see LowerCollective),
       // but BOTH are declared as plain `Tensor*` here: the synthesized
-      // signature fixes the ABI and the variant stays keyed on dtype alone. The
-      // three genuinely window-bound operands stay distributed, which is also
+      // signature fixes the ABI; dtype and transport determine the variant.
+      // The three window-bound operands stay distributed, which is also
       // what gives MaterializeDistTensorCtx the CommCtx parameters the kernel
       // needs.
       //
@@ -228,7 +229,7 @@ struct BuiltinKernelSpec {
 /// signature whose CommCtx parameter count no longer matches its arguments,
 /// because MaterializeDistTensorCtx appends one per DistributedTensor
 /// parameter. Declaring a canonical type instead keeps the variant keyed on
-/// dtype alone, which is the only thing that actually changes the kernel.
+/// dtype and transport, the compile-time choices that change the kernel.
 [[nodiscard]] TypePtr CanonicalParamType(bool distributed, const ExprPtr& arg, const Span& span) {
   auto arg_type = AsTensorTypeLike(arg->GetType());
   INTERNAL_CHECK_SPAN(arg_type, span) << "LowerL2TensorCollectives: collective operand must be Tensor-like";
@@ -382,6 +383,9 @@ class LowerL2TensorCollectivesMutator : public IRMutator {
         << "LowerL2TensorCollectives: pld.tensor.all_to_all_v signal [NR, S] must be positive, got ["
         << nranks << ", " << signal_stride << "]";
     const int64_t launched_blocks = CalAllToAllVBlocks(nranks, requested_blocks);
+    CHECK_SPAN(call->GetKwarg<std::string>("transport", "mte") != "urma" || launched_blocks <= nranks,
+               call->span_)
+        << "URMA all_to_all_v requires admitted block count <= rank count (one writer per peer queue)";
 
     // A stride narrower than the launched gang is a defect, not something the
     // kernel should clamp its way past (RFC #2521 §13.3). Compare against the
@@ -404,8 +408,9 @@ class LowerL2TensorCollectivesMutator : public IRMutator {
            "rank's send vector through CommRemotePtr, so a plain Tensor (accepted only on the InCore "
            "composite path) is not supported on this rail";
 
-    auto spec = MakeAllToAllVKernelSpec(target_type->dtype_, call->span_);
-    // One kernel per dtype, shared by every call site in the Program. The
+    auto spec = MakeAllToAllVKernelSpec(target_type->dtype_, call->GetKwarg<std::string>("transport", "mte"),
+                                        call->span_);
+    // One kernel per dtype and transport, shared by call sites in the Program. The
     // kernel reads each extent from the runtime `Tensor` descriptor
     // (`target_tensor->shapes[]`, `ndims`), so shape is deliberately *not* part
     // of the variant key: two exchanges of different sizes reusing one kernel

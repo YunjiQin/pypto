@@ -16,14 +16,18 @@ from pathlib import Path
 import pytest
 
 
-@pytest.fixture(scope="module")
-def transport_probe(tmp_path_factory: pytest.TempPathFactory) -> Path:
+@pytest.fixture(scope="module", params=["mte", "urma"])
+def transport_probe(
+    tmp_path_factory: pytest.TempPathFactory, request: pytest.FixtureRequest
+) -> tuple[Path, str]:
+    transport = getattr(request, "param")
+    assert isinstance(transport, str)
     compiler = shutil.which("c++")
     if compiler is None:
         pytest.skip("transport probe requires a C++17 host compiler")
     root = Path(__file__).resolve().parents[3]
     template = root / "python/pypto/runtime/builtins/collectives/all_to_all_v/templates/kernel.cpp.in"
-    text = template.read_text()
+    text = template.read_text().replace("{{transport_urma}}", str(int(transport == "urma")))
     begin = text.index("template <typename T>\nAICORE inline __gm__ T *CommRemotePtr")
     end = text.index("// N-way credit barrier", begin)
     folder = tmp_path_factory.mktemp("urma_transport")
@@ -36,6 +40,7 @@ def transport_probe(tmp_path_factory: pytest.TempPathFactory) -> Path:
 #define AICORE
 #define __gm__
 #define PTO_URMA_SUPPORTED
+#define USE_URMA TRANSPORT_URMA
 #define PTO_ASSERT(condition, message) ((void)0)
 struct CommContext { uint64_t windowsIn[2]; uint64_t workSpace; uint32_t rankId; };
 int posts = 0, waits = 0, mte = 0;
@@ -48,8 +53,8 @@ struct AsyncSession {};
 namespace urma {
 uint64_t UrmaPeerMrBaseAddr(uint8_t *, uint32_t) { return registered_base; }
 }
-template <DmaEngine> bool BuildAsyncSession(uint8_t *, uint32_t, AsyncSession &) {
-    return session_ok;
+template <DmaEngine> bool BuildAsyncSession(uint8_t *workspace, uint32_t, AsyncSession &) {
+    return session_ok && workspace;
 }
 struct Event {
     int *dst;
@@ -77,7 +82,7 @@ int main(int argc, char **argv) {
     registered_base = reinterpret_cast<uint64_t>(registered);
     const char *mode = argv[1];
     if (!std::strcmp(mode, "address"))
-        return PayloadRemotePtr(&ctx, local + 3, 1) == registered + 3 ? 0 : 2;
+        return PayloadRemotePtr(&ctx, local + 3, 1) == (USE_URMA ? registered : ipc) + 3 ? 0 : 2;
     if (!std::strcmp(mode, "unregistered")) {
         registered_base = 0;
         PayloadRemotePtr(&ctx, local + 3, 1);
@@ -90,15 +95,26 @@ int main(int argc, char **argv) {
     completion_ok = std::strcmp(mode, "bad_completion");
     int src = 73, dst = 0, tile = 0;
     PushPayload(dst, src, tile, &ctx, peer);
-    const bool fallback = !ctx.workSpace || peer == 0;
+    const bool fallback = !USE_URMA || peer == 0;
     return dst == src && (fallback ? mte == 1 && posts == 0 && waits == 0
                                   : mte == 0 && posts == 1 && waits == 1) ? 0 : 4;
 }
 """
     )
     binary = folder / "probe"
-    subprocess.run([compiler, "-std=c++17", "-O2", str(source), "-o", str(binary)], check=True)
-    return binary
+    subprocess.run(
+        [
+            compiler,
+            "-std=c++17",
+            "-O2",
+            f"-DTRANSPORT_URMA={int(transport == 'urma')}",
+            str(source),
+            "-o",
+            str(binary),
+        ],
+        check=True,
+    )
+    return binary, transport
 
 
 @pytest.mark.parametrize(
@@ -114,8 +130,13 @@ int main(int argc, char **argv) {
         ("bad_completion", 42),
     ],
 )
-def test_release_transport_contract(transport_probe: Path, mode: str, returncode: int) -> None:
-    result = subprocess.run([str(transport_probe), mode], check=False)
+def test_release_transport_contract(transport_probe: tuple[Path, str], mode: str, returncode: int) -> None:
+    binary, transport = transport_probe
+    if transport == "mte":
+        returncode = 3 if mode == "unregistered" else 0
+    elif mode == "no_workspace":
+        returncode = 42
+    result = subprocess.run([str(binary), mode], check=False)
     assert result.returncode == returncode, mode
 
 

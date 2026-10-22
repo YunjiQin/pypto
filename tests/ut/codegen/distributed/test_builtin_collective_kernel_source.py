@@ -21,8 +21,8 @@ AIV kernel from the *same* template
   ``builtin_template_dir`` / ``builtin_template_vars``, and the PTO backend
   renders the same template into the chip sub-build.
 
-``dtype_cpp`` is the only substitution either rail makes and both give it the
-same value, so the rendered sources must be **byte-identical**. That is the
+Both rails substitute the same dtype and compile-time transport values, so the
+rendered sources must be **byte-identical**. That is the
 property under test: it is what makes "one transport implementation, two rails"
 true rather than aspirational. A change that reintroduces a per-rail difference
 in the kernel body — an extra template variable, a rail-specific ``#ifdef`` —
@@ -42,6 +42,7 @@ import pypto.language.distributed as pld
 import pytest
 from pypto import ir
 from pypto.ir import DistributedConfig
+from pypto.language.parser.diagnostics import InvalidOperationError
 from pypto.pypto_core import passes
 
 
@@ -67,15 +68,22 @@ def _dtype_of(name: str):
     return {"fp32": pl.FP32, "int8": pl.INT8}[name]
 
 
-def _variant_of(name: str) -> str:
-    return f"builtin.tensor.all_to_all_v__{name}"
+def _variant_of(name: str, transport: str = "mte") -> str:
+    return f"builtin.tensor.all_to_all_v__{name}" + ("__urma" if transport == "urma" else "")
 
 
-def _l2_kernel_of(name: str) -> str:
-    return f"__builtin_all_to_all_v__{name}.cpp"
+def _l2_kernel_of(name: str, transport: str = "mte") -> str:
+    suffix = "__urma" if transport == "urma" else ""
+    return f"__builtin_all_to_all_v__{name}{suffix}.cpp"
 
 
-def _build_chip_rail_program(dtype_name: str = "fp32", core_num: int = 1, signal_stride: int = 1):
+def _build_chip_rail_program(
+    dtype_name: str = "fp32",
+    core_num: int = 1,
+    signal_stride: int = 1,
+    transport: str = "mte",
+    mixed: bool = False,
+):
     """CHIP/L2 rail: the collective written in a CHIP orchestration body.
 
     Identical to the HOST program below except for *where* the collective is
@@ -85,6 +93,7 @@ def _build_chip_rail_program(dtype_name: str = "fp32", core_num: int = 1, signal
     ``core_num`` / ``signal_stride`` choose the requested block limit and the
     signal's per-block lane count ``S`` (the signal is ``[NR, S]``).
     """
+    second_transport = "mte" if mixed else transport
     dtype = _dtype_of(dtype_name)
     payload_bytes = TOTAL * SIZE * dtype.get_byte()
     i32_bytes = NR * pl.INT32.get_byte()
@@ -100,13 +109,22 @@ def _build_chip_rail_program(dtype_name: str = "fp32", core_num: int = 1, signal
             signal: pl.InOut[pld.DistributedTensor[[NR, signal_stride], pl.INT32]],
             counts: pl.InOut[pld.DistributedTensor[[NR, 1], pl.INT32]],
             recv: pl.InOut[pld.DistributedTensor[[NR, 1], pl.INT32]],
+            signal2: pl.InOut[pld.DistributedTensor[[NR, signal_stride], pl.INT32]],
+            recv2: pl.InOut[pld.DistributedTensor[[NR, 1], pl.INT32]],
         ) -> pld.DistributedTensor[[TOTAL, SIZE], dtype]:
-            return pld.tensor.all_to_all_v(stage, data, signal, counts, recv, core_num=core_num)
+            data = pld.tensor.all_to_all_v(
+                stage, data, signal, counts, recv, core_num=core_num, transport=transport
+            )
+            return pld.tensor.all_to_all_v(
+                stage, data, signal2, counts, recv2, core_num=core_num, transport=second_transport
+            )
 
         @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
         def host_orch(self):
             stage_buf = pld.alloc_window_buffer(payload_bytes)
             data_buf = pld.alloc_window_buffer(payload_bytes)
+            signal2_buf = pld.alloc_window_buffer(signal_bytes)
+            recv2_buf = pld.alloc_window_buffer(i32_bytes)
             signal_buf = pld.alloc_window_buffer(signal_bytes)
             counts_buf = pld.alloc_window_buffer(i32_bytes)
             recv_buf = pld.alloc_window_buffer(i32_bytes)
@@ -117,12 +135,14 @@ def _build_chip_rail_program(dtype_name: str = "fp32", core_num: int = 1, signal
                 sig = pld.window(signal_buf, [NR, signal_stride], dtype=pl.INT32)
                 counts = pld.window(counts_buf, [NR, 1], dtype=pl.INT32)
                 recv = pld.window(recv_buf, [NR, 1], dtype=pl.INT32)
-                self.chip_pipeline(stage, data, sig, counts, recv, device=r)
+                sig2 = pld.window(signal2_buf, [NR, signal_stride], dtype=pl.INT32)
+                recv2 = pld.window(recv2_buf, [NR, 1], dtype=pl.INT32)
+                self.chip_pipeline(stage, data, sig, counts, recv, sig2, recv2, device=r)
 
     return ChipRail
 
 
-def _build_host_rail_program(dtype_name: str = "fp32"):
+def _build_host_rail_program(dtype_name: str = "fp32", transport: str = "mte", mixed: bool = False):
     """HOST/L3 rail: the collective written in the host orchestrator.
 
     Mirrors the CHIP program: same five windows, same one dispatch per rank.
@@ -131,6 +151,7 @@ def _build_host_rail_program(dtype_name: str = "fp32"):
     ``MaterializeCommDomainScopes`` infers a window's comm domain from the
     dispatches that consume it.
     """
+    second_transport = "mte" if mixed else transport
     dtype = _dtype_of(dtype_name)
     payload_bytes = TOTAL * SIZE * dtype.get_byte()
     i32_bytes = NR * pl.INT32.get_byte()
@@ -191,7 +212,8 @@ def _build_host_rail_program(dtype_name: str = "fp32"):
                 r_recv = pld.window(recv_buf, [NR, 1], dtype=pl.INT32)
                 self.touch_orch(r_stage, r_data, r_sig, r_counts, r_recv, device=r)
 
-            pld.tensor.all_to_all_v(stage, data, sig, counts, recv)
+            data = pld.tensor.all_to_all_v(stage, data, sig, counts, recv, transport=transport)
+            pld.tensor.all_to_all_v(stage, data, sig, counts, recv, transport=second_transport)
 
     return HostRail
 
@@ -214,23 +236,61 @@ def _sole_file(directory, pattern):
 
 
 @pytest.mark.parametrize("dtype_name", ["fp32", "int8"])
-def test_both_rails_render_a_byte_identical_builtin_kernel(tmp_path, dtype_name):
+@pytest.mark.parametrize("transport", ["mte", "urma"])
+def test_both_rails_render_a_byte_identical_builtin_kernel(tmp_path, dtype_name, transport):
     """The two rails' rendered kernel sources must match exactly."""
-    chip = _compile(_build_chip_rail_program(dtype_name), tmp_path, f"chip_{dtype_name}")
-    host = _compile(_build_host_rail_program(dtype_name), tmp_path, f"host_{dtype_name}")
+    chip = _compile(_build_chip_rail_program(dtype_name, transport=transport), tmp_path, f"chip_{dtype_name}")
+    host = _compile(_build_host_rail_program(dtype_name, transport=transport), tmp_path, f"host_{dtype_name}")
 
     chip_kernel = (
-        chip.output_dir / "next_levels" / "chip_pipeline" / "kernels" / "aiv" / _l2_kernel_of(dtype_name)
+        chip.output_dir
+        / "next_levels"
+        / "chip_pipeline"
+        / "kernels"
+        / "aiv"
+        / _l2_kernel_of(dtype_name, transport)
     )
     assert chip_kernel.is_file(), f"expected the rendered CHIP kernel at {chip_kernel}"
     host_kernel = _sole_file(
-        host.output_dir / "next_levels" / _variant_of(dtype_name) / "kernels" / "aiv", "*.cpp"
+        host.output_dir / "next_levels" / _variant_of(dtype_name, transport) / "kernels" / "aiv", "*.cpp"
     )
 
     assert host_kernel.read_text() == chip_kernel.read_text(), (
         "HOST and CHIP rails must render the same builtin kernel source; a difference means "
         "the two rails no longer share one transport implementation"
     )
+
+    assert "{{transport_urma}}" not in chip_kernel.read_text()
+    assert f"#if {int(transport == 'urma')}" in chip_kernel.read_text()
+
+
+@pytest.mark.parametrize("transport", ["auto", "invalid", 1, None])
+def test_invalid_transport_rejected(transport):
+    with pytest.raises(InvalidOperationError, match="transport"):
+        _build_chip_rail_program(transport=transport)
+
+
+def test_urma_rejects_shared_queue_writers(tmp_path):
+    with pytest.raises(ValueError, match="one writer per peer queue"):
+        _compile(
+            _build_chip_rail_program(core_num=4, signal_stride=4, transport="urma"), tmp_path, "bad_urma"
+        )
+
+
+@pytest.mark.parametrize("rail", ["host", "chip"])
+def test_transport_variants_coexist(tmp_path, rail):
+    factory = _build_host_rail_program if rail == "host" else _build_chip_rail_program
+    compiled = _compile(factory(transport="urma", mixed=True), tmp_path, rail)
+    if rail == "host":
+        for transport in ("mte", "urma"):
+            directory = (
+                compiled.output_dir / "next_levels" / _variant_of("fp32", transport) / "kernels" / "aiv"
+            )
+            assert _sole_file(directory, "*.cpp").is_file()
+    else:
+        directory = compiled.output_dir / "next_levels" / "chip_pipeline" / "kernels" / "aiv"
+        for transport in ("mte", "urma"):
+            assert (directory / _l2_kernel_of("fp32", transport)).is_file()
 
 
 def _chip_orchestration_sources(output_dir) -> str:

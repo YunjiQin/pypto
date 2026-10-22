@@ -418,10 +418,12 @@ void CheckHostWindowBoundArg(const ExprPtr& expr, const char* op_name, const cha
   CHECK_SPAN(!core_num_const || core_num_const->value_ > 0, call->span_)
       << "HOST pld.tensor.all_to_all_v core_num must be positive, got " << core_num_const->value_;
 
+  const auto transport = call->GetKwarg<std::string>("transport", "mte");
   return MakeBuiltinCallWithAttrs(
       "builtin.tensor.all_to_all_v", call,
       {call->args_[0], call->args_[1], call->args_[2], call->args_[3], call->args_[4], call->args_[5]},
-      {{"dtype", target_type->dtype_}}, device, {{"dtype", target_type->dtype_}},
+      {{"dtype", target_type->dtype_}, {"transport", transport}}, device,
+      {{"dtype", target_type->dtype_}, {"transport", transport}},
       {ArgDirection::Input, ArgDirection::InOut, ArgDirection::InOut, ArgDirection::Input,
        ArgDirection::InOut, ArgDirection::Input});
 }

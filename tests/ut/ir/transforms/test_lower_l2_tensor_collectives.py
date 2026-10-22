@@ -154,7 +154,7 @@ def test_synthesized_kernel_carries_builtin_template_attrs():
     # argument layout, so the rendered kernel source is byte-identical between
     # them (asserted end-to-end in the ST).
     template_vars = dict(item.split("=", 1) for item in attrs["builtin_template_vars"].split(","))
-    assert template_vars == {"dtype_cpp": "float"}
+    assert template_vars == {"dtype_cpp": "float", "transport_urma": "0"}
 
 
 def test_synthesized_kernel_returns_its_target_parameter():
@@ -234,7 +234,8 @@ def test_collective_embedded_in_a_return_is_lowered():
     assert _get_func(result, _KERNEL_NAME) is not None
 
 
-def test_incore_collective_is_left_alone():
+@pytest.mark.parametrize("transport", ["mte", "urma"])
+def test_incore_collective_is_left_alone(transport):
     """Only orchestration bodies are this rail's business."""
 
     @pl.program
@@ -248,7 +249,7 @@ def test_incore_collective_is_left_alone():
             signal: pl.InOut[pld.DistributedTensor[[NR, 1], pl.INT32]],
             recv: pl.InOut[pld.DistributedTensor[[NR, 1], pl.INT32]],
         ) -> pld.DistributedTensor[[TOTAL, SIZE], pl.FP32]:
-            return pld.tensor.all_to_all_v(inp, data, signal, counts, recv)
+            return pld.tensor.all_to_all_v(inp, data, signal, counts, recv, transport=transport)
 
     # The composite rail (LowerCompositeOps) owns this one, and it runs 25
     # passes earlier — so by this point in the pipeline an InCore collective is
@@ -258,6 +259,10 @@ def test_incore_collective_is_left_alone():
     step = _get_func(result, "exchange_step")
     assert step is not None
     assert _callee_names(step) == [_ALL_TO_ALL_V]
+
+    if transport == "urma":
+        with pytest.raises(ValueError, match="InCore all_to_all_v supports transport='mte' only"):
+            passes.lower_composite_ops()(InCoreExchange)
 
 
 def test_kernel_signature_is_canonical_not_call_site_typed():
@@ -551,7 +556,7 @@ def test_int8_synthesizes_int8_variant():
     assert kernel is not None
     attrs = dict(kernel.attrs)
     template_vars = dict(item.split("=", 1) for item in attrs["builtin_template_vars"].split(","))
-    assert template_vars == {"dtype_cpp": "int8_t"}
+    assert template_vars == {"dtype_cpp": "int8_t", "transport_urma": "0"}
 
 
 if __name__ == "__main__":
