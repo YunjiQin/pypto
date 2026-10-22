@@ -19,6 +19,7 @@
 #include <torch_npu/csrc/core/npu/sys_ctrl/npu_sys_ctrl.h>
 
 #include <cstdint>
+#include <string>
 
 #include "pypto/core/error.h"
 
@@ -27,23 +28,29 @@ namespace {
 void Require(bool condition, const char* message) {
   if (!condition) throw pypto::ValueError(message);
 }
+
+void CheckAcl(aclError result, const char* operation) {
+  if (result != ACL_SUCCESS) {
+    throw pypto::RuntimeError(std::string(operation) + " failed with ACL error " + std::to_string(result));
+  }
+}
+
 bool FrameworkAlive() { return c10_npu::NpuSysCtrl::GetInstance().GetInitFlag(); }
 
 uintptr_t BorrowContext(int32_t device_id) {
   Require(FrameworkAlive(), "Cannot borrow a context after torch_npu teardown");
   int32_t current = -1;
   aclrtContext context = nullptr;
-  Require(aclrtGetDevice(&current) == ACL_SUCCESS && current == device_id,
-          "Kernel lifecycle must borrow the current torch NPU device");
-  Require(aclrtGetCurrentContext(&context) == ACL_SUCCESS && context != nullptr,
-          "Cannot borrow the current torch NPU context");
+  CheckAcl(aclrtGetDevice(&current), "aclrtGetDevice");
+  Require(current == device_id, "Kernel lifecycle must borrow the current torch NPU device");
+  CheckAcl(aclrtGetCurrentContext(&context), "aclrtGetCurrentContext");
+  Require(context != nullptr, "Cannot borrow the current torch NPU context");
   return reinterpret_cast<uintptr_t>(context);
 }
 
 void BindContext(uintptr_t context) {
   Require(FrameworkAlive() && context != 0, "Kernel lifecycle cannot use a torn-down framework context");
-  Require(aclrtSetCurrentContext(reinterpret_cast<aclrtContext>(context)) == ACL_SUCCESS,
-          "Cannot bind the borrowed framework context to the kernel lifecycle thread");
+  CheckAcl(aclrtSetCurrentContext(reinterpret_cast<aclrtContext>(context)), "aclrtSetCurrentContext");
 }
 
 c10_npu::NPUStream CallStream(int64_t stream_id, int32_t device_id) {
@@ -64,8 +71,7 @@ NB_MODULE(_torch_npu, m) {
     auto stream = CallStream(stream_id, device_id);
     aclmdlRICaptureStatus status{};
     aclmdlRI model = nullptr;
-    Require(aclmdlRICaptureGetInfo(stream.stream(false), &status, &model) == ACL_SUCCESS,
-            "Cannot query kernel initialization capture state");
+    CheckAcl(aclmdlRICaptureGetInfo(stream.stream(false), &status, &model), "aclmdlRICaptureGetInfo");
     Require(status == ACL_MODEL_RI_CAPTURE_STATUS_NONE || status == ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE,
             "Kernel initialization encountered an invalidated graph capture");
     return status == ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE;
