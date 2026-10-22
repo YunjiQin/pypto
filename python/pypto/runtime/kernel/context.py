@@ -23,8 +23,7 @@ from pypto.ir.compiled_artifact import CompiledArtifact
 from pypto.runtime._execution_mode import claim_kernel_mode
 
 from .callable import KernelRegistration, artifact_identity
-from .config import KernelConfig
-from .worker import _NativeWorker
+from .session import KernelConfig, _BorrowedWorkerSession
 
 
 class KernelState(Enum):
@@ -101,7 +100,7 @@ class _ProcessKernelState:
             self._initializing_thread = threading.current_thread()
             self.state = KernelState.INITIALIZING
         try:
-            self._worker = _NativeWorker(config, self)
+            self._worker = _BorrowedWorkerSession(config, self)
             self._worker.init(config)
         except BaseException as exc:
             with self._condition:

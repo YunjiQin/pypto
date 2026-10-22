@@ -14,7 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 from pypto.runtime import _execution_mode
-from pypto.runtime.kernel import _compat
+from pypto.runtime.kernel import session
 from pypto.runtime.kernel.context import KernelState
 from pypto.torch import init, interop, launch
 
@@ -38,7 +38,7 @@ def framework(kernel_env, monkeypatch):
                 raise fake.config_error
 
     fake.config_error = None
-    monkeypatch.setattr(_compat, "require_runtime", lambda: SimpleNamespace(CallConfig=CallConfig))
+    monkeypatch.setattr(session, "require_runtime", lambda: SimpleNamespace(CallConfig=CallConfig))
     monkeypatch.setattr(
         launch,
         "_load_native",
@@ -103,7 +103,7 @@ def test_preflight_failure_is_retryable(kernel_env, framework, monkeypatch, fail
             def fail_runtime():
                 raise NotImplementedError("missing borrowed init")
 
-            patch.setattr(_compat, "require_runtime", fail_runtime)
+            patch.setattr(session, "require_runtime", fail_runtime)
         else:
 
             def fail_context(device):
@@ -145,10 +145,10 @@ def test_program_claim_and_closed_state_reject_init(kernel_env, framework):
 def test_new_modules_import_without_optional_runtime(run_without_optional_runtime):
     result = run_without_optional_runtime("""
 import pypto.torch
-from pypto.runtime.kernel import context, config, pending, worker, _compat
+from pypto.runtime.kernel import context, pending, session
 from pypto.torch import execution, launch, shutdown
 assert pypto.torch.__all__ == ['init']
-assert config.KernelConfig('a2a3', 'host_build_graph', 0).device_id == 0
+assert session.KernelConfig('a2a3', 'host_build_graph', 0).device_id == 0
 assert context.get_process_kernel_state().state is context.KernelState.UNINITIALIZED
 """)
     assert result.returncode == 0, result.stderr

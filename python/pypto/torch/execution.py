@@ -40,10 +40,9 @@ def init(  # noqa: PLR0913
     passed to the public Worker. Graph capture is unsupported. This stage exposes
     initialization only; direct JIT calls retain their program execution path.
     """
-    from pypto.runtime.kernel import _compat  # noqa: PLC0415
-    from pypto.runtime.kernel.config import KernelConfig  # noqa: PLC0415
+    from pypto.runtime.kernel import session  # noqa: PLC0415
     from pypto.runtime.kernel.context import get_process_kernel_state  # noqa: PLC0415
-    from pypto.runtime.kernel.worker import make_call_config  # noqa: PLC0415
+    from pypto.runtime.kernel.session import KernelConfig, make_call_config  # noqa: PLC0415
 
     from . import interop, launch, shutdown  # noqa: PLC0415
 
@@ -73,7 +72,7 @@ def init(  # noqa: PLR0913
         )
     config = replace(config, device_id=current)
     shutdown.require_supported_framework(framework)
-    api = _compat.require_runtime()
+    api = session.require_runtime()
     make_call_config(config, api.CallConfig)
     native = launch._load_native()
     stream = framework.npu.current_stream(current)

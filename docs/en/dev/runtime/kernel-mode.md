@@ -92,6 +92,18 @@ and the public registration/DFX APIs remain separate migration steps.
 
 ## Process initialization and lifecycle
 
+The internal `runtime/kernel` package groups code by ownership:
+
+- `session.py`: configuration, runtime capability checks and `_BorrowedWorkerSession`,
+  which binds lifecycle operations on a public `simpler.Worker` to the Torch context.
+- `context.py`: process state, concurrent registration reuse and pending-ticket cleanup.
+- `owner.py`: the lifecycle owner thread.
+- `callable.py`: shared artifact identity and context-bound registration records.
+- `pending.py`: callback result publication and per-call resource retention.
+
+The session is a lifecycle adapter, not a separate execution engine. Simpler owns
+callable registration and execution; the process manager owns admission and caches.
+
 `pypto.torch.init()` explicitly borrows the current torch_npu device context. It
 supports onboard `a2a3` with `tensormap_and_ringbuffer` or `host_build_graph`.
 An explicit `device` must equal the framework's current device; initialization

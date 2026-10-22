@@ -14,9 +14,9 @@ import threading
 from types import SimpleNamespace
 
 import pytest
-from pypto.runtime.kernel import _compat, worker
-from pypto.runtime.kernel.config import KernelConfig
+from pypto.runtime.kernel import session
 from pypto.runtime.kernel.context import _ProcessKernelState
+from pypto.runtime.kernel.session import KernelConfig
 from pypto.torch import shutdown
 
 
@@ -95,7 +95,7 @@ def public_runtime(monkeypatch):
     )
     for name in ("simpler", "simpler.task_interface", "simpler.worker"):
         monkeypatch.setitem(sys.modules, name, api)
-    monkeypatch.setattr(_compat, "check_runtime_pin", lambda: events.append(("pin",)))
+    monkeypatch.setattr(session, "check_runtime_pin", lambda: events.append(("pin",)))
     native = SimpleNamespace(
         borrow_context=lambda device: 987,
         bind_context=lambda context: events.append(("bind", threading.get_ident(), context)),
@@ -120,7 +120,7 @@ def test_public_worker_receives_config_generation_and_opaque_handle(public_runti
         4096,
     )
     state = _ProcessKernelState()
-    adapter = worker._NativeWorker(cfg, state)
+    adapter = session._BorrowedWorkerSession(cfg, state)
     caller = threading.get_ident()
     adapter.init(cfg)
     target = object()
@@ -153,7 +153,7 @@ def test_public_worker_receives_config_generation_and_opaque_handle(public_runti
 def test_context_mismatch_and_register_error_keep_original_semantics(public_runtime, monkeypatch):
     api, native = public_runtime
     cfg = KernelConfig("a2a3", "tensormap_and_ringbuffer", 0)
-    adapter = worker._NativeWorker(cfg, _ProcessKernelState())
+    adapter = session._BorrowedWorkerSession(cfg, _ProcessKernelState())
     adapter.init(cfg)
     monkeypatch.setattr(native, "borrow_context", lambda device: 988)
     with pytest.raises(RuntimeError, match="different borrowed context"):
@@ -190,21 +190,21 @@ def test_capability_guard_rejects_missing_public_contract(public_runtime, monkey
     else:
         monkeypatch.delattr(api.Worker, "flush_diagnostics")
     with pytest.raises(NotImplementedError):
-        _compat.require_runtime()
+        session.require_runtime()
 
 
 def test_pin_error_is_not_reclassified_and_old_supported_bit_is_ignored(public_runtime, monkeypatch):
     api, _ = public_runtime
     api.kernel_mode_supported = 0
-    assert _compat.require_runtime().Worker is api.Worker
+    assert session.require_runtime().Worker is api.Worker
     error = ValueError("native revision mismatch")
 
     def reject():
         raise error
 
-    monkeypatch.setattr(_compat, "check_runtime_pin", reject)
+    monkeypatch.setattr(session, "check_runtime_pin", reject)
     with pytest.raises(ValueError) as caught:
-        _compat.require_runtime()
+        session.require_runtime()
     assert caught.value is error
 
 
@@ -214,7 +214,7 @@ def test_owner_thread_reentrancy_fails_instead_of_waiting(kernel_env, public_run
 
     env = kernel_env
     api, _ = public_runtime
-    monkeypatch.setattr(context, "_NativeWorker", worker._NativeWorker)
+    monkeypatch.setattr(context, "_BorrowedWorkerSession", session._BorrowedWorkerSession)
     if operation == "init":
         monkeypatch.setattr(api.Worker, "init", lambda self, **kwargs: env.state.ensure_worker(env.config))
     elif operation == "close":
@@ -225,7 +225,7 @@ def test_owner_thread_reentrancy_fails_instead_of_waiting(kernel_env, public_run
             api.Worker, "register", lambda self, target: env.state.ensure_callable(env.artifact(), env.config)
         )
     # The signature capability check is a separate test; preserve the real adapter here.
-    monkeypatch.setattr(worker, "require_runtime", lambda: api)
+    monkeypatch.setattr(session, "require_runtime", lambda: api)
     try:
         with pytest.raises(RuntimeError, match="[Rr]eentrant|owner thread"):
             if operation == "prepare":
@@ -239,7 +239,7 @@ def test_owner_thread_reentrancy_fails_instead_of_waiting(kernel_env, public_run
 def test_retirement_binds_context_on_owner_before_releasing_sources(public_runtime):
     api, _ = public_runtime
     config = KernelConfig("a2a3", "tensormap_and_ringbuffer", 0)
-    adapter = worker._NativeWorker(config, _ProcessKernelState())
+    adapter = session._BorrowedWorkerSession(config, _ProcessKernelState())
     adapter.init(config)
 
     def wait():
