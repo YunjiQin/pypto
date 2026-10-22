@@ -2773,18 +2773,16 @@ if __name__ == "__main__":
     pytest.main([__file__, "-v"])
 
 
-@pytest.mark.parametrize("transport", ["mte", "urma"])
-def test_all_to_all_v_transport_attribute(transport):
+@pytest.mark.parametrize("engine", ["mte", "urma"])
+def test_all_to_all_v_engine_attribute(engine):
     span = ir.Span.unknown()
     args = _make_all_to_all_v_args(span)
-    call = ir.create_op_call("pld.tensor.all_to_all_v", args, {"transport": transport}, span)
-    assert dict(call.kwargs)["transport"] == transport
+    call = ir.create_op_call("pld.tensor.all_to_all_v", args, {"engine": engine}, span)
+    assert dict(call.kwargs)["engine"] == engine
 
 
-@pytest.mark.parametrize("transport", ["auto", "invalid"])
-def test_all_to_all_v_rejects_invalid_transport_in_raw_ir(transport):
+@pytest.mark.parametrize("engine", ["auto", "invalid"])
+def test_all_to_all_v_rejects_invalid_engine_in_raw_ir(engine):
     span = ir.Span.unknown()
-    with pytest.raises(ValueError, match="transport"):
-        ir.create_op_call(
-            "pld.tensor.all_to_all_v", _make_all_to_all_v_args(span), {"transport": transport}, span
-        )
+    with pytest.raises(ValueError, match="engine"):
+        ir.create_op_call("pld.tensor.all_to_all_v", _make_all_to_all_v_args(span), {"engine": engine}, span)

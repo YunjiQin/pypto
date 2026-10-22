@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""Execute the builtin transport helpers with a release-mode URMA test double."""
+"""Execute the builtin engine helpers with a release-mode URMA test double."""
 
 import shutil
 import subprocess
@@ -17,20 +17,20 @@ import pytest
 
 
 @pytest.fixture(scope="module", params=["mte", "urma"])
-def transport_probe(
+def engine_probe(
     tmp_path_factory: pytest.TempPathFactory, request: pytest.FixtureRequest
 ) -> tuple[Path, str]:
-    transport = getattr(request, "param")
-    assert isinstance(transport, str)
+    engine = getattr(request, "param")
+    assert isinstance(engine, str)
     compiler = shutil.which("c++")
     if compiler is None:
-        pytest.skip("transport probe requires a C++17 host compiler")
+        pytest.skip("engine probe requires a C++17 host compiler")
     root = Path(__file__).resolve().parents[3]
     template = root / "python/pypto/runtime/builtins/collectives/all_to_all_v/templates/kernel.cpp.in"
-    text = template.read_text().replace("{{transport_urma}}", str(int(transport == "urma")))
+    text = template.read_text().replace("{{engine_urma}}", str(int(engine == "urma")))
     begin = text.index("template <typename T>\nAICORE inline __gm__ T *CommRemotePtr")
     end = text.index("// N-way credit barrier", begin)
-    folder = tmp_path_factory.mktemp("urma_transport")
+    folder = tmp_path_factory.mktemp("urma_engine")
     source = folder / "probe.cpp"
     source.write_text(
         r"""
@@ -40,7 +40,7 @@ def transport_probe(
 #define AICORE
 #define __gm__
 #define PTO_URMA_SUPPORTED
-#define USE_URMA TRANSPORT_URMA
+#define USE_URMA ENGINE_URMA
 #define PTO_ASSERT(condition, message) ((void)0)
 struct CommContext { uint64_t windowsIn[2]; uint64_t workSpace; uint32_t rankId; };
 int posts = 0, waits = 0, mte = 0;
@@ -107,14 +107,14 @@ int main(int argc, char **argv) {
             compiler,
             "-std=c++17",
             "-O2",
-            f"-DTRANSPORT_URMA={int(transport == 'urma')}",
+            f"-DENGINE_URMA={int(engine == 'urma')}",
             str(source),
             "-o",
             str(binary),
         ],
         check=True,
     )
-    return binary, transport
+    return binary, engine
 
 
 @pytest.mark.parametrize(
@@ -130,9 +130,9 @@ int main(int argc, char **argv) {
         ("bad_completion", 42),
     ],
 )
-def test_release_transport_contract(transport_probe: tuple[Path, str], mode: str, returncode: int) -> None:
-    binary, transport = transport_probe
-    if transport == "mte":
+def test_release_engine_contract(engine_probe: tuple[Path, str], mode: str, returncode: int) -> None:
+    binary, engine = engine_probe
+    if engine == "mte":
         returncode = 3 if mode == "unregistered" else 0
     elif mode == "no_workspace":
         returncode = 42

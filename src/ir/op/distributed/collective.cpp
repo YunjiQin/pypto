@@ -625,18 +625,18 @@ void CheckAllToAllVCoreNumType(const ExprPtr& core_num, const char* op_name) {
   }
 }
 
-void CheckAllToAllVTransport(const std::vector<std::pair<std::string, std::any>>& kwargs) {
+void CheckAllToAllVEngine(const std::vector<std::pair<std::string, std::any>>& kwargs) {
   for (const auto& [key, value] : kwargs) {
-    if (key != "transport") continue;
-    const auto* transport = std::any_cast<std::string>(&value);
-    CHECK(transport && (*transport == "mte" || *transport == "urma"))
-        << "all_to_all_v transport must be a compile-time string: 'mte' or 'urma'";
+    if (key != "engine") continue;
+    const auto* engine = std::any_cast<std::string>(&value);
+    CHECK(engine && (*engine == "mte" || *engine == "urma"))
+        << "all_to_all_v engine must be a compile-time string: 'mte' or 'urma'";
   }
 }
 
 TypePtr DeduceTensorAllToAllVType(const std::vector<ExprPtr>& args,
                                   const std::vector<std::pair<std::string, std::any>>& kwargs) {
-  CheckAllToAllVTransport(kwargs);
+  CheckAllToAllVEngine(kwargs);
   CHECK(args.size() == 6) << "pld.tensor.all_to_all_v requires 6 args "
                              "(input, target, signal, send_counts, recv_counts, core_num), but got "
                           << args.size();
@@ -876,7 +876,7 @@ REGISTER_OP("pld.tensor.all_to_all_v")
     .set_arg_effect(1, ArgEffect::Write)
     .set_arg_effect(2, ArgEffect::ReadWrite)
     .set_arg_effect(4, ArgEffect::Write)
-    .set_attr<std::string>("transport")
+    .set_attr<std::string>("engine")
     .f_deduce_type(DeduceTensorAllToAllVType);
 
 // ============================================================================
@@ -1253,7 +1253,7 @@ namespace {
 
 TypePtr DeduceBuiltinTensorAllToAllVType(const std::vector<ExprPtr>& args,
                                          const std::vector<std::pair<std::string, std::any>>& kwargs) {
-  CheckAllToAllVTransport(kwargs);
+  CheckAllToAllVEngine(kwargs);
   constexpr const char* kOpName = "builtin.tensor.all_to_all_v";
   CHECK(args.size() == 6) << kOpName
                           << " requires exactly 6 positional arguments "
@@ -1419,7 +1419,7 @@ REGISTER_OP("builtin.tensor.all_to_all_v")
     .set_arg_effect(1, ArgEffect::Write)
     .set_arg_effect(2, ArgEffect::ReadWrite)
     .set_arg_effect(4, ArgEffect::Write)
-    .set_attr<std::string>("transport")
+    .set_attr<std::string>("engine")
     .f_deduce_type(DeduceBuiltinTensorAllToAllVType);
 
 }  // namespace ir

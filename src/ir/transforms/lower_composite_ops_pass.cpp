@@ -2025,8 +2025,8 @@ ExprPtr LowerTensorAllToAllRule(const CallPtr& call, const std::vector<ExprPtr>&
 
 ExprPtr LowerTensorAllToAllVRule(const CallPtr& call, const std::vector<ExprPtr>& args, LoweringBuilder& b) {
   const Span& span = call->span_;
-  CHECK_SPAN(call->GetKwarg<std::string>("transport", "mte") == "mte", span)
-      << "InCore all_to_all_v supports transport='mte' only; use a managed HOST/CHIP function for URMA";
+  CHECK_SPAN(call->GetKwarg<std::string>("engine", "mte") == "mte", span)
+      << "InCore all_to_all_v supports engine='mte' only; use a managed HOST/CHIP function for URMA";
   INTERNAL_CHECK_SPAN(args.size() == 6, span)
       << "pld.tensor.all_to_all_v rule expects 6 args "
          "(input, target, signal, send_counts, recv_counts, core_num), got "

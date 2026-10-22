@@ -357,11 +357,11 @@ full-slice `get` 要求 `dst` / `src` 形状一致；subregion `get` 允许完�
 
 ```text
 pld.tensor.all_to_all_v(
-    input, target, signal, send_counts, recv_counts, *, core_num: int | Scalar[INDEX] = 1, transport: str = "mte"
+    input, target, signal, send_counts, recv_counts, *, core_num: int | Scalar[INDEX] = 1, engine: str = "mte"
 ) -> DistributedTensorType(target)
 ```
 
-`transport="mte"`（默认）或 `transport="urma"` 在编译期选择数据传输引擎，
+`engine="mte"`（默认）或 `engine="urma"` 在编译期选择数据传输引擎，
 生成的 kernel 没有运行时引擎选择。URMA 需要 A5、已初始化的 PER_PEER
 workspace，且实际启动的 AIV 数量不能超过 rank 数量。URMA 仅支持托管
 HOST/CHIP 路径，远端数据不会回退到 MTE；本地复制及计数、屏障协议仍使用 MTE。

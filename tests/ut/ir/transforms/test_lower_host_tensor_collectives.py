@@ -1504,8 +1504,8 @@ def test_host_all_to_all_v_lowers_to_namesake_builtin():
             ir.ArgDirection.InOut,
             ir.ArgDirection.Input,
         ],
-        kwargs={"dtype": pl.FP32, "transport": "mte"},
-        attrs={"dtype": pl.FP32, "transport": "mte"},
+        kwargs={"dtype": pl.FP32, "engine": "mte"},
+        attrs={"dtype": pl.FP32, "engine": "mte"},
         trailing_scalar_const=1,
     )
 
@@ -1563,8 +1563,8 @@ def test_host_all_to_all_v_accepts_signal_wider_than_one_lane():
             ir.ArgDirection.InOut,
             ir.ArgDirection.Input,
         ],
-        kwargs={"dtype": pl.FP32, "transport": "mte"},
-        attrs={"dtype": pl.FP32, "transport": "mte"},
+        kwargs={"dtype": pl.FP32, "engine": "mte"},
+        attrs={"dtype": pl.FP32, "engine": "mte"},
         trailing_scalar_const=1,
     )
 
@@ -1619,8 +1619,8 @@ def test_host_all_to_all_v_accepts_multicore_request_with_wider_signal():
             ir.ArgDirection.InOut,
             ir.ArgDirection.Input,
         ],
-        kwargs={"dtype": pl.FP32, "transport": "mte"},
-        attrs={"dtype": pl.FP32, "transport": "mte"},
+        kwargs={"dtype": pl.FP32, "engine": "mte"},
+        attrs={"dtype": pl.FP32, "engine": "mte"},
         trailing_scalar_const=4,
     )
 

@@ -31,8 +31,8 @@
 // [aicore] entry annotation while using simpler's logical SPMD context.
 #include "intrinsic.h"
 
-#if {{transport_urma}} && !defined(PTO_URMA_SUPPORTED)
-#error "all_to_all_v transport=urma requires an URMA-capable A5 target"
+#if {{engine_urma}} && !defined(PTO_URMA_SUPPORTED)
+#error "all_to_all_v engine=urma requires an URMA-capable A5 target"
 #endif
 
 namespace {
@@ -73,7 +73,7 @@ AICORE inline __gm__ T *CommRemotePtr(__gm__ CommContext *ctx, __gm__ T *local_p
 
 template <typename T>
 AICORE inline __gm__ T *PayloadRemotePtr(__gm__ CommContext *ctx, __gm__ T *local_ptr, int peer) {
-#if {{transport_urma}}
+#if {{engine_urma}}
   if (peer != static_cast<int>(ctx->rankId)) {
     const uint64_t offset = reinterpret_cast<uint64_t>(local_ptr) - ctx->windowsIn[ctx->rankId];
     const uint64_t remote_base = pto::comm::urma::UrmaPeerMrBaseAddr(
@@ -92,7 +92,7 @@ AICORE inline __gm__ T *PayloadRemotePtr(__gm__ CommContext *ctx, __gm__ T *loca
 template <typename GlobalData, typename TileData>
 AICORE inline void PushPayload(GlobalData &dst, GlobalData &src, TileData &tile,
                                __gm__ CommContext *ctx, int peer) {
-#if {{transport_urma}}
+#if {{engine_urma}}
   if (peer != static_cast<int>(ctx->rankId)) {
     auto *workspace = reinterpret_cast<__gm__ uint8_t *>(ctx->workSpace);
     pto::comm::AsyncSession session;
@@ -194,9 +194,9 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
   }
 
   int my_rank = static_cast<int>(comm_ctx->rankId);
-#if {{transport_urma}}
+#if {{engine_urma}}
   if (comm_ctx->workSpace == 0) {
-    PTO_ASSERT(false, "all_to_all_v transport=urma requires an initialized URMA workspace");
+    PTO_ASSERT(false, "all_to_all_v engine=urma requires an initialized URMA workspace");
     trap();
     return;
   }
