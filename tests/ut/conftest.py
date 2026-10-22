@@ -325,7 +325,7 @@ def kernel_env(monkeypatch, tmp_path):
     from pypto.ir.compiled_artifact import CompiledArtifact  # noqa: PLC0415
     from pypto.runtime import _execution_mode  # noqa: PLC0415
     from pypto.runtime.kernel import context  # noqa: PLC0415
-    from pypto.runtime.kernel.config import KernelConfig  # noqa: PLC0415
+    from pypto.runtime.kernel.session import KernelConfig  # noqa: PLC0415
 
     monkeypatch.setattr(_execution_mode, "_gate", _execution_mode._ModeGate())
     calls = SimpleNamespace(workers=[], inits=[], prepares=[], closes=[])
@@ -353,7 +353,7 @@ def kernel_env(monkeypatch, tmp_path):
         def close(self):
             calls.closes.append(self)
 
-    monkeypatch.setattr(context, "_NativeWorker", FakeWorker)
+    monkeypatch.setattr(context, "_BorrowedWorkerSession", FakeWorker)
     state = context._ProcessKernelState()
     monkeypatch.setattr(context, "_process", SimpleNamespace(state=state))
 

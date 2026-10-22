@@ -70,6 +70,18 @@ callable 注册；JIT 提交、公开算子注册和 DFX API 留待后续迁移�
 
 ## 进程初始化与生命周期
 
+内部 `runtime/kernel` 包按资源归属组织：
+
+- `session.py`：配置、runtime 能力检查和借用上下文会话（`_BorrowedWorkerSession`），
+  将公开 `simpler.Worker` 的生命周期操作绑定到 Torch context。
+- `context.py`：进程状态、并发注册复用和 pending ticket 清理。
+- `owner.py`：生命周期 owner 线程。
+- `callable.py`：共享 artifact 身份及绑定上下文的注册记录。
+- `pending.py`：callback 结果发布及单次调用的资源保留。
+
+session 是生命周期适配层，不是独立执行引擎。Simpler 负责 callable 注册和执行，
+进程管理器负责调用准入和缓存。
+
 `pypto.torch.init()` 显式借用当前 torch_npu 设备上下文，支持 onboard `a2a3` 的
 `tensormap_and_ringbuffer` 和 `host_build_graph`。显式 `device` 必须匹配当前设备，
 初始化不会切换设备。graph capture 在占用进程模式前抛出 `NotImplementedError`。

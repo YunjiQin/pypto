@@ -17,8 +17,8 @@ from dataclasses import replace
 import pytest
 from pypto.runtime import _execution_mode
 from pypto.runtime.kernel import context
-from pypto.runtime.kernel.config import KernelConfig
 from pypto.runtime.kernel.context import KernelState
+from pypto.runtime.kernel.session import KernelConfig
 
 
 def test_kernel_lookup_waits_for_concurrent_initialization(kernel_env, monkeypatch):
