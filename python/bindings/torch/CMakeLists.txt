@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-# Optional framework lifecycle bridge, independent of Simpler native types.
+# Optional framework queue and lifecycle bridge, independent of Simpler native types.
 execute_process(COMMAND "${Python_EXECUTABLE}" -c
     "import pathlib,torch,importlib.util; assert torch._C._GLIBCXX_USE_CXX11_ABI, 'PyPTO core requires the C++11 libstdc++ ABI'; print(torch.utils.cmake_prefix_path); print(pathlib.Path(importlib.util.find_spec('torch_npu').origin).parent)"
     OUTPUT_VARIABLE _torch_paths OUTPUT_STRIP_TRAILING_WHITESPACE RESULT_VARIABLE _torch_result)
