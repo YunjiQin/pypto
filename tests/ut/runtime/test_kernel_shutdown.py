@@ -256,18 +256,31 @@ def test_unverified_framework_fails_before_install(kernel_env, framework, versio
     assert fw._C._npu_shutdown is original and not hasattr(fw, "_pypto_kernel_shutdown")
 
 
-def test_forked_hook_skips_native_cleanup_and_inherited_lock(kernel_env, framework, monkeypatch):
-    state, _, _, _ = (kernel_env.state, kernel_env.config, kernel_env.calls, kernel_env.worker_cls)
+@pytest.mark.parametrize("finalize_first", [False, True])
+@pytest.mark.parametrize("parent_attempted", [False, True])
+def test_forked_hook_retains_state_without_cleanup_or_inherited_lock(
+    kernel_env, framework, monkeypatch, finalize_first, parent_attempted
+):
+    state, config, calls, _ = (kernel_env.state, kernel_env.config, kernel_env.calls, kernel_env.worker_cls)
     fw, native, events = framework
     shutdown.install_shutdown(state)
+    state.ensure_worker(config)
     hook = fw._pypto_kernel_shutdown
-    hook._lock.acquire()
-    try:
-        monkeypatch.setattr(shutdown.os, "getpid", lambda: hook.pid + 1)
+    hook._attempted = parent_attempted
+    # A lock inherited from a vanished parent thread cannot be entered. An
+    # unusable sentinel makes any attempt fail instead of hanging the test.
+    monkeypatch.setattr(hook, "_lock", None)
+    with monkeypatch.context() as child:
+        child.setattr(shutdown.os, "getpid", lambda: hook.pid + 1)
+        if finalize_first:
+            fw._C._npu_shutdown(True)
+        else:
+            fw._C._npu_shutdown_synchronize()
         fw._C._npu_shutdown_synchronize()
-        assert events == ["framework-sync"]
-    finally:
-        hook._lock.release()
+        fw._C._npu_shutdown(True)
+    first_teardown = ("framework-finalize", True) if finalize_first else "framework-sync"
+    assert events == [("retain", state), first_teardown, "framework-sync", ("framework-finalize", True)]
+    assert state.state is KernelState.READY and not calls.closes
 
 
 if __name__ == "__main__":

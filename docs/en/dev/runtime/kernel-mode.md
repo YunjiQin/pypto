@@ -136,9 +136,16 @@ fail. Concurrent initialization shares one result. Native initialization failure
 retains the Worker and the process mode for cleanup. Closing is terminal: it does
 not permit switching to program execution. Program mode is claimed before
 runner execution (including DFX dependency-capture subprocesses), and at direct
-Worker initialization, not at import, compilation or metadata loading. A child
+Worker initialization, not at import, compilation or metadata loading.
+One-shot distributed execution claims program mode before changing host tensor
+storage to shared memory or clearing prior dispatch diagnostics. A child
 forked after kernel initialization must use a fresh spawned process; an untouched
-manager replaces inherited locks on first use in a child.
+manager is replaced once in the single-threaded at-fork child callback, including
+its inherited locks, before concurrent first use.
+The mode gate is also reset in an at-fork child callback when the parent was
+unclaimed or in PROGRAM mode. Competing PROGRAM/KERNEL claims in that child
+share one lock: one mode wins and the other raises before native Worker
+initialization. An inherited KERNEL claim is never reset.
 
 The lifecycle owner thread binds the borrowed RTS context before public
 `Worker(level=2).init(prewarm_config=..., borrowed_context_generation=...)`,
@@ -161,12 +168,15 @@ ticket and Worker; cleanup does not assume device quiescence.
 
 The optional `_torch_npu` extension supplies only lifecycle/context and NZ
 storage queries in this step. Build it with `-DPYPTO_BUILD_TORCH_NPU=ON` using
-matching Torch, torch_npu and CANN headers/libraries. It links no Simpler C++
+matching Torch, torch_npu and CANN headers/libraries. The configure-time C++11
+ABI check also runs when `PYTHONOPTIMIZE` is enabled. It links no Simpler C++
 implementation or separate kernel ABI. The default core build does not require
 these optional dependencies. Shutdown wraps the verified framework teardown
 hooks (torch_npu `2.6.0.post2` and `2.10.0.post2`, allowing build suffixes), closing
 PyPTO before framework teardown. Unsafe cleanup retains a native lifetime anchor
 through process exit rather than running destructors after context destruction.
+In a forked child, shutdown anchors the inherited state before framework teardown
+without acquiring inherited locks or closing the parent's Worker.
 
 Direct `@pl.jit` calls still enter program execution. Consequently, invoking
 one after `pypto.torch.init()` is rejected by the process mode gate in this

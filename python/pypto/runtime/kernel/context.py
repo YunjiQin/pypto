@@ -340,11 +340,19 @@ class _ProcessKernelState:
 _process = SimpleNamespace(state=_ProcessKernelState())
 
 
+def _reset_unused_state_after_fork() -> None:
+    # The child is still single-threaded here. Publishing now avoids competing
+    # lazy replacements on first use, without acquiring inherited mutexes.
+    # Preserve initialized/failed state so lookup rejects inherited resources.
+    if _process.state.pid != os.getpid() and _process.state.state is KernelState.UNINITIALIZED:
+        _process.state = _ProcessKernelState()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_unused_state_after_fork)
+
+
 def get_process_kernel_state() -> _ProcessKernelState:
     """Return the process-owned manager shared by all internal kernel consumers."""
-    if _process.state.pid != os.getpid():
-        if _process.state.state is not KernelState.UNINITIALIZED:
-            _process.state._check_pid()
-        # No native state existed at fork. Replace inherited synchronization too.
-        _process.state = _ProcessKernelState()
+    _process.state._check_pid()
     return _process.state

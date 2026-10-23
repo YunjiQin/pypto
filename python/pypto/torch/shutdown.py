@@ -37,6 +37,7 @@ class _ShutdownHook:
         self.state = state
         self.native = native
         self.pid = os.getpid()
+        self._retained_pid: int | None = None
         self._lock = threading.RLock()
         self._attempted = False
         self._synchronize = synchronize
@@ -44,7 +45,14 @@ class _ShutdownHook:
 
     def _close(self) -> None:
         # Never acquire locks inherited from another process or finalize its Worker.
-        if os.getpid() != self.pid:
+        pid = os.getpid()
+        if pid != self.pid:
+            # Module clearing must not destroy the inherited Worker after the
+            # child's framework teardown. Pin once per child without using any
+            # inherited locks, even if the parent already attempted cleanup.
+            if self._retained_pid != pid:
+                self.native.retain_until_exit(self.state)
+                self._retained_pid = pid
             return
         with self._lock:
             if self._attempted:

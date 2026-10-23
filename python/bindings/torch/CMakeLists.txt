@@ -8,8 +8,9 @@
 # -----------------------------------------------------------------------------------------------------------
 
 # Optional framework lifecycle bridge, independent of Simpler native types.
+# Use an explicit exit: PYTHONOPTIMIZE removes Python assert statements.
 execute_process(COMMAND "${Python_EXECUTABLE}" -c
-    "import pathlib,torch,importlib.util; assert torch._C._GLIBCXX_USE_CXX11_ABI, 'PyPTO core requires the C++11 libstdc++ ABI'; print(torch.utils.cmake_prefix_path); print(pathlib.Path(importlib.util.find_spec('torch_npu').origin).parent)"
+    "import pathlib,torch,importlib.util,sys; sys.exit('PyPTO core requires the C++11 libstdc++ ABI') if not torch._C._GLIBCXX_USE_CXX11_ABI else None; print(torch.utils.cmake_prefix_path); print(pathlib.Path(importlib.util.find_spec('torch_npu').origin).parent)"
     OUTPUT_VARIABLE _torch_paths OUTPUT_STRIP_TRAILING_WHITESPACE RESULT_VARIABLE _torch_result)
 if(NOT _torch_result EQUAL 0)
     message(FATAL_ERROR "PYPTO_BUILD_TORCH_NPU requires matching torch and torch_npu")

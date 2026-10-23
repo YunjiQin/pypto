@@ -1613,6 +1613,12 @@ def _execute_distributed(  # pyright: ignore[reportUnusedFunction]
             )
         host_args.append(arg)
 
+    from ._execution_mode import claim_program_mode  # noqa: PLC0415
+
+    # Reject a kernel-mode process before setup can change caller storage or
+    # remove diagnostics from an earlier run.
+    claim_program_mode()
+
     dc = compiled._distributed_config
     output_dir = compiled.output_dir
 
@@ -1668,9 +1674,6 @@ def _execute_distributed(  # pyright: ignore[reportUnusedFunction]
             # Prewarm with this dispatch's own config so the single run below hits
             # the prebuilt runtime-arena cache instead of paying the ~800ms cold
             # build inside the timed dispatch. No-op without a prebuilt arena.
-            from ._execution_mode import claim_program_mode  # noqa: PLC0415
-
-            claim_program_mode()
             w.init(prewarm_config=call_config)
             _dispatch(w, entry_fn, tensors, chip_cids, sub_ids, call_config, len(dc.device_ids))
         except BaseException:  # noqa: BLE001 - cleanup must also run for interruption

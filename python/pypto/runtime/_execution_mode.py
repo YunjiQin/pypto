@@ -24,11 +24,7 @@ class _ModeGate:
     def claim(self, mode: ArtifactExecutionMode) -> None:
         # Check before acquiring a possibly inherited, permanently locked mutex.
         if self.pid != os.getpid():
-            if self.mode is ArtifactExecutionMode.KERNEL:
-                raise RuntimeError("A forked process cannot inherit kernel Worker state; use spawn")
-            self.pid = os.getpid()
-            self.mode = None
-            self.lock = threading.Lock()
+            raise RuntimeError("A forked process cannot inherit runtime mode state; use spawn")
         with self.lock:
             if self.mode is not None and self.mode is not mode:
                 raise RuntimeError(
@@ -41,6 +37,20 @@ class _ModeGate:
 
 
 _gate = _ModeGate()
+
+
+def _reset_mode_after_fork() -> None:
+    # Reset exactly once while the child is single-threaded. Lazy reset in
+    # claim() could clear another thread's claim and replace its active lock.
+    # An inherited kernel claim remains terminal, even after failed init/close.
+    if _gate.pid != os.getpid() and _gate.mode is not ArtifactExecutionMode.KERNEL:
+        _gate.pid = os.getpid()
+        _gate.mode = None
+        _gate.lock = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_mode_after_fork)
 
 
 def claim_program_mode() -> None:

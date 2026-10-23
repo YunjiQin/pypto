@@ -104,8 +104,12 @@ INITIALIZING、READY、FAILED、CLOSING、CLOSED。同配置初始化幂等，�
 拒绝，并发初始化共享结果。native 初始化失败保留 Worker 和模式以便清理；关闭后不允许
 切换到 program。program 模式在 runner 执行前（包括 DFX dependency-capture 子进程）
 及直接初始化 Worker 时占用，导入、编译和 metadata 加载
-均不占用模式。kernel 初始化后 fork 的子进程必须改用 spawn；未使用的管理器在子进程中
-首次访问时替换继承的锁。
+均不占用模式。一次性分布式执行在将 host Tensor 转换为共享内存或清理已有 dispatch
+诊断文件之前占用 program 模式。kernel 初始化后 fork 的子进程必须改用 spawn；未使用的管理器及其继承的锁
+在单线程的 at-fork 子进程回调中统一替换一次，早于子进程中的并发首次访问。
+父进程未声明模式或使用 PROGRAM 模式时，模式门禁也在 at-fork 子进程回调中重置。
+子进程中竞争的 PROGRAM/KERNEL 声明共享同一把锁：一种模式获准，另一种在 native Worker
+初始化前抛出异常。继承的 KERNEL 声明不会被重置。
 
 生命周期 owner thread 在调用公开
 `Worker(level=2).init(prewarm_config=..., borrowed_context_generation=...)`、
@@ -126,9 +130,11 @@ Worker 关闭的顺序清理。callback、退休或 source 释放失败均保留
 可选 `_torch_npu` 扩展本阶段只提供生命周期/context 和 NZ storage 查询。用匹配的
 Torch、torch_npu、CANN 头文件及库，通过 `-DPYPTO_BUILD_TORCH_NPU=ON` 构建；
 它不链接 Simpler C++ 实现或独立 kernel ABI。默认 core 构建不要求这些可选依赖。
+即使启用 `PYTHONOPTIMIZE`，配置阶段仍会执行 C++11 ABI 检查。
 关闭逻辑包装已验证的框架 teardown hooks（torch_npu `2.6.0.post2`、`2.10.0.post2`，
 允许构建后缀），在框架拆除前关闭 PyPTO。无法安全清理时通过 native anchor 保留资源
 直至进程退出，避免 context 销毁后运行析构。
+fork 子进程在框架拆除前通过 native anchor 保留继承的状态，不获取继承的锁，也不关闭父进程的 Worker。
 
 直接 `@pl.jit` 调用仍进入 program 路径。因此，本迁移中间阶段在 `pypto.torch.init()`
 之后直接调用 JIT 会被模式互斥检查拒绝。初始化可独立验证；JIT → callback →

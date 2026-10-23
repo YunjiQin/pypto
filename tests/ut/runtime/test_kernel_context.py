@@ -9,6 +9,8 @@
 
 """Process ownership and lifecycle regression tests with opaque public handles."""
 
+import multiprocessing
+import os
 import threading
 import weakref
 from concurrent.futures import ThreadPoolExecutor
@@ -253,6 +255,80 @@ def test_fork_rejects_state_before_touching_inherited_mutex(kernel_env, monkeypa
         state.close()
 
 
+@pytest.mark.skipif("fork" not in multiprocessing.get_all_start_methods(), reason="requires fork")
+def test_fork_resets_unused_manager_before_concurrent_child_initialization(kernel_env, monkeypatch):
+    parent_state = kernel_env.state
+    created = []
+    manager_type = context._ProcessKernelState
+
+    def create_manager():
+        manager = manager_type()
+        created.append(manager)
+        return manager
+
+    monkeypatch.setattr(context, "_ProcessKernelState", create_manager)
+
+    def run_child():
+        # Check before any lookup: the at-fork handler must publish exactly one
+        # fresh manager, rather than letting first-use threads compete to do so.
+        child_state = context._process.state
+        assert child_state is not parent_state and child_state.pid == os.getpid()
+        assert created == [child_state]
+        start = threading.Barrier(2)
+
+        def initialize():
+            start.wait(timeout=5)
+            manager = context.get_process_kernel_state()
+            return manager, manager.ensure_worker(kernel_env.config)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(initialize) for _ in range(2)]
+            results = [future.result(timeout=5) for future in futures]
+        assert all(manager is child_state for manager, _ in results)
+        assert results[0][1] is results[1][1]
+        assert created == [child_state]
+        assert len(kernel_env.calls.workers) == len(kernel_env.calls.inits) == 1
+        child_state.close()
+
+    # Both locks are held across fork; child initialization must use new locks.
+    with parent_state._condition, parent_state._submission_lock:
+        child = multiprocessing.get_context("fork").Process(target=run_child)
+        child.start()
+        try:
+            child.join(timeout=15)
+            assert child.exitcode == 0
+        finally:
+            if child.is_alive():
+                child.terminate()
+                child.join(timeout=5)
+    assert context.get_process_kernel_state() is parent_state
+    assert parent_state.state is KernelState.UNINITIALIZED
+    assert not created and not kernel_env.calls.workers
+
+
+@pytest.mark.skipif("fork" not in multiprocessing.get_all_start_methods(), reason="requires fork")
+@pytest.mark.parametrize("state", [state for state in KernelState if state is not KernelState.UNINITIALIZED])
+def test_fork_preserves_used_manager_for_pid_rejection(kernel_env, state):
+    parent_state = kernel_env.state
+    parent_state.state = state
+
+    def run_child():
+        assert context._process.state is parent_state
+        with pytest.raises(RuntimeError, match="PID"):
+            context.get_process_kernel_state()
+
+    with parent_state._condition, parent_state._submission_lock:
+        child = multiprocessing.get_context("fork").Process(target=run_child)
+        child.start()
+        try:
+            child.join(timeout=10)
+            assert child.exitcode == 0
+        finally:
+            if child.is_alive():
+                child.terminate()
+                child.join(timeout=5)
+
+
 def test_registration_retains_worker_after_operator_is_deleted(kernel_env):
     state, config, _, _ = (kernel_env.state, kernel_env.config, kernel_env.calls, kernel_env.worker_cls)
     state.ensure_worker(config)
@@ -293,6 +369,71 @@ def test_process_mode_claim_is_mutually_exclusive(kernel_env, first):
     other = "kernel" if first == "program" else "program"
     with pytest.raises(RuntimeError, match=f"already claimed {first}"):
         claims[other]()
+
+
+@pytest.mark.skipif("fork" not in multiprocessing.get_all_start_methods(), reason="requires fork")
+@pytest.mark.parametrize("parent_mode", [None, "program", "kernel"])
+@pytest.mark.parametrize("child_modes", [("program", "kernel"), ("program", "program"), ("kernel", "kernel")])
+def test_fork_mode_claims_share_one_child_gate(kernel_env, parent_mode, child_modes):
+    claims = {"program": _execution_mode.claim_program_mode, "kernel": _execution_mode.claim_kernel_mode}
+    parent_gate = _execution_mode._gate
+    if parent_mode is not None:
+        claims[parent_mode]()
+    original_mode = parent_gate.mode
+    parent_lock = parent_gate.lock
+
+    def run_child():
+        gate = _execution_mode._gate
+        if parent_mode == "kernel":
+            assert gate is parent_gate and gate.pid != os.getpid()
+        else:
+            # No claim has run yet: the at-fork callback must already have
+            # reset the gate and replaced its inherited, locked mutex.
+            assert gate is parent_gate and gate.pid == os.getpid()
+            assert gate.mode is None and gate.lock is not parent_lock
+        start = threading.Barrier(2)
+
+        def claim(mode):
+            start.wait(timeout=5)
+            try:
+                claims[mode]()
+            except RuntimeError as exc:
+                return mode, str(exc)
+            return mode, None
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(claim, mode) for mode in child_modes]
+            results = [future.result(timeout=5) for future in futures]
+        assert _execution_mode._gate is gate
+        accepted = [mode for mode, error in results if error is None]
+        rejected = [error for _, error in results if error is not None]
+        if parent_mode == "kernel":
+            assert not accepted and len(rejected) == 2
+            assert all("use spawn" in error for error in rejected)
+            assert gate.mode is original_mode
+        else:
+            expected = 2 if child_modes[0] == child_modes[1] else 1
+            assert len(accepted) == expected
+            winner = accepted[0]
+            assert gate.mode is not None and gate.mode.value == winner
+            assert all(f"already claimed {winner}" in error for error in rejected)
+            # The winning claim remains sticky; repeated calls cannot reset it.
+            claims[winner]()
+            other = "kernel" if winner == "program" else "program"
+            with pytest.raises(RuntimeError, match=f"already claimed {winner}"):
+                claims[other]()
+
+    with parent_gate.lock:
+        child = multiprocessing.get_context("fork").Process(target=run_child)
+        child.start()
+        try:
+            child.join(timeout=15)
+            assert child.exitcode == 0
+        finally:
+            if child.is_alive():
+                child.terminate()
+                child.join(timeout=5)
+    assert _execution_mode._gate is parent_gate and parent_gate.mode is original_mode
 
 
 class _Ticket:
