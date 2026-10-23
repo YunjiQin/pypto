@@ -102,7 +102,8 @@ caller-stream submit、Buffer/TaskArgs、RunHandle 和 `flush_diagnostics` 接�
 进程管理器持有一个 Worker 和非零 context-generation token，状态包括 UNINITIALIZED、
 INITIALIZING、READY、FAILED、CLOSING、CLOSED。同配置初始化幂等，冲突及递归初始化
 拒绝，并发初始化共享结果。native 初始化失败保留 Worker 和模式以便清理；关闭后不允许
-切换到 program。program 模式在实际 Worker 初始化时占用，导入、编译和 metadata 加载
+切换到 program。program 模式在 runner 执行前（包括 DFX dependency-capture 子进程）
+及直接初始化 Worker 时占用，导入、编译和 metadata 加载
 均不占用模式。kernel 初始化后 fork 的子进程必须改用 spawn；未使用的管理器在子进程中
 首次访问时替换继承的锁。
 

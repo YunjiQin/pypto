@@ -134,7 +134,8 @@ Its states are UNINITIALIZED, INITIALIZING, READY, FAILED, CLOSING and CLOSED.
 Identical configuration is idempotent; conflicts and recursive initialization
 fail. Concurrent initialization shares one result. Native initialization failure
 retains the Worker and the process mode for cleanup. Closing is terminal: it does
-not permit switching to program execution. Program mode is claimed at actual
+not permit switching to program execution. Program mode is claimed before
+runner execution (including DFX dependency-capture subprocesses), and at direct
 Worker initialization, not at import, compilation or metadata loading. A child
 forked after kernel initialization must use a fresh spawned process; an untouched
 manager replaces inherited locks on first use in a child.
