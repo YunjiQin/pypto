@@ -7,6 +7,48 @@ core placement/replication contracts. Buffer-stage operations use the separate
 > The whole chain that consumes these declarations is laid out in
 > [Parameter Direction Inference](08-param-directions.md).
 
+## Storage aliases, physical reuse, and views
+
+These contracts answer independent questions:
+
+| Query | Responsibility |
+| ----- | -------------- |
+| `OutputMemoryInheritsInput()` | Result memory space equals the first Tile/Tensor input's space |
+| `IsInplaceSafe()` and forbidden-alias constraints | Execution legality of physical reuse |
+| `GetOutputReusesInputArg()` | Explicit semantic sharing of an input's underlying storage |
+| `GetArgEffect(i, call->kwargs_)` | Data reads/writes through argument `i` |
+| Execution-memory-access evidence | Whether execution actually accesses data |
+| Result type and view mapping | Offset, shape, stride, layout, and valid extent |
+
+`set_output_reuses_input(i)` applies to one result and requires an in-range
+argument with an explicit effect verdict, including `Read` or `no_arg_writes()`.
+It does **not** imply a write, identical MemRef windows or descriptors, or
+interchangeable SSA values. Multi-output operators cannot use this single-result
+alias declaration. Buffer IR keeps its separate result/effect contract.
+
+For example, `tile.add(a, x)` produces an independent logical value even when
+liveness permits the planner to reuse `a`'s physical address. `tile.slice(a, ...)`
+always shares `a`'s storage but has its own window. `tile.reshape(a, ...)` may
+need a different backend descriptor. `tile.assemble(target, source, offsets)`
+shares `target` and declares `ReadWrite` on it. `tile.transpose(a, ...)` inherits
+memory space and forbids in-place execution, but has independent result storage.
+
+Storage consumers use `op_predicates::StorageAliasArgIndex` (or its boolean
+wrapper `OutputInheritsSourceBuffer`); write consumers query argument effects.
+Neither memory-space inheritance nor in-place safety establishes an alias edge.
+After moving source storage, consumers reapply the original view mapping rather
+than replacing a subview with the entire input MemRef. Backend SSA sharing still
+requires compatible windows and descriptors. Return normalization has its own
+value-replacement policy: sharing storage does not authorize replacing
+`return slice(p)` with `return p`.
+
+Physical reuse remains a planner decision subject to liveness, space, capacity,
+layout, and execution constraints; it creates no semantic alias edge. This
+contract adds no DCE or reuse optimization. The Python memory-spec query continues
+to report space inheritance in its existing format.
+
+## Argument effects
+
 An operator that updates one of its arguments in place must say so. Direction
 inference, dependency analysis and the parameter-direction verifier all ask the
 registry the same question — *does this call write the buffer this argument
@@ -71,12 +113,11 @@ analysis that needs the answer can then refuse to guess instead of defaulting an
 unclassified writer to read-only.
 
 **Enforcement.** `OpRegistry::ValidateArgEffects()` runs at import and rejects
-two shapes, naming every offender and the fix rather than failing on first use:
+invalid declarations, naming every offender rather than failing on first use:
 
-- an operator declaring `set_output_reuses_input(N)` — its SSA result *is*
-  argument N's buffer, so it writes through it — without a verdict about
-  argument N specifically. Classification is what is required, not a particular
-  answer: an operator whose in-place slot is metadata may declare it read-only.
+- an operator declaring `set_output_reuses_input(N)` with an out-of-range index,
+  multiple results, or no explicit effect verdict for argument N. Read-only
+  storage aliases are valid; sharing storage does not imply a data write.
 - an operator declaring a write channel while writing through no argument. A
   channel says *how* an operator writes, so one without a write is either a
   stray declaration or a missing one.

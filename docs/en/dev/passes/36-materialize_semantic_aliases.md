@@ -4,6 +4,11 @@ Forces buffers that the program *semantics require* to be the same allocation to
 share one MemRef, by propagating each loop-carried `iter_arg`/`initValue` MemRef
 down the yield/producer chain.
 
+Operator storage sources come from explicit `set_output_reuses_input` declarations;
+plain SSA aliases and control-flow relations remain separate sources. Argument
+effects determine writes. View windows and descriptors are preserved when their
+source moves; sharing storage does not mean copying the entire source MemRef.
+
 ## Overview
 
 Memory planning distinguishes two kinds of buffer sharing:

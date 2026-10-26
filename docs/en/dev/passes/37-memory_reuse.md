@@ -8,6 +8,11 @@ This pass analyzes variable lifetimes and dependencies to enable memory sharing.
 
 After applying MemRef sharing, the pass also **removes redundant `tile.alloc` statements** for MemRefs that are no longer referenced by any TileType variable.
 
+This lifetime-based physical reuse creates no semantic alias edge. Explicit
+operator aliases use `set_output_reuses_input`, independently of memory-space
+inheritance and in-place execution constraints. Views retain their own windows
+and descriptors even when their underlying storage is shared.
+
 **Key insights**:
 
 - Variables that don't overlap in lifetime can reuse memory

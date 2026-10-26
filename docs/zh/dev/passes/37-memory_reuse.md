@@ -8,6 +8,10 @@
 
 应用 MemRef 共享后，该 Pass 还会**移除冗余的 `tile.alloc` 语句 (Statement)**——即那些不再被任何 TileType 变量引用的 MemRef 对应的 alloc 语句。
 
+基于生命周期的物理复用不产生语义别名边。算子的显式别名使用
+`set_output_reuses_input`，与内存空间继承和原地执行限制分开。即使共享底层存储，
+视图仍保留自身的窗口和 descriptor。
+
 **核心要点**：
 
 - 生命周期不重叠的变量可以复用内存

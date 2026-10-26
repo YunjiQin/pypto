@@ -3,6 +3,10 @@
 将**语义要求**必须是同一块分配的 buffer 归一到同一个 MemRef —— 通过把每个循环
 carried 的 `iter_arg`/`initValue` MemRef 沿 yield/producer 链向下传播来实现。
 
+算子存储来源由显式 `set_output_reuses_input` 声明提供；普通 SSA 别名和控制流关系
+仍是独立来源。参数效果决定写入。源存储移动时保留视图窗口和 descriptor；共享存储
+不表示复制整个源 MemRef。
+
 ## 概述
 
 内存规划区分两种 buffer 共享：

@@ -369,13 +369,17 @@ bool NamesSameWindowExtent(const TileTypePtr& lhs, const TileTypePtr& rhs) {
 /// The accumulator operand of `call` — the argument whose buffer the result
 /// names.  Null when the call is not an accumulator op (or carries no Var there).
 ///
-/// Asking `BuiltinWritebackArgIndex` — rather than naming `tile.matmul_acc` /
+/// Asking `StorageAliasArgIndex` — rather than naming `tile.matmul_acc` /
 /// `tile.gemv_acc` / `tile.matmul_mx_acc` — is what lets the guard below cover
-/// any future accumulator op for free.
+/// any future accumulator op. The argument effect must independently report
+/// a write: a read-only view is not an accumulator.
 VarPtr AccumulatorOperand(const CallPtr& call) {
   if (!call || !call->op_) return nullptr;
-  auto declared = op_predicates::BuiltinWritebackArgIndex(call->op_, call->args_.size());
-  if (!declared.has_value()) return nullptr;
+  // Assemble inserts a region with its own mapping; it is not a compact
+  // whole-destination accumulator write and keeps its existing legality path.
+  if (IsOp(call, "tile.assemble")) return nullptr;
+  auto declared = op_predicates::StorageAliasArgIndex(call->op_, call->args_.size());
+  if (!declared || !op_predicates::CallWritesArg(call, *declared)) return nullptr;
   return AsVarLike(call->args_[*declared]);
 }
 
@@ -759,10 +763,9 @@ class SliceCollector : public IRVisitor {
     // It is an inherit-input view op, so it would otherwise fall through below
     // and inherit its *source's* window — silently dropping that offset.
     if (IsOp(call, "tile.slice")) return;
-    if (!op_predicates::OutputInheritsSourceBuffer(call->op_->name_)) return;
-    size_t source_index = op_predicates::BuiltinWritebackArgIndex(call->op_, call->args_.size()).value_or(0);
-    if (source_index >= call->args_.size()) return;
-    BindWindowAlias(op->var_, call->args_[source_index]);
+    auto source_index = op_predicates::StorageAliasArgIndex(call->op_, call->args_.size());
+    if (!source_index) return;
+    BindWindowAlias(op->var_, call->args_[*source_index]);
   }
 
   // Convert direct ConstInt SSA definitions (and their plain aliases) back to
@@ -898,16 +901,13 @@ class SliceStorageAnalysis : public IRVisitor {
       for (const auto& arg : call->args_) MarkWritten(arg);
       return;
     }
-    const auto writeback = op_predicates::BuiltinWritebackArgIndex(call->op_, call->args_.size());
-    if (writeback.has_value()) MarkWritten(call->args_[*writeback]);
-    const auto& entry = registry.GetEntry(call->op_->name_);
     for (size_t i = 0; i < call->args_.size(); ++i) {
-      auto kind = entry.GetLaneInvariantArgKind(i);
-      if (kind.has_value() && *kind != LaneInvariantArg::IndexAddressedSource) MarkWritten(call->args_[i]);
+      if (op_predicates::CallWritesArg(call, i)) MarkWritten(call->args_[i]);
     }
-    if (result && !call->args_.empty() && op_predicates::OutputInheritsSourceBuffer(call->op_->name_)) {
-      const size_t source_index = writeback.value_or(0);
-      if (source_index < call->args_.size()) Union(result, call->args_[source_index]);
+    if (result) {
+      if (auto source = op_predicates::StorageAliasArgIndex(call->op_, call->args_.size())) {
+        Union(result, call->args_[*source]);
+      }
     }
   }
 
