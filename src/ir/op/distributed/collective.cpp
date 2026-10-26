@@ -775,6 +775,16 @@ TypePtr DeduceTensorAllToAllVTypeImpl(const std::vector<ExprPtr>& args,
     for (size_t i = 0; i < 5; ++i) {
       CHECK(args[5].get() != args[i].get()) << "indexed_all_to_all_v index must not alias another operand";
     }
+    // Barrier updates and receive-count stores must not overwrite send counts
+    // or each other. Provenance of distinct L2 parameters remains caller-owned.
+    constexpr const char* kControlNames[] = {"signal", "send_counts", "recv_counts"};
+    for (size_t i = 2; i < 5; ++i) {
+      for (size_t j = i + 1; j < 5; ++j) {
+        CHECK_SPAN(args[i].get() != args[j].get(), args[j]->span_)
+            << "indexed_all_to_all_v " << kControlNames[i - 2] << " and " << kControlNames[j - 2]
+            << " must be distinct buffers";
+      }
+    }
   }
 
   // send_counts: per-destination row counts, read at runtime by the lowering

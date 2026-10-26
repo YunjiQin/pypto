@@ -5,8 +5,7 @@
 `LowerHostTensorCollectives` rewrites host-orchestrator calls to
 `pld.tensor.allreduce`, `pld.tensor.barrier`, `pld.tensor.broadcast`,
 `pld.tensor.reduce_scatter`, `pld.tensor.allgather`,
-`pld.tensor.all_to_all`, `pld.tensor.all_to_all_v`, and
-`pld.tensor.indexed_all_to_all_v` into compiler-internal
+`pld.tensor.all_to_all`, and `pld.tensor.all_to_all_v` into compiler-internal
 builtin chip dispatches. It runs
 after [`MaterializeCommDomainScopes`](47-materialize_comm_domain_scopes.md), so
 each window-bound data tensor and explicit or synthesized signal tensor already has a

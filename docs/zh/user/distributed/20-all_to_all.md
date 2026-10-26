@@ -152,7 +152,8 @@ target = pld.tensor.indexed_all_to_all_v(
 首版仅支持 **A5 URMA、PER_PEER、L2**，payload 为 FP32 或 INT8。
 L2 的 input/index 和 recv_counts 可以是本地 Tensor，recv_counts 为 INT32
 `[P,1]`，只由本 rank 写入。send_counts 必须是窗口，
-因为 peer 会远程读取。形状为静态，所有视图完整且连续。
+因为 peer 会远程读取。`signal`、`send_counts` 和 `recv_counts` 必须使用两两
+不同的缓冲区。形状为静态，所有视图完整且连续。
 不支持 HOST、InCore、远端 MTE 或 SHARED_POOL。
 
 `core_num=B` 是正的精确启动核数，运行时按硬件 AIV 上限检查 sync-start。

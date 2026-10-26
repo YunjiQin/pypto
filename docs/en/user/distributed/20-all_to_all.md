@@ -201,7 +201,9 @@ expansion remain application operations.
 This API supports **A5 URMA with PER_PEER queues, L2 only**, with FP32 or
 INT8 payloads. L2 accepts
 local Tensor input/index and a local INT32 recv_counts `[P,1]` output.
-send_counts must be window-bound because peers read it. All views must be packed and full; shapes are static. HOST, InCore, remote MTE,
+send_counts must be window-bound because peers read it. `signal`, `send_counts`
+and `recv_counts` must use pairwise distinct buffers. All views must be packed
+and full; shapes are static. HOST, InCore, remote MTE,
 and SHARED_POOL are unsupported.
 
 `core_num=B` is a positive exact launch width, subject to the runtime's AIV

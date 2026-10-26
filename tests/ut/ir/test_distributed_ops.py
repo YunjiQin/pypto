@@ -2787,6 +2787,31 @@ def test_indexed_all_to_all_v_accepts_original_input_capacity():
 
 
 @pytest.mark.parametrize(
+    "left,right,names",
+    [
+        (2, 3, "signal and send_counts"),
+        (2, 4, "signal and recv_counts"),
+        (3, 4, "send_counts and recv_counts"),
+    ],
+)
+def test_indexed_all_to_all_v_rejects_aliased_control_buffers(left, right, names):
+    span = ir.Span.unknown()
+    args = _make_indexed_all_to_all_v_args(span)
+    args[3] = _make_distributed_tensor_var("send_counts", [_AAV_NR, 1], DataType.INT32, span)
+    args[right] = args[left]
+    with pytest.raises(ValueError, match=f"{names} must be distinct buffers"):
+        ir.create_op_call("pld.tensor.indexed_all_to_all_v", args, {}, span)
+
+
+def test_indexed_all_to_all_v_accepts_distinct_window_control_buffers():
+    span = ir.Span.unknown()
+    args = _make_indexed_all_to_all_v_args(span)
+    args[3] = _make_distributed_tensor_var("send_counts", [_AAV_NR, 1], DataType.INT32, span)
+    call = ir.create_op_call("pld.tensor.indexed_all_to_all_v", args, {}, span)
+    assert call.type is args[1].type
+
+
+@pytest.mark.parametrize(
     "shape,dtype",
     [
         ([_AAV_NR * _AAV_MAX_RECV], DataType.INT32),

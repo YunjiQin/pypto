@@ -1149,8 +1149,9 @@ def indexed_all_to_all_v(
     Only L2 orchestration is supported. L2 accepts local input
     and index tensors, and a local recv_counts output. Payload is FP32 or
     INT8; HOST and InCore are unsupported. Self uses MTE, remote peers use URMA.
-    Signal is INT32 [P,S], S >= core_num, zero-initialized once. All ranks
-    use the same positive core_num and collective order. All AIVs share local
+    Signal is INT32 [P,S], S >= core_num, zero-initialized once.
+    Signal, send_counts and recv_counts must use pairwise distinct buffers.
+    All ranks use the same positive core_num and collective order. All AIVs share local
     copies between remote submission and completion waits; AIVs beyond P
     do not submit URMA work. Reuse must follow
     the previous receive-window consumer. Completion is a task dependency,
