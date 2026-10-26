@@ -1591,6 +1591,29 @@ class TestStorageAliasContract:
     def test_independent_result_has_no_alias(self, name):
         assert testing.storage_alias_arg_index(name, 4) is None
 
+    @pytest.mark.parametrize(
+        ("name", "index"),
+        [
+            ("tile.row_sum", 1),
+            ("tile.row_max", 1),
+            ("tile.row_min", 1),
+            ("tile.row_prod", 1),
+            ("tile.col_sum", 1),
+            ("tile.rem", 2),
+            ("tile.rems", 2),
+            ("tile.prelu", 2),
+            ("tile.sel", 3),
+            ("tile.sort32", 2),
+            ("tile.row_expand_add", 2),
+            ("tile.cast", 1),
+        ],
+    )
+    def test_hardware_scratch_declares_write_without_result_alias(self, name, index):
+        # Slice placement must observe scratch clobbers through ArgEffect,
+        # independently of lane-splitting metadata or result storage aliases.
+        assert ir.get_op_arg_effect(name, index) == ir.ArgEffect.Write
+        assert testing.storage_alias_arg_index(name, index + 1) is None
+
     def test_missing_call_argument_does_not_resolve_alias(self):
         assert testing.storage_alias_arg_index("tile.store", 2) is None
 

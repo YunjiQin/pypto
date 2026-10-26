@@ -59,6 +59,11 @@ tile.mscatter 写 output_tensor，却从未声明
 | `ArgEffect::Write` | 覆盖写，写前不读 | `tile.store` 的 `output_tensor`、`pld.tile.get` 的 `dst` |
 | `ArgEffect::ReadWrite` | 既读*又*写 | `tile.matmul_acc` 的累加器、原子 store 的目的操作数 |
 
+硬件临时工作缓冲（scratch）在不读取调用前内容时，也必须声明 `ArgEffect::Write`。
+例如，`tile.row_sum` 会把第二个参数作为工作区写入。`set_lane_invariant_arg()`
+描述分 lane 规则，不是参数效果，不能代替写入声明。后续消费者读取同一存储时，
+slice 提取必须保持在 scratch 写入之后。
+
 **部分覆盖仍然是 `Write`。** 只写入子区域的 store 不会读取未触及的其余部分——没有
 任何数据流*进*内核——所以其目的操作数是纯写。把它声明成 `ReadWrite` 并非无害的保守
 近似：这会让外层参数变成 `InOut`，从而触发 host→device 搬运，并且在跨 rank 场景下

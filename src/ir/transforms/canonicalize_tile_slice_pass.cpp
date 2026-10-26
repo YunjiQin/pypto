@@ -744,12 +744,11 @@ class SliceCollector : public IRVisitor {
   ///     (`tile.matmul_acc`, so a chained accumulation stays checked).
   ///
   /// The relation is read from the op registry via
-  /// `op_predicates::OutputInheritsSourceBuffer`, so a newly added in-place or
-  /// view op is covered without editing this pass — and `tile.transpose` /
-  /// `tile.extract`, which permute or copy into a *fresh* buffer, are excluded
-  /// for the right reason rather than by name.  An in-place op names its source
-  /// through the registry's declared index; a view op declares no index, and
-  /// every inherit-input view in the registry takes its source as argument 0.
+  /// `op_predicates::StorageAliasArgIndex`: both views and destination updates
+  /// name their source explicitly. A new alias is covered without editing this
+  /// pass, while `tile.transpose` / `tile.extract` have no storage alias and are
+  /// excluded. The declaration identifies storage only; the slice-specific
+  /// window mapping above must still account for its offset and extent.
   void RecordAliasedWindow(const AssignStmtPtr& op) {
     if (!op || !op->var_) return;
     if (AsVarLike(op->value_)) {
@@ -802,10 +801,10 @@ bool IsColExpandMaterializingOp(const OpPtr& op) {
 /// any Var sharing its storage.  Storage sharing is an equivalence relation
 /// built with union-find over the edges that bind a Var to existing storage —
 /// a plain alias, an output that inherits its source buffer (views, in-place
-/// ops), and loop / if merges.  A write is a declared writeback operand, a
-/// declared hardware scratch or absolute-indexed destination, or any tile
-/// operand of a call the registry cannot describe.  Whole-function rather than
-/// between-site analysis keeps the sweep O(N α(N)); it can only decline a
+/// ops), and loop / if merges. Writes come from argument effects, including
+/// hardware scratch and absolute-indexed destinations, or conservatively from
+/// every tile operand of a call the registry cannot describe. Whole-function
+/// rather than between-site analysis keeps the sweep O(N α(N)); it can only decline a
 /// placement, never admit a wrong one.
 class SliceStorageAnalysis : public IRVisitor {
  public:

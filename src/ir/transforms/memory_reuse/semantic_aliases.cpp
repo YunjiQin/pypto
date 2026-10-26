@@ -345,20 +345,19 @@ class DefMapVisitor : public IRVisitor {
         reading_initializer_ = false;
         return;
       }
-      if (auto call = As<Call>(op->value_);
-          call && call->op_ &&
-          op_predicates::StorageAliasArgIndex(call->op_, call->args_.size()).has_value() &&
+      auto call = As<Call>(op->value_);
+      const auto source_index =
+          call ? op_predicates::StorageAliasArgIndex(call->op_, call->args_.size()) : std::nullopt;
+      if (call && call->op_ && source_index &&
           OpRegistry::GetInstance().GetEntry(call->op_->name_).GetExecutionMemoryAccessEvidence() ==
-              ExecutionMemoryAccessEvidence::NoAccess &&
-          !call->args_.empty()) {
-        auto source_index = *op_predicates::StorageAliasArgIndex(call->op_, call->args_.size());
-        if (auto source = AsVarLike(call->args_[source_index])) {
+              ExecutionMemoryAccessEvidence::NoAccess) {
+        if (auto source = AsVarLike(call->args_[*source_index])) {
           if (payload_reachable_) binding_reads[op->var_].emplace_back(op.get(), source);
           reading_initializer_ = true;
-          VisitExpr(call->args_[source_index]);
+          VisitExpr(call->args_[*source_index]);
           reading_initializer_ = false;
           for (size_t i = 0; i < call->args_.size(); ++i) {
-            if (i != source_index) VisitExpr(call->args_[i]);
+            if (i != *source_index) VisitExpr(call->args_[i]);
           }
           // Debug/dependency attributes can independently consume payloads.
           for (const auto& [key, value] : call->attrs_) {
@@ -892,12 +891,13 @@ class LoopInputIsolation : public IRVisitor {
   void VisitStmt_(const AssignStmtPtr& statement) override {
     auto source = AsVarLike(statement->value_);
     bool identity = source != nullptr;
-    if (auto call = As<Call>(statement->value_);
-        call && call->op_ && !call->args_.empty() &&
-        op_predicates::StorageAliasArgIndex(call->op_, call->args_.size()).has_value() &&
+    auto call = As<Call>(statement->value_);
+    const auto source_index =
+        call ? op_predicates::StorageAliasArgIndex(call->op_, call->args_.size()) : std::nullopt;
+    if (call && call->op_ && source_index &&
         OpRegistry::GetInstance().GetEntry(call->op_->name_).GetExecutionMemoryAccessEvidence() ==
             ExecutionMemoryAccessEvidence::NoAccess) {
-      source = AsVarLike(call->args_[*op_predicates::StorageAliasArgIndex(call->op_, call->args_.size())]);
+      source = AsVarLike(call->args_[*source_index]);
       const auto input = source ? GetTileTypeWithMemRef(source->GetType()) : nullptr;
       const auto output = GetTileTypeWithMemRef(statement->var_->GetType());
       identity = input && output && SameKnownTileMemorySpace(input, output) &&

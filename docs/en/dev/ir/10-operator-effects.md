@@ -68,6 +68,12 @@ tile.mscatter writes output_tensor, but never declared it
 | `ArgEffect::Write` | Overwritten without being read first | `tile.store`'s `output_tensor`, `pld.tile.get`'s `dst` |
 | `ArgEffect::ReadWrite` | Read *and* written | `tile.matmul_acc`'s accumulator, an atomic store's destination |
 
+Hardware scratch operands must also declare `ArgEffect::Write` when their
+incoming contents are not read. For example, `tile.row_sum` writes its second
+argument as workspace. `set_lane_invariant_arg()` describes lane splitting,
+not argument effects; it cannot replace the write declaration. Slice extraction
+must remain after a scratch write when a later consumer reads the same storage.
+
 **Partial overwrite is still `Write`.** A store that lands on a sub-region does
 not read the untouched remainder — nothing moves *into* the kernel — so its
 destination is a pure write. Declaring it `ReadWrite` is not a harmless

@@ -632,7 +632,7 @@ void OpRegistry::ValidateArgEffects() const {
     try {
       entry.ValidateOutputStorageAlias();
     } catch (const ValueError& error) {
-      unclassified.push_back(error.what());
+      unclassified.emplace_back(error.what());
     }
   }
   if (!channel_without_write.empty()) {

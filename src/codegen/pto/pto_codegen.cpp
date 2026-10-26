@@ -2422,12 +2422,11 @@ void PTOCodegen::VisitStmt_(const AssignStmtPtr& op) {
       fs_.current_result_buf = result_buf;
       fs_.current_result_tile_type = result_tile_type;
       bool elide_move = false;
+      const auto source_index = ir::op_predicates::StorageAliasArgIndex(call->op_, call->args_.size());
+      const bool defines_view = source_index && (!ir::op_predicates::CallWritesArg(call, *source_index) ||
+                                                 ir::IsOp(call, "tile.assemble"));
       if (!emit_tile_addr_ && result_tile_type && result_tile_type->memref_.has_value() &&
-          !is_set_validshape && !ir::IsOp(call, "tile.extract") &&
-          !(ir::op_predicates::StorageAliasArgIndex(call->op_, call->args_.size()) &&
-            (!ir::op_predicates::CallWritesArg(
-                 call, *ir::op_predicates::StorageAliasArgIndex(call->op_, call->args_.size())) ||
-             ir::IsOp(call, "tile.assemble")))) {
+          !is_set_validshape && !ir::IsOp(call, "tile.extract") && !defines_view) {
         // Views define their result from the input; extract already prepares
         // an independent destination in its emitter. TPOP has no general-pool
         // MemRef, and set_validshape must retain its mutable input handle.
