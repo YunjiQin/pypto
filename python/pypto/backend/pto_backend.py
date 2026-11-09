@@ -1531,6 +1531,11 @@ def _render_builtin_kernel_sources(program: _ir_core.Program) -> dict[str, str]:
         if spec is None:
             continue
         template_dir, variables = spec
+        if template_dir == ":pypto.runtime.builtins.ccu.broadcast":
+            raise NotImplementedError(
+                "CHIP broadcast engine='ccu' source generation is not implemented yet; "
+                "the AIV wrapper and CCU build sources require the PR2 integration"
+            )
         templates_dir = _resolve_builtin_template_dir(template_dir) / "templates"
         kernel_template = templates_dir / "kernel.cpp.in"
         if not kernel_template.is_file():

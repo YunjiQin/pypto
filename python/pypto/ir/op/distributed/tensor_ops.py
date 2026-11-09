@@ -365,6 +365,7 @@ def broadcast(
     signal: Expr,
     root: int,
     *,
+    engine: str = "default",
     span: Span | None = None,
 ) -> Call:
     """Build a ``pld.tensor.broadcast(target, signal, root=...)`` Call.
@@ -373,11 +374,16 @@ def broadcast(
     ``root`` is a static int selecting the source rank.  The result type is
     ``target``'s :class:`ir.DistributedTensorType` (in-place rebind).
 
-    LowerCompositeOps expands this into notify-all / wait-all + tile.create +
-    pld.tile.get; this Call never survives past that pass.
+    ``engine="default"`` preserves the existing HOST/InCore paths.
+    ``engine="ccu"`` selects the restricted CHIP builtin lowering.
     """
     actual_span = _get_span_or_capture(span, frame_offset=1)
-    return _ir_core.create_op_call("pld.tensor.broadcast", [target, signal], {"root": root}, actual_span)
+    return _ir_core.create_op_call(
+        "pld.tensor.broadcast",
+        [target, signal],
+        {"root": root, **({"engine": engine} if engine != "default" else {})},
+        actual_span,
+    )
 
 
 def allgather(

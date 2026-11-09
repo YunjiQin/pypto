@@ -2858,5 +2858,29 @@ def test_indexed_all_to_all_v_accepts_local_receive_counts(local):
     assert call.type is args[1].type
 
 
+@pytest.mark.parametrize("engine", ["default", "ccu"])
+def test_broadcast_engine_builder_and_effects(engine):
+    span = ir.Span.unknown()
+    data = ir.Var("data", ir.DistributedTensorType([1, 256], DataType.FP32), span)
+    signal = ir.Var("signal", ir.DistributedTensorType([2, 1], DataType.INT32), span)
+    call = dist_tensor_ops.broadcast(data, signal, 0, engine=engine)
+    assert call.kwargs.get("engine", "default") == engine
+    assert call.type is data.type
+    assert ir.get_op_arg_effect("pld.tensor.broadcast", 0) == ir.ArgEffect.ReadWrite
+    assert ir.get_op_arg_effect("pld.tensor.broadcast", 1) == ir.ArgEffect.ReadWrite
+    legacy = ir.create_op_call("pld.tensor.broadcast", [data, signal], {"root": 0}, span)
+    assert legacy.type is data.type
+    ir.assert_structural_equal(call, ir.deserialize(ir.serialize(call)), enable_auto_mapping=True)
+
+
+@pytest.mark.parametrize("engine", ["CCU", "urma", "", 1])
+def test_broadcast_engine_rejects_invalid_values(engine):
+    span = ir.Span.unknown()
+    data = ir.Var("data", ir.DistributedTensorType([1, 256], DataType.FP32), span)
+    signal = ir.Var("signal", ir.DistributedTensorType([2, 1], DataType.INT32), span)
+    with pytest.raises((ValueError, TypeError), match="engine|type"):
+        dist_tensor_ops.broadcast(data, signal, 0, engine=engine)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

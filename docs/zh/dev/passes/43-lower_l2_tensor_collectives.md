@@ -237,3 +237,29 @@ recv_counts 可以是本地 Tensor；send_counts 必须是窗口。
 每个目标队列只有一个写入者。调用者必须为共享队列的交换建立顺序；即使
 payload 窗口不同，复用同一个 InOut signal 也能建立此依赖。
 不支持 HOST 和 InCore 调用。参见[用户约定](../../user/distributed/20-all_to_all.md#a5-urma-索引-alltoallv)。
+
+## CCU broadcast
+
+此 pass 同时支持 Ascend950 上显式的 `pld.tensor.broadcast(..., engine="ccu")`。
+它生成 AIV builtin，模板身份为 `:pypto.runtime.builtins.ccu.broadcast`，按 root/shape
+区分变体，三个参数 `target`、`signal`、`order` 均为 `InOut`，函数体为 `return target`，
+并显式设置单块 launch。支持 FP32、静态正尺寸、完整连续 ND target，INT32 `[2, 1]`
+signal，root 0/1 和 CHIP 直线调用。默认 broadcast 保持原有限制。
+
+在方向和依赖推导前，在 CHIP 函数体内为每个 CCU function 分配一个普通 UINT8 `[1]`
+tensor。function key 由 CCU 模板及 dtype/rank/root 特化条件组成；shape 只区分 AIV wrapper
+签名，因为 element count 是 CCU 调用参数。共享同一入口的调用复用 `InOut` token，形成
+写后写（WAW）依赖链。不同入口使用独立 token，除非 payload 或 signal 数据依赖要求排序，
+否则允许并行。token 属于单次 CHIP 调用，不涉及远端访问或完成语义；不需要 Host 窗口、
+隐藏 CHIP 参数或 function attr。Host Call/Submit 的签名、输出空缺、返回映射和依赖保持不变。
+支持直接窗口/SSA 别名、常量设备或单个静态 rank 分发循环；动态、嵌套及条件绑定明确报错。
+
+`MaterializeDistTensorCtx` 仅为 builtin 追加 target/signal 的 context，形成
+`target, signal, order, ctx_target, ctx_signal`。本地 order tensor 不需要 context。
+target/signal 同域与实际 rank 数匹配仍为调用前置条件，不新增算法 scratch。
+源码渲染识别该模板身份并明确报错，等待 PR2 接通；入口去重和编号必须与 token 共享使用相同
+CCU function key。本 IR 里程碑不交付 engine 收集、AIV/CCU 源码及运行时接入。
+
+CCU builtin 的 signal/order 在 `InOutUseDiscipline` 中属于可复用控制句柄：保留 `InOut`
+任务效果，但不要求通过 SSA 返回值重新绑定。target 继续遵循普通的重新绑定检查。
+token 在 CHIP 函数体内分配，因此不需要对 CHIP 参数添加豁免。

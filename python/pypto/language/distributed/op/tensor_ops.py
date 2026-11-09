@@ -813,6 +813,7 @@ def broadcast(
     signal: DistributedTensor,
     *,
     root: int,
+    engine: str = "default",
 ) -> DistributedTensor:
     """Broadcast root rank's data to all ranks.
 
@@ -847,13 +848,18 @@ def broadcast(
             compile time for the fully-dynamic "all device" domain, since no
             device count is known there.
 
+        engine: "default" for existing HOST/InCore behavior, or "ccu" for
+            CHIP FP32 broadcast with two ranks and a static full ND target.
+            CCU requires signal shape [2, 1], a single communication domain,
+            and a straight-line call sequence. Source generation is pending.
+
     Returns:
         The rebound :class:`pld.DistributedTensor` view of ``target``.
     """
     target_expr, signal_expr = _unwrap_distributed_tensors(
         "pld.tensor.broadcast", target=target, signal=signal
     )
-    call = _ir_tensor.broadcast(target_expr, signal_expr, root)
+    call = _ir_tensor.broadcast(target_expr, signal_expr, root, engine=engine)
     return DistributedTensor(expr=call)
 
 

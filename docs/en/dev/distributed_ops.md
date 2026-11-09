@@ -958,3 +958,30 @@ dispatches before the final `Simplify`.
   monotonic epochs, and ordinary TaskId dependency gating. Other communication
   STs use the `pld.system.notify` / `pld.system.wait` handshake pattern
   established by notify/wait and collective STs.
+
+## CHIP CCU broadcast (IR support)
+
+`pld.tensor.broadcast(target, signal, *, root, engine="default")` preserves the
+existing HOST/InCore behavior when engine is omitted or `"default"`. Selecting
+`engine="ccu"` enables compiler lowering on Ascend950 CHIP orchestration only:
+FP32, static positive packed ND target with a full valid view, INT32 `[2, 1]`
+signal, and root 0 or 1. Calls must form a straight-line sequence. HOST/InCore,
+loops, conditional calls, and other shapes/layouts/backends report errors.
+
+Target and signal must belong to one domain whose actual size is two. These
+are caller preconditions, not a general compiler proof. Supported Host bindings
+use direct window views/SSA aliases and constant device IDs or one static
+two-device rank-dispatch loop. Each callable has one domain per Host body.
+
+Inside each CHIP invocation, lowering allocates one local UINT8 `[1]` scheduling
+token per CCU function. Calls to the same function share an `InOut` token and
+execute serially; different functions use distinct tokens and may run in parallel
+when payload/signal dependencies allow. Broadcast's CCU function is specialized
+by dtype, rank count and root; different tensor shapes alone do not create a new
+CCU function. The token is neither a communication window nor a completion
+record, and introduces no Host argument or communication context.
+
+The public result still aliases target. The builtin's target, signal and token
+parameters are `InOut`. **This milestone supports IR only:** source generation
+raises an explicit error until the AIV/CCU templates and configuration integration
+land. No CCU binary build or execution is provided.

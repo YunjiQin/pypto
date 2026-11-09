@@ -801,3 +801,25 @@ host_orch 函数体包裹进嵌套的 `CommDomainScopeStmt` 节点（按推断�
   注册复用、A5 跨 rank 正确性、持久窗口单调 epoch，以及普通 TaskId 依赖门控。
   其他通信 ST 采用由 notify/wait 和集体 ST 建立的
   `pld.system.notify` / `pld.system.wait` 握手模式。
+
+## CHIP CCU broadcast（IR 支持）
+
+`pld.tensor.broadcast(target, signal, *, root, engine="default")` 在省略 engine
+或使用 `"default"` 时保持现有 HOST/InCore 行为。`engine="ccu"` 仅开放 Ascend950
+CHIP 编排的编译器 lowering：target 为 FP32、静态正尺寸、连续 ND、完整有效视图；
+signal 为 INT32 `[2, 1]`；root 为 0 或 1。调用必须为直线序列。
+HOST/InCore、循环、条件调用以及其他 shape/layout/backend 均明确报错。
+
+target 和 signal 必须属于同一通信域，实际域大小必须为二。这是调用前置条件，
+不代表通用的编译器同域证明。支持的 Host 绑定使用直接窗口视图或 SSA 别名，
+以及常量设备 ID 或一个静态双设备 rank 分发循环。每个 Host 函数内，每个 callable 只支持一个域。
+
+每次 CHIP 调用内，lowering 为每个 CCU function 分配一个本地 UINT8 `[1]` 调度 token。
+同一 function 的调用共享 `InOut` token 并串行执行；不同 function 使用独立 token，
+在 payload/signal 数据依赖允许时可以并行。broadcast 的 CCU function 按 dtype、rank 数和 root
+特化，仅 tensor shape 不同不会产生新的 CCU function。token 不是通信窗口或完成记录，
+不会增加 Host 实参或通信 context。
+
+公共返回值仍是 target 的别名。builtin 的 target、signal 和 token 三个参数均为 `InOut`。
+**本里程碑仅支持 IR**：在 AIV/CCU 模板及配置接通前，源码生成明确报错，
+不提供 CCU 二进制构建或执行。

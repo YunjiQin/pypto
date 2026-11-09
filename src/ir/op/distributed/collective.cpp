@@ -289,6 +289,10 @@ TypePtr DeduceTensorBroadcastType(const std::vector<ExprPtr>& args,
       << "pld.tensor.broadcast signal must have INT32 element type, got dtype "
       << signal_type->dtype_.ToString();
 
+  auto engine = GetKwargOr<std::string>(kwargs, "engine", "default");
+  CHECK(engine == "default" || engine == "ccu")
+      << "pld.tensor.broadcast engine must be 'default' or 'ccu', got '" << engine << "'";
+
   // Validate root kwarg.
   auto root_value = GetRequiredKwarg<int>(kwargs, "root", "pld.tensor.broadcast");
   CHECK(root_value >= 0) << "pld.tensor.broadcast root rank must be non-negative, got " << root_value;
@@ -313,6 +317,7 @@ REGISTER_OP("pld.tensor.broadcast")
     .add_argument("target", "Window-bound DistributedTensor (InOut)")
     .add_argument("signal", "Window-bound INT32 DistributedTensor used as cross-rank barrier (InOut)")
     .set_attr<int>("root")
+    .set_attr<std::string>("engine")
     .no_memory_spec()
     // Composite collective — target is read on the root and written on every rank; signal is notify+wait.
     .set_arg_effect(0, ArgEffect::ReadWrite)

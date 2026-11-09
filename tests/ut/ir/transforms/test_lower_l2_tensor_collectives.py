@@ -20,11 +20,17 @@ signature and directions, the argument order, and the absence of any residual
 public collective.
 """
 
+from contextlib import nullcontext
+
 import pypto.language as pl
 import pypto.language.distributed as pld
 import pytest
+from pypto import Error
+from pypto import ir as public_ir
 from pypto._function_attrs import REQUIRE_CONTIGUOUS_OPERANDS_ATTR
-from pypto.pypto_core import ir, passes
+from pypto.backend.pto_backend import _render_builtin_kernel_sources
+from pypto.pypto_core import codegen, ir, passes
+from pypto.pypto_core.backend import BackendType
 
 SIZE = 64
 NR = 2
@@ -947,6 +953,544 @@ def test_indexed_strided_index_is_rejected():
 
     with pytest.raises(ValueError, match=_NOT_ROW_MAJOR.format(role="index", op="tensor.slice")):
         passes.lower_l2_tensor_collectives()(StridedIndex)
+
+
+# CCU stage 1 deliberately stops at IR: kernel sources are a PR2 deliverable.
+_CCU_TEMPLATE = ":pypto.runtime.builtins.ccu.broadcast"
+
+
+def _require_ccu_func(program: ir.Program, name: str) -> ir.Function:
+    func = _get_func(program, name)
+    assert func is not None
+    return func
+
+
+def _ccu_program(
+    root: int = 0,
+    size: int | str = 256,
+    dtype: str = "FP32",
+    signal_shape: str = "2, 1",
+    body: str | None = None,
+    target_view: str = "",
+) -> ir.Program:
+    """Text fixtures let the negative cases vary types without executing a DSL op."""
+    body = body or f"data = pld.tensor.broadcast(data, signal, root={root}, engine='ccu')"
+    dimension_param = "n: pl.Scalar[pl.INDEX], " if size == "n" else ""
+    source = f"""
+@pl.program
+class Broadcast:
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def chip(self, {dimension_param}
+             data: pl.InOut[pld.DistributedTensor[[1, {size}], pl.{dtype}{target_view}]],
+             signal: pl.InOut[pld.DistributedTensor[[{signal_shape}], pl.INT32]]
+    ) -> pld.DistributedTensor[[1, {size}], pl.{dtype}]:
+        {body}
+        return data
+"""
+    return pl.parse_program(source)
+
+
+def _ccu_kernels(program: ir.Program) -> list[ir.Function]:
+    return [f for f in program.functions.values() if f.attrs.get("builtin_template_dir") == _CCU_TEMPLATE]
+
+
+def _ccu_calls(program: ir.Program, name: str = "chip") -> list[ir.Call]:
+    kernels = {f.name for f in _ccu_kernels(program)}
+    return [call for call in _collect_calls(_require_ccu_func(program, name).body) if call.op.name in kernels]
+
+
+@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend950], indirect=True)
+@pytest.mark.parametrize("root", [0, 1])
+def test_ccu_broadcast_signature_alias_launch_and_ctx(ascend_backend, root):
+    before = _ccu_program(root=root)
+    # Explicit engine must survive both public text and binary IR round trips.
+    ir.assert_structural_equal(before, pl.parse_program(ir.python_print(before)))
+    ir.assert_structural_equal(before, ir.deserialize(ir.serialize(before)))
+    after = passes.lower_l2_tensor_collectives()(before)
+    (kernel,) = _ccu_kernels(after)
+    assert kernel.func_type == ir.FunctionType.AIV
+    assert [p.name_hint for p in kernel.params] == ["target", "signal", "order"]
+    assert kernel.param_directions == [ir.ParamDirection.InOut] * 3
+    assert isinstance(kernel.body, ir.ReturnStmt)
+    assert kernel.body.value[0] is kernel.params[0]
+    assert kernel.attrs["builtin_template_vars"].endswith(f"root_cpp={root}")
+    chip = _require_ccu_func(after, "chip")
+    (call,) = _ccu_calls(after)
+    assert len(chip.params) == 2
+    assert isinstance(call.args[2].type, ir.TensorType)
+    assert not isinstance(call.args[2].type, ir.DistributedTensorType)
+    assert all(call.args[2] is not param for param in chip.params)
+    assert call.attrs["core_num"].value == 1
+    ir.assert_structural_equal(after, pl.parse_program(ir.python_print(after)))
+    ir.assert_structural_equal(after, ir.deserialize(ir.serialize(after)))
+    ir.assert_structural_equal(after, passes.lower_l2_tensor_collectives()(after))
+    after = passes.derive_call_directions()(after)
+    after = passes.materialize_dist_tensor_ctx()(after)
+    chip = _require_ccu_func(after, "chip")
+    (kernel,) = _ccu_kernels(after)
+    (call,) = _ccu_calls(after)
+    assert len(kernel.params) == len(call.args) == 5
+    assert len(chip.params) == 4
+    assert list(call.arg_directions) == [ir.ArgDirection.InOut] * 3 + [ir.ArgDirection.Scalar] * 2
+    assert all(isinstance(p.type, ir.CommCtxType) for p in kernel.params[3:])
+    assert all(call.args[i + 3] is chip.params[i + 2] for i in range(2))
+
+
+@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend950], indirect=True)
+@pytest.mark.parametrize("second_root", [0, 1])
+def test_ccu_order_scoped_to_function_across_disjoint_payloads_and_shapes(
+    ascend_backend, second_root, tmp_path
+):
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip(
+            self,
+            a: pl.InOut[pld.DistributedTensor[[1, 256], pl.FP32]],
+            sa: pl.InOut[pld.DistributedTensor[[2, 1], pl.INT32]],
+            b: pl.InOut[pld.DistributedTensor[[1, 128], pl.FP32]],
+            sb: pl.InOut[pld.DistributedTensor[[2, 1], pl.INT32]],
+            c: pl.InOut[pld.DistributedTensor[[1, 64], pl.FP32]],
+            sc: pl.InOut[pld.DistributedTensor[[2, 1], pl.INT32]],
+        ):
+            a = pld.tensor.broadcast(a, sa, root=0, engine="ccu")
+            b = pld.tensor.broadcast(b, sb, root=second_root, engine="ccu")
+            c = pld.tensor.broadcast(c, sc, root=0, engine="ccu")
+            return a, b, c
+
+    after = passes.lower_l2_tensor_collectives()(Before)
+    assert len(_ccu_kernels(after)) == 3
+    chip = _require_ccu_func(after, "chip")
+    first, second, third = _ccu_calls(after)
+    # Shape only specializes the AIV wrapper. With equal roots the two calls
+    # share one CCU entry; distinct roots must not acquire an artificial WAW.
+    assert len(chip.params) == 6
+    assert (first.args[2] is second.args[2]) == (second_root == 0)
+    assert first.args[2] is third.args[2]
+    creates = [call for call in _collect_calls(chip.body) if call.op.name == ir.get_op("tensor.create").name]
+    assert len(creates) == (1 if second_root == 0 else 2)
+    assert isinstance(first.args[2], ir.Var)
+    assert isinstance(second.args[2], ir.Var)
+    order_names = [first.args[2].name_hint, second.args[2].name_hint]
+    after = passes.derive_call_directions()(after)
+    after = passes.auto_derive_task_dependencies(analyze_auto_scopes=True)(after)
+    # Plain calls use runtime TensorMap dependencies. Unlike Submit, they do
+    # not expose TaskIds for explicit compiler_manual_dep_edges.
+    after = passes.materialize_dist_tensor_ctx()(after)
+    chip = _require_ccu_func(after, "chip")
+    after = passes.materialize_runtime_scopes()(after)
+    chip = _require_ccu_func(after, "chip")
+    source = codegen.generate_orchestration(after, chip).code
+    assert source.count(f".add_inout({order_names[0]})") == (3 if second_root == 0 else 2)
+    if second_root != 0:
+        assert source.count(f".add_inout({order_names[1]})") == 1
+    assert source.count("rt_submit_aiv_task") == 3
+
+    # The complete pipeline must preserve both token sharing and separation
+    # until the intentionally unavailable PR2 template renderer is reached.
+    with pytest.raises(NotImplementedError, match="source generation is not implemented"):
+        public_ir.compile(
+            Before, output_dir=str(tmp_path), backend_type=BackendType.Ascend950, skip_ptoas=True
+        )
+
+
+@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend950], indirect=True)
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        ({"dtype": "BF16"}, "only FP32"),
+        ({"size": 0}, "static positive"),
+        ({"signal_shape": "3, 1"}, "two ranks"),
+        ({"signal_shape": "2, 2"}, "two ranks"),
+        ({"root": 2}, "root must"),
+        (
+            {"target_view": ", pl.TensorView(stride=[512, 1], layout=pl.TensorLayout.ND)"},
+            "not provably row-major",
+        ),
+        (
+            {"target_view": ", pl.TensorView(stride=[1, 1], layout=pl.TensorLayout.DN)"},
+            "not provably row-major",
+        ),
+        ({"target_view": ", pl.TensorView(stride=[256, 1], valid_shape=[1, 128])"}, "full valid view"),
+    ],
+)
+def test_ccu_capability_diagnostics(ascend_backend, options, message):
+    with pytest.raises(ValueError, match=message):
+        passes.lower_l2_tensor_collectives()(_ccu_program(**options))
+
+
+@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend910], indirect=True)
+def test_ccu_backend_capability_rejects_unsupported_target(ascend_backend):
+    with pytest.raises(ValueError, match="unsupported by this backend"):
+        passes.lower_l2_tensor_collectives()(_ccu_program())
+
+
+@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend950], indirect=True)
+def test_ccu_rejects_loops(ascend_backend):
+    before = _ccu_program(
+        body="for i in pl.range(2):\n"
+        "            data = pld.tensor.broadcast(data, signal, root=0, engine='ccu')"
+    )
+    with pytest.raises(ValueError, match="straight-line"):
+        passes.lower_l2_tensor_collectives()(before)
+
+
+@pytest.mark.parametrize("location", ["InCore", "HOST"])
+def test_ccu_rejects_other_rails(location):
+    source = ir.python_print(_ccu_program())
+    if location == "InCore":
+        source = source.replace("pl.FunctionType.Orchestration", "pl.FunctionType.InCore")
+        source = source.replace("pl.Level.CHIP", "pl.Level.CHIP_DIE").replace(
+            "pl.Role.Orchestrator", "pl.Role.SubWorker"
+        )
+        transform = passes.lower_composite_ops()
+    else:
+        source = source.replace("pl.Level.CHIP", "pl.Level.HOST").replace(
+            "pl.FunctionType.Orchestration", "pl.FunctionType.Opaque"
+        )
+        transform = passes.lower_host_tensor_collectives()
+    with pytest.raises(ValueError, match="supported only in CHIP"):
+        transform(pl.parse_program(source))
+
+
+@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend950], indirect=True)
+def test_ccu_source_generation_reports_pending_integration(ascend_backend):
+    after = passes.lower_l2_tensor_collectives()(_ccu_program())
+    with pytest.raises(NotImplementedError, match="source generation is not implemented"):
+        _render_builtin_kernel_sources(after)
+
+
+@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend950], indirect=True)
+def test_ccu_local_order_does_not_extend_host_windows_or_context(ascend_backend, tmp_path):
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip(
+            self,
+            data: pld.DistributedTensor[[1, 256], pl.FP32],
+            signal: pld.DistributedTensor[[2, 1], pl.INT32],
+        ):
+            data = pld.tensor.broadcast(data, signal, root=0, engine="ccu")
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host(self):
+            data_buf = pld.alloc_window_buffer(1024)
+            signal_buf = pld.alloc_window_buffer(8)
+            data = pld.window(data_buf, [1, 256], dtype=pl.FP32)
+            signal = pld.window(signal_buf, [2, 1], dtype=pl.INT32)
+            for r in pl.range(2):
+                self.chip(data, signal, device=r)
+            return 0
+
+    after = passes.lower_l2_tensor_collectives()(Before)
+    host = _require_ccu_func(after, "host")
+    calls = _collect_calls(host.body)
+    allocations = [c for c in calls if c.op.name == ir.get_op("pld.tensor.alloc_window_buffer").name]
+    assert len(allocations) == 2
+    ir.assert_structural_equal(host, _require_ccu_func(Before, "host"))
+    (dispatch,) = [c for c in calls if c.op.name == "chip"]
+    assert len(dispatch.args) == 2
+    after = passes.derive_call_directions()(after)
+    after = passes.materialize_comm_domain_scopes()(after)
+    after = passes.materialize_dist_tensor_ctx()(after)
+    host = _require_ccu_func(after, "host")
+    (dispatch,) = [c for c in _collect_calls(host.body) if c.op.name == "chip"]
+    assert len(dispatch.args) == 4
+    assert isinstance(host.body, ir.CommDomainScopeStmt)
+    assert len(host.body.slots) == 2
+    assert all(isinstance(arg.type, ir.CommCtxType) for arg in dispatch.args[-2:])
+    # Match the existing distributed source tests: retain property checks.
+    # Buffer-stage binary roundtrip has a pre-existing window forward-ref bug.
+    with (
+        passes.PassContext([passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)]),
+        pytest.raises(NotImplementedError, match="source generation is not implemented"),
+    ):
+        public_ir.compile(
+            Before,
+            output_dir=str(tmp_path),
+            backend_type=BackendType.Ascend950,
+            skip_ptoas=True,
+            distributed_config=public_ir.DistributedConfig(device_ids=[0, 1], num_sub_workers=0),
+        )
+
+
+@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend950], indirect=True)
+@pytest.mark.parametrize("omit_out", [False, True])
+def test_ccu_local_order_preserves_submit_output_gap_and_deps(ascend_backend, omit_out):
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip(
+            self,
+            data: pld.DistributedTensor[[1, 256], pl.FP32],
+            signal: pld.DistributedTensor[[2, 1], pl.INT32],
+            out: pl.Out[pl.Tensor[[1, 256], pl.FP32]],
+        ) -> pl.Tensor[[1, 256], pl.FP32]:
+            data = pld.tensor.broadcast(data, signal, root=0, engine="ccu")
+            return out
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host(self):
+            data_buf = pld.alloc_window_buffer(1024)
+            signal_buf = pld.alloc_window_buffer(8)
+            data = pld.window(data_buf, [1, 256], dtype=pl.FP32)
+            signal = pld.window(signal_buf, [2, 1], dtype=pl.INT32)
+            out = pl.create_tensor([1, 256], dtype=pl.FP32)
+            with pl.manual_scope():
+                _out0, tid0 = pl.submit(self.chip, data, signal, out, device=0)
+                _out1, _tid1 = pl.submit(self.chip, data, signal, out, device=1, deps=[tid0])
+            return 0
+
+    # HOST DSL requires all Out arguments. Exercise the IR gap contract by
+    # removing the caller allocation, preserving Submit deps and result type.
+    class OmitOut(ir.IRMutator):
+        def visit_submit(self, op: ir.Submit) -> ir.Expr:
+            return ir.Submit(
+                op.op,
+                list(op.args[:-1]),
+                list(op.deps),
+                type=op.type,
+                span=op.span,
+                kwargs=op.kwargs,
+                attrs=op.attrs,
+            )
+
+    before = OmitOut().visit_program(Before) if omit_out else Before
+    # This IR-only gap is intentionally outside HOST authoring syntax; keep
+    # property verification and binary roundtrip, without a DSL roundtrip.
+    context = (
+        passes.PassContext([passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)])
+        if omit_out
+        else nullcontext()
+    )
+    with context:
+        after = passes.lower_l2_tensor_collectives()(before)
+        chip = _require_ccu_func(after, "chip")
+        assert chip.param_directions == [ir.ParamDirection.In] * 2 + [ir.ParamDirection.Out]
+        ir.assert_structural_equal(_require_ccu_func(after, "host"), _require_ccu_func(before, "host"))
+        ir.assert_structural_equal(after, ir.deserialize(ir.serialize(after)))
+        after = passes.derive_call_directions()(after)
+        after = passes.materialize_comm_domain_scopes()(after)
+        after = passes.materialize_dist_tensor_ctx()(after)
+    submits: list[ir.Submit] = []
+
+    class Collector(ir.IRVisitor):
+        def visit_submit(self, op: ir.Submit) -> None:
+            submits.append(op)
+
+    Collector().visit_stmt(_require_ccu_func(after, "host").body)
+    assert len(submits) == 2
+    first, second = submits
+    assert len(first.args) == len(second.args) == (4 if omit_out else 5)
+    assert len(_require_ccu_func(after, "chip").params) == 5
+    assert len(second.deps) == 1
+    assert isinstance(second.deps[0], ir.Var)
+    assert second.deps[0].name_hint == "tid0"
+    assert isinstance(second.type, ir.TupleType)
+    assert isinstance(second.type.types[-1], ir.ScalarType)
+    assert second.type.types[-1].dtype == pl.TASK_ID
+    assert all(isinstance(arg.type, ir.CommCtxType) for arg in second.args[-2:])
+
+
+@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend950], indirect=True)
+def test_ccu_rejects_slice_with_lost_stride_metadata(ascend_backend):
+    before = _ccu_program(
+        body="sliced = pl.slice(data, [1, 128], [0, 0])\n"
+        "        sliced = pld.tensor.broadcast(sliced, signal, root=0, engine='ccu')",
+        size=256,
+    )
+    # Rank-2 one-row narrowing is rejected conservatively by the shared
+    # AllToAllV provenance proof; general view support is not part of PR1.
+    with pytest.raises(ValueError, match="not provably row-major"):
+        passes.lower_l2_tensor_collectives()(before)
+
+
+@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend950], indirect=True)
+def test_ccu_full_pipeline_stops_at_explicit_codegen_diagnostic(ascend_backend, tmp_path):
+    with pytest.raises(NotImplementedError, match="source generation is not implemented"):
+        public_ir.compile(
+            _ccu_program(), output_dir=str(tmp_path), backend_type=BackendType.Ascend950, skip_ptoas=True
+        )
+
+
+@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend950], indirect=True)
+@pytest.mark.parametrize("second_root", [0, 1])
+def test_ccu_repeated_broadcast_preserves_payload_and_signal_dependencies(ascend_backend, second_root):
+    before = _ccu_program(
+        body="data = pld.tensor.broadcast(data, signal, root=0, engine='ccu')\n"
+        f"        data = pld.tensor.broadcast(data, signal, root={second_root}, engine='ccu')"
+    )
+    after = passes.lower_l2_tensor_collectives()(before)
+    assert len(_ccu_kernels(after)) == (1 if second_root == 0 else 2)
+    first, second = _ccu_calls(after)
+    assert first.args[1] is second.args[1]
+    assert (first.args[2] is second.args[2]) == (second_root == 0)
+    # Different CCU functions may overlap only when real operands allow it.
+    # Here the target and signal must still create dependencies between tasks.
+    after = passes.derive_call_directions()(after)
+    after = passes.materialize_dist_tensor_ctx()(after)
+    after = passes.materialize_runtime_scopes()(after)
+    source = codegen.generate_orchestration(after, _require_ccu_func(after, "chip")).code
+    assert source.count(".add_inout(ext_data)") == 2
+    assert source.count(".add_inout(ext_signal)") == 2
+
+
+@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend950], indirect=True)
+def test_ccu_target_still_requires_rebind(ascend_backend):
+    before = _ccu_program(
+        body="first = pld.tensor.broadcast(data, signal, root=0, engine='ccu')\n"
+        "        second = pld.tensor.broadcast(data, signal, root=0, engine='ccu')"
+    )
+    with pytest.raises(Error, match="InOutUseDiscipline"):
+        passes.lower_l2_tensor_collectives()(before)
+
+
+@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend950], indirect=True)
+def test_ccu_rejects_dynamic_target_extent(ascend_backend):
+    with pytest.raises(ValueError, match="static positive"):
+        passes.lower_l2_tensor_collectives()(_ccu_program(size="n"))
+
+
+@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend950], indirect=True)
+def test_ccu_rejects_conditional_call(ascend_backend):
+    before = _ccu_program(
+        body="if True:\n            data = pld.tensor.broadcast(data, signal, root=0, engine='ccu')"
+    )
+    with pytest.raises(ValueError, match="straight-line"):
+        passes.lower_l2_tensor_collectives()(before)
+
+
+@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend950], indirect=True)
+def test_ccu_producer_broadcast_consumer_dependencies(ascend_backend):
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.AIV)
+        def produce(self, data: pl.InOut[pld.DistributedTensor[[1, 256], pl.FP32]]):
+            return data
+
+        @pl.function(type=pl.FunctionType.AIV)
+        def consume(self, data: pld.DistributedTensor[[1, 256], pl.FP32]):
+            return
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip(
+            self,
+            data: pl.InOut[pld.DistributedTensor[[1, 256], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[2, 1], pl.INT32]],
+        ):
+            data = self.produce(data)
+            data = pld.tensor.broadcast(data, signal, root=0, engine="ccu")
+            self.consume(data)
+            return data
+
+    after = passes.lower_l2_tensor_collectives()(Before)
+    after = passes.derive_call_directions()(after)
+    after = passes.auto_derive_task_dependencies()(after)
+    after = passes.materialize_dist_tensor_ctx()(after)
+    after = passes.materialize_runtime_scopes()(after)
+    chip = _require_ccu_func(after, "chip")
+    produce, broadcast, consume = [
+        call for call in _collect_calls(chip.body) if call.op.name != ir.get_op("tensor.create").name
+    ]
+    assert produce.arg_directions[0] == ir.ArgDirection.InOut
+    assert list(broadcast.arg_directions[:3]) == [ir.ArgDirection.InOut] * 3
+    assert consume.arg_directions[0] == ir.ArgDirection.Input
+    # Return-alias tracking must keep all three task operands on the same
+    # external TensorMap buffer, establishing produce -> broadcast -> consume.
+    source = codegen.generate_orchestration(after, chip).code
+    assert source.count(".add_inout(ext_data)") == 2
+    assert source.count(".add_input(ext_data)") == 1
+    assert source.count("rt_submit_aiv_task") == 3
+
+
+@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend950], indirect=True)
+@pytest.mark.parametrize("devices", [1, 3])
+def test_ccu_host_rejects_unqualified_rank_count(ascend_backend, devices):
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip(
+            self,
+            data: pld.DistributedTensor[[1, 256], pl.FP32],
+            signal: pld.DistributedTensor[[2, 1], pl.INT32],
+        ):
+            data = pld.tensor.broadcast(data, signal, root=0, engine="ccu")
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host(self):
+            data_buf = pld.alloc_window_buffer(1024)
+            signal_buf = pld.alloc_window_buffer(8)
+            data = pld.window(data_buf, [1, 256], dtype=pl.FP32)
+            signal = pld.window(signal_buf, [2, 1], dtype=pl.INT32)
+            for r in pl.range(devices):
+                self.chip(data, signal, device=r)
+            return 0
+
+    with pytest.raises(ValueError, match="static two-device"):
+        passes.lower_l2_tensor_collectives()(Before)
+
+
+@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend950], indirect=True)
+def test_ccu_order_isolated_between_host_domains_and_callables(ascend_backend):
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_a(
+            self,
+            data: pld.DistributedTensor[[1, 256], pl.FP32],
+            signal: pld.DistributedTensor[[2, 1], pl.INT32],
+        ):
+            data = pld.tensor.broadcast(data, signal, root=0, engine="ccu")
+            return data
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_b(
+            self,
+            data: pld.DistributedTensor[[1, 256], pl.FP32],
+            signal: pld.DistributedTensor[[2, 1], pl.INT32],
+        ):
+            data = pld.tensor.broadcast(data, signal, root=0, engine="ccu")
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host(self):
+            a_buf = pld.alloc_window_buffer(1024)
+            sa_buf = pld.alloc_window_buffer(8)
+            b_buf = pld.alloc_window_buffer(1024)
+            sb_buf = pld.alloc_window_buffer(8)
+            a = pld.window(a_buf, [1, 256], dtype=pl.FP32)
+            sa = pld.window(sa_buf, [2, 1], dtype=pl.INT32)
+            b = pld.window(b_buf, [1, 256], dtype=pl.FP32)
+            sb = pld.window(sb_buf, [2, 1], dtype=pl.INT32)
+            for r in pl.range(2):
+                self.chip_a(a, sa, device=r)
+            for r in pl.range(2, 4):
+                self.chip_b(b, sb, device=r)
+            return 0
+
+    after = passes.lower_l2_tensor_collectives()(Before)
+    # Code specialization is shared, but scheduling storage must not be.
+    assert len(_ccu_kernels(after)) == 1
+    (call_a,) = _ccu_calls(after, "chip_a")
+    (call_b,) = _ccu_calls(after, "chip_b")
+    assert call_a.args[2] is not call_b.args[2]
+    assert not isinstance(call_a.args[2].type, ir.DistributedTensorType)
+    assert not isinstance(call_b.args[2].type, ir.DistributedTensorType)
+    after = passes.materialize_comm_domain_scopes()(after)
+    host = _require_ccu_func(after, "host")
+    scopes = []
+    body = host.body
+    while isinstance(body, ir.CommDomainScopeStmt):
+        scopes.append(body)
+        body = body.body
+    assert [list(scope.devices) for scope in scopes] == [[0, 1], [2, 3]]
+    assert [len(scope.slots) for scope in scopes] == [2, 2]
+    calls = _collect_calls(host.body)
+    (a,) = [call for call in calls if call.op.name == "chip_a"]
+    (b,) = [call for call in calls if call.op.name == "chip_b"]
+    assert len(a.args) == len(b.args) == 2
 
 
 if __name__ == "__main__":

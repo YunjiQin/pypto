@@ -7,7 +7,8 @@ rewrites a `pld.tensor.*` collective written in a **CHIP orchestration body**
 into a call to a compiler-synthesized AIV kernel, so the collective becomes one
 ordinary task inside the caller's own pipeline.
 
-Today it handles `pld.tensor.all_to_all_v` with a compile-time `core_num`.
+It handles `pld.tensor.all_to_all_v` with a compile-time `core_num`, indexed
+all-to-all-v, and the restricted CCU broadcast IR path described below.
 
 The HOST rail ([`LowerHostTensorCollectives`](50-lower_host_tensor_collectives.md))
 solves the same problem one level up, and differently: it fans the collective
@@ -169,7 +170,8 @@ passes earlier, so re-reporting them here would blame the wrong pass.
 
 ## What this pass does *not* do
 
-- It does not create a `CommDomain` or allocate any collective staging buffer.
+- It does not create a `CommDomain` or allocate collective payload staging.
+  CCU broadcast does synthesize local scheduling tokens.
   L3 still creates the domain, exchanges window addresses and binds the
   windows; L2 consumes local views and an already-built context.
 - It does not fan out per device. The `device=` dispatch stays in the HOST
@@ -278,3 +280,38 @@ Only A5 URMA PER_PEER transport is supported, with one writer per destination.
 Callers must order exchanges sharing queues; reusing the same InOut signal
 creates that dependency even when payload windows differ. HOST and InCore
 calls are unsupported. See the [user contract](../../user/distributed/20-all_to_all.md#indexed-alltoallv-on-a5-urma).
+
+## CCU broadcast
+
+The pass also lowers explicit `pld.tensor.broadcast(..., engine="ccu")` on
+Ascend950. It emits an AIV builtin with template identity
+`:pypto.runtime.builtins.ccu.broadcast`, a root/shape-specific name, three
+`InOut` parameters (`target`, `signal`, `order`), `return target`, and an
+explicit one-block launch. The supported matrix is FP32 full contiguous ND
+static positive target shapes, signal INT32 `[2, 1]`, root 0/1, straight-line
+CHIP calls. Default broadcast keeps its existing restrictions.
+
+Before direction/dependency derivation, the CHIP body allocates one ordinary
+UINT8 `[1]` tensor per CCU function. The function key is the CCU template plus
+its dtype/rank/root specialization; shape only distinguishes AIV wrapper
+signatures because element count is a CCU call argument. Calls sharing an entry
+reuse its `InOut` token to form a WAW chain. Distinct entries use independent
+tokens, preserving parallelism unless payload or signal dependencies order them.
+The token is local to each CHIP invocation and has no remote access or completion
+semantics. It requires no Host window, hidden CHIP parameter, or function attr.
+Host Call/Submit signatures, output gaps, return mappings and dependencies stay
+unchanged. Direct window/SSA-alias bindings and constant devices or a single
+static rank-dispatch loop are supported; dynamic/nested/conditional binding fails.
+
+`MaterializeDistTensorCtx` appends only target/signal contexts to the builtin,
+giving `target, signal, order, ctx_target, ctx_signal`. The local order tensor
+needs no context. Same-domain target/signal and matching runtime rank count remain
+caller preconditions. No algorithm scratch is added. Source rendering explicitly
+rejects this template identity pending PR2; entry deduplication and IDs must use
+the same CCU function key as token sharing. Engine collection, AIV/CCU sources and
+runtime integration are not delivered by this IR milestone.
+
+The CCU builtin's signal/order are reusable control handles for
+`InOutUseDiscipline`; they retain `InOut` task effects but do not require SSA
+return rebinds. Target keeps normal rebind checking. No CHIP parameter exemption
+is needed because the token is allocated inside the CHIP body.

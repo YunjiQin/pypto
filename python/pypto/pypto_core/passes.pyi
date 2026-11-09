@@ -824,6 +824,11 @@ def lower_l2_tensor_collectives() -> Pass:
     joins the caller's own task DAG, so ``compute -> collective -> consume`` is
     ordered by ordinary TensorMap dependencies.
 
+    Explicit ``broadcast(engine="ccu")`` lowers to a shape/root-specialized
+    AIV signature with a CHIP-local order token per CCU function on Ascend950
+    (FP32, two ranks, straight-line CHIP only). Host signatures stay unchanged.
+    CCU source generation remains unavailable until the companion templates land.
+
     Runs before :func:`derive_call_directions` so the emitted call
     gets its argument directions and task edges derived like any kernel call.
     ``pld.tensor.indexed_all_to_all_v`` also lowers on this rail (A5 URMA only),

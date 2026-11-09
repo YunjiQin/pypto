@@ -42,6 +42,9 @@ namespace lower_composite {
 // ============================================================================
 
 ExprPtr LowerTensorBroadcastRule(const CallPtr& call, const std::vector<ExprPtr>& args, LoweringBuilder& b) {
+  CHECK_SPAN(call->GetKwarg<std::string>("engine", "default") != "ccu", call->span_)
+      << "pld.tensor.broadcast engine='ccu' is supported only in CHIP orchestration, not InCore";
+
   const Span& span = call->span_;
   INTERNAL_CHECK_SPAN(args.size() == 2, span)
       << "pld.tensor.broadcast rule expects 2 args, got " << args.size();
