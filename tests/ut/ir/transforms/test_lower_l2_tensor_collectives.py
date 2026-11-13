@@ -1158,7 +1158,7 @@ def test_ccu_rejects_other_rails(location):
 def test_ccu_source_generation_reports_pending_integration(ascend_backend):
     after = passes.lower_l2_tensor_collectives()(_ccu_program())
     with pytest.raises(NotImplementedError, match="source generation is not implemented"):
-        _render_builtin_kernel_sources(after)
+        _render_builtin_kernel_sources(after, [])
 
 
 @pytest.mark.parametrize("ascend_backend", [BackendType.Ascend950], indirect=True)
@@ -1200,6 +1200,7 @@ def test_ccu_local_order_does_not_extend_host_windows_or_context(ascend_backend,
     assert len(dispatch.args) == 4
     assert isinstance(host.body, ir.CommDomainScopeStmt)
     assert len(host.body.slots) == 2
+    assert list(host.body.engines) == ["ccu"]
     assert all(isinstance(arg.type, ir.CommCtxType) for arg in dispatch.args[-2:])
     # Match the existing distributed source tests: retain property checks.
     # Buffer-stage binary roundtrip has a pre-existing window forward-ref bug.

@@ -9,7 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#include "src/ir/transforms/lower_l2/ccu_broadcast.h"
+#include "src/ir/transforms/lower_l2/ccu_collectives.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -31,7 +31,7 @@
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/pass_context.h"
 #include "pypto/ir/transforms/utils/auto_name_utils.h"
-#include "pypto/ir/transforms/utils/ccu_broadcast_utils.h"
+#include "pypto/ir/transforms/utils/ccu_collective_utils.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
 
 namespace pypto::ir {

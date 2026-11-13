@@ -9,8 +9,8 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#ifndef SRC_IR_TRANSFORMS_LOWER_L2_CCU_BROADCAST_H_
-#define SRC_IR_TRANSFORMS_LOWER_L2_CCU_BROADCAST_H_
+#ifndef SRC_IR_TRANSFORMS_LOWER_L2_CCU_COLLECTIVES_H_
+#define SRC_IR_TRANSFORMS_LOWER_L2_CCU_COLLECTIVES_H_
 
 #include "pypto/ir/program.h"
 
@@ -23,4 +23,4 @@ bool IsCcuBroadcast(const CallPtr& call);
 ProgramPtr LowerCcuCollectives(const ProgramPtr& program);
 }  // namespace pypto::ir
 
-#endif  // SRC_IR_TRANSFORMS_LOWER_L2_CCU_BROADCAST_H_
+#endif  // SRC_IR_TRANSFORMS_LOWER_L2_CCU_COLLECTIVES_H_

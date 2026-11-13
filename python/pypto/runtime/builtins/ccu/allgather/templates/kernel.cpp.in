@@ -14,6 +14,8 @@
 #include <pto/pto-inst.hpp>
 #include "async_kernel_api.h"
 #include "tensor.h"
+#define PYPTO_CCU_INLINE __aicore__ inline
+#include "../../ccu/allgather_schedule.hpp"
 
 extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t *args) {
   auto *input = reinterpret_cast<__gm__ Tensor *>(args[0]);
@@ -39,13 +41,19 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
   using Arg = simpler::ccu::CcuCallArg;
   // Window expands to address/token; PeerRank resolves the same domain slot
   // to a physical registration rank. Keep output bases in domain rank order.
-  Arg call_args[3 + 2 * nranks]{};
+  const auto go = pypto_ccu::CalcGoSize(bytes % pypto_ccu::kSegmentBytes);
+  Arg call_args[8 + 2 * nranks]{};
   call_args[0] = {Arg::Kind::Window, rank, input_offset, bytes};
   call_args[1] = {Arg::Kind::Scalar, 0, bytes, 0};
   call_args[2] = {Arg::Kind::Scalar, 0, slot_offset, 0};
+  call_args[3] = {Arg::Kind::Scalar, 0, bytes / pypto_ccu::kSegmentBytes, 0};
+  call_args[4] = {Arg::Kind::Scalar, 0, go.addr_offset, 0};
+  call_args[5] = {Arg::Kind::Scalar, 0, go.iterations, 0};
+  call_args[6] = {Arg::Kind::Scalar, 0, go.parallel, 0};
+  call_args[7] = {Arg::Kind::Scalar, 0, go.residual, 0};
   for (uint32_t peer = 0; peer < nranks; ++peer) {
-    call_args[3 + 2 * peer] = {Arg::Kind::Window, peer, target_offset, nranks * bytes};
-    call_args[4 + 2 * peer] = {Arg::Kind::PeerRank, peer, 0, 0};
+    call_args[8 + 2 * peer] = {Arg::Kind::Window, peer, target_offset, nranks * bytes};
+    call_args[9 + 2 * peer] = {Arg::Kind::PeerRank, peer, 0, 0};
   }
   // Both local and peer payload copies belong to CCU. AIV only submits metadata.
   // The runtime registers done before publishing parameters and trigger.

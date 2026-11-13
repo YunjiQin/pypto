@@ -103,7 +103,7 @@
 #include "pypto/ir/transforms/utils/tensor_view_semantics.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/type.h"
-#include "src/ir/transforms/lower_l2/ccu_broadcast.h"
+#include "src/ir/transforms/lower_l2/ccu_collectives.h"
 
 namespace pypto {
 namespace ir {

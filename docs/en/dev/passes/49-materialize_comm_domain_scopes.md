@@ -25,8 +25,8 @@ the IR types so downstream codegen has O(1) access.
 communication domain. Before materializing domains, this pass scans every function
 in the Program once, including Call and Submit nodes. If any function uses
 `pld.tensor.indexed_all_to_all_v` or its lowered builtin, every materialized domain
-receives `urma`. Explicit CCU broadcast/allgather or their lowered builtin
-template identities add `ccu`. With no engine requirements the list is empty.
+receives `urma`. Lowered CCU broadcast/allgather builtin template identities
+add `ccu`. With no engine requirements the list is empty.
 
 This deliberately conservative policy includes unused functions and unrelated
 domains. Precise per-domain matching is deferred. Distributed codegen only emits
@@ -213,7 +213,10 @@ absent definitions are outside this contract. Legacy informational
 
 ### CCU engine requirements
 
-Explicit `engine="ccu"` broadcast/allgather Call or Submit operations and their
-lowered builtin template identities contribute `ccu` to every domain, including
-uses in uncalled functions. Reruns merge it with existing engines such as `urma`
+`LowerL2TensorCollectives` runs before this pass, so CHIP CCU requirements are
+collected only from Call/Submit references to lowered broadcast/allgather builtin
+template identities. These contribute `ccu` to every domain, including uses in
+uncalled functions. Raw HOST collective analysis remains necessary because
+`LowerHostTensorCollectives` runs after this pass. Reruns merge CCU requirements
+with existing engines such as `urma`
 without replacing window bindings. See [CCU lowering](43-lower_l2_tensor_collectives.md#ccu-allgather).

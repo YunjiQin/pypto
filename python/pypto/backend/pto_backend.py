@@ -41,7 +41,7 @@ if sys.version_info >= (3, 11):
     from importlib.resources.abc import Traversable
 else:  # pragma: no cover - exercised only on Python < 3.11
     from importlib.abc import Traversable
-from typing import Any, TypedDict
+from typing import Any
 
 from pypto._external_source import EXTERNAL_INCLUDE_DIRS_ATTR, decode_external_include_dirs
 from pypto._function_attrs import (
@@ -1526,71 +1526,17 @@ def _builtin_template_of(func: _ir_core.Function) -> tuple[str, dict[str, str]] 
 _CCU_ALLGATHER_TEMPLATE = ":pypto.runtime.builtins.ccu.allgather"
 
 
-_CcuKey = tuple[str, tuple[tuple[str, str], ...]]
-
-
-class _CcuEntry(TypedDict):
-    ccu_id: int
-    template: str
-    variables: dict[str, str]
-    request_count: int
-    wrappers: list[str]
-    source: str
-    entry_symbol: str
-    parameter_size: int
-    parameter_alignment: int
-
-
-def _ccu_entries(program: _ir_core.Program) -> list[_CcuEntry]:
-    """Assign callable-local IDs by implementation identity, independently of shape.
-
-    A native mission processes exactly the number of straight-line invocations
-    in this CHIP program. The L2 pass rejects conditional/repeated/nested calls.
-    Multi-chip extraction runs this independently for each callable.
-    """
-    specs: dict[str, _CcuKey] = {}
-    for func in program.functions.values():
-        spec = _builtin_template_of(func)
-        if spec is not None and spec[0] == _CCU_ALLGATHER_TEMPLATE:
-            specs[func.name] = (spec[0], tuple(sorted(spec[1].items())))
-    counts: dict[_CcuKey, int] = {}
-    wrappers: dict[_CcuKey, list[str]] = {}
-    for func in program.functions.values():
-        collector = _CallCollector()
-        collector.visit_stmt(func.body)
-        for name in collector.callee_names:
-            if name in specs:
-                key = specs[name]
-                counts[key] = counts.get(key, 0) + 1
-                wrappers.setdefault(key, []).append(name)
-    return [
-        {
-            "ccu_id": index,
-            "template": key[0],
-            "variables": dict(key[1]),
-            "request_count": counts[key],
-            "wrappers": sorted(set(wrappers[key])),
-            "source": f"ccu/module_{index}.cpp",
-            "entry_symbol": f"pypto_ccu_allgather_{index}",
-            "parameter_size": 8 * (4 + 3 * int(dict(key[1])["nranks_cpp"])),
-            "parameter_alignment": 64,
-        }
-        for index, key in enumerate(sorted(counts))
-    ]
-
-
-def _ccu_config(entries: list[_CcuEntry]) -> str:
+def _ccu_config(entries: list[_codegen_core.CcuModule]) -> str:
     """Source-only handoff; module order is the runtime's callable-local ID order."""
     if not entries:
         return ""
     modules = [
         {
-            "ccu_id": entry["ccu_id"],
-            "source": entry["source"],
-            "entry_symbol": entry["entry_symbol"],
-            "parameter_size": entry["parameter_size"],
-            "parameter_alignment": entry["parameter_alignment"],
-            "request_count": entry["request_count"],
+            "ccu_id": entry.ccu_id,
+            "source": entry.source,
+            "entry_symbol": entry.entry_symbol,
+            "parameter_size": entry.parameter_size,
+            "parameter_alignment": entry.parameter_alignment,
         }
         for entry in entries
     ]
@@ -1606,20 +1552,20 @@ def _ccu_config(entries: list[_CcuEntry]) -> str:
     )
 
 
-def _render_builtin_kernel_sources(program: _ir_core.Program) -> dict[str, str]:
+def _render_builtin_kernel_sources(
+    program: _ir_core.Program, entries: list[_codegen_core.CcuModule]
+) -> dict[str, str]:
     """Render every builtin-template kernel in *program* into artifact sources."""
     rendered: dict[str, str] = {}
-    entries = _ccu_entries(program)
-    wrapper_entries = {name: entry for entry in entries for name in entry["wrappers"]}
+    wrapper_entries = {name: entry for entry in entries for name in entry.wrappers}
+    if entries:
+        schedule = _resolve_builtin_template_dir(_CCU_ALLGATHER_TEMPLATE) / "templates" / "schedule.hpp.in"
+        rendered["ccu/allgather_schedule.hpp"] = _render_builtin_template(schedule, {})
     for entry in entries:
-        template = _resolve_builtin_template_dir(entry["template"]) / "templates" / "module.cpp.in"
-        rendered[entry["source"]] = _render_builtin_template(
+        template = _resolve_builtin_template_dir(entry.template_dir) / "templates" / "module.cpp.in"
+        rendered[entry.source] = _render_builtin_template(
             template,
-            {
-                **entry["variables"],
-                "request_count": str(entry["request_count"]),
-                "entry_symbol": entry["entry_symbol"],
-            },
+            {**entry.variables, "entry_symbol": entry.entry_symbol},
         )
     for func in program.functions.values():
         spec = _builtin_template_of(func)
@@ -1634,7 +1580,7 @@ def _render_builtin_kernel_sources(program: _ir_core.Program) -> dict[str, str]:
         if template_dir == _CCU_ALLGATHER_TEMPLATE:
             if func.name not in wrapper_entries:
                 continue  # Unreferenced definitions must not create an untriggered mission.
-            variables = {**variables, "ccu_id": str(wrapper_entries[func.name]["ccu_id"])}
+            variables = {**variables, "ccu_id": str(wrapper_entries[func.name].ccu_id)}
         templates_dir = _resolve_builtin_template_dir(template_dir) / "templates"
         kernel_template = templates_dir / "kernel.cpp.in"
         if not kernel_template.is_file():
@@ -2474,8 +2420,6 @@ def _generate_single_chip(
     def _skips_pto_codegen(func: _ir_core.Function) -> bool:
         return _external_source_of(func) is not None or _builtin_template_of(func) is not None
 
-    result_files.update(_render_builtin_kernel_sources(transformed_program))
-
     emitted_incore_funcs = [
         func for members in groups.values() for func in members if not _skips_pto_codegen(func)
     ] + [func for func in ungrouped if not _skips_pto_codegen(func)]
@@ -2591,6 +2535,7 @@ def _generate_single_chip(
     )
 
     # Orchestration + config
+    ccu_modules: list[_codegen_core.CcuModule] = []
     if orch_func is not None:
         try:
             if not skip_ptoas and any(
@@ -2603,6 +2548,7 @@ def _generate_single_chip(
                 )
             with _profiling_stage(prof, "orchestration_codegen"):
                 orch_result = _codegen_core.generate_orchestration(transformed_program, orch_func)
+            ccu_modules = orch_result.ccu_modules
             result_files[f"orchestration/{orch_func.name}.cpp"] = (
                 f"// Orchestration Function: {orch_func.name}\n"
                 f"// Generated by PyPTO IR Compiler\n\n"
@@ -2637,10 +2583,13 @@ def _generate_single_chip(
                         if unit.helpers
                     },
                 )
-                result_files["kernel_config.py"] += _ccu_config(_ccu_entries(transformed_program))
+                result_files["kernel_config.py"] += _ccu_config(ccu_modules)
         except Exception as e:
             logger.error("Failed to generate orchestration '%s': %s", orch_func.name, e)
             errors.append((orch_func.name, e))
+    # Rendering consumes codegen metadata without changing its identities.
+    # Keep template diagnostics outside the orchestration error wrapper.
+    result_files.update(_render_builtin_kernel_sources(transformed_program, ccu_modules))
 
     if errors:
         report = _format_error_report(errors, output_dir)

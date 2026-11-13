@@ -39,7 +39,7 @@
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/structural_comparison.h"
-#include "pypto/ir/transforms/utils/ccu_broadcast_utils.h"
+#include "pypto/ir/transforms/utils/ccu_collective_utils.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
@@ -898,12 +898,12 @@ Pass MaterializeCommDomainScopes() {
       bool uses_ccu = false;
       bool uses_urma = false;
       ProgramPtr program_;
-      void RecordCcu(const OpPtr& op, const std::string& engine) {
+      // CHIP collectives have already been lowered by LowerL2TensorCollectives.
+      // HOST raw collectives are handled separately by the domain analyzer.
+      void RecordCcu(const OpPtr& op) {
         if (auto gv = As<GlobalVar>(op)) {
           auto func = program_->GetFunction(gv->name_);
           uses_ccu |= IsCcuAllGatherBuiltin(func) || IsCcuBroadcastBuiltin(func);
-        } else if (IsOp(op, "pld.tensor.allgather") || IsOp(op, "pld.tensor.broadcast")) {
-          uses_ccu |= engine == "ccu";
         }
       }
       void Record(const OpPtr& op) {
@@ -916,12 +916,12 @@ Pass MaterializeCommDomainScopes() {
       }
       void VisitExpr_(const CallPtr& op) override {
         Record(op->op_);
-        RecordCcu(op->op_, op->GetKwarg<std::string>("engine", "default"));
+        RecordCcu(op->op_);
         IRVisitor::VisitExpr_(op);
       }
       void VisitExpr_(const SubmitPtr& op) override {
         Record(op->op_);
-        RecordCcu(op->op_, op->GetKwarg<std::string>("engine", "default"));
+        RecordCcu(op->op_);
         IRVisitor::VisitExpr_(op);
       }
     } collector(program);

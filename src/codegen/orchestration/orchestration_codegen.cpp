@@ -12,6 +12,7 @@
 #include "pypto/codegen/orchestration/orchestration_codegen.h"
 
 #include <cctype>
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -20,6 +21,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <system_error>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -40,6 +42,7 @@
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/utils/auto_name_utils.h"
+#include "pypto/ir/transforms/utils/ccu_collective_utils.h"
 #include "pypto/ir/transforms/utils/var_collectors.h"
 #include "pypto/ir/type.h"
 #include "src/codegen/orchestration/orchestration_stmt_codegen.h"
@@ -72,6 +75,56 @@ CoreType InferFunctionCoreType(const FunctionPtr& func) {
 }
 
 namespace {
+
+// Reuse the registrations produced while emitting Call/Submit dispatches. This
+// keeps native missions scoped to the actual callable and avoids a second IR
+// scan that could register kernels reachable only from unused functions.
+std::vector<CcuModule> CollectCcuModules(const ProgramPtr& program,
+                                         const std::vector<KernelRegistration>& registrations) {
+  using Identity = std::pair<std::string, std::map<std::string, std::string>>;
+  std::map<Identity, std::set<std::string>> wrappers;
+  std::set<std::string> seen;
+  for (const auto& registration : registrations) {
+    if (!seen.insert(registration.code_name).second) continue;
+    auto func = program->GetFunction(registration.code_name);
+    if (!IsCcuAllGatherBuiltin(func)) continue;
+    std::map<std::string, std::string> variables;
+    std::istringstream substitutions(func->GetAttr<std::string>(kAttrBuiltinTemplateVars));
+    std::string item;
+    while (std::getline(substitutions, item, ',')) {
+      const auto equal = item.find('=');
+      INTERNAL_CHECK_SPAN(equal != std::string::npos && equal > 0 && equal + 1 < item.size(), func->span_)
+          << "Invalid CCU builtin specialization: " << item;
+      const bool inserted = variables.emplace(item.substr(0, equal), item.substr(equal + 1)).second;
+      INTERNAL_CHECK_SPAN(inserted, func->span_) << "Duplicate CCU specialization key: " << item;
+    }
+    wrappers[{kCcuAllGatherTemplate, std::move(variables)}].insert(func->name_);
+  }
+  std::vector<CcuModule> modules;
+  for (const auto& [identity, names] : wrappers) {
+    const auto& [template_dir, variables] = identity;
+    const auto ranks = variables.find("nranks_cpp");
+    INTERNAL_CHECK(ranks != variables.end()) << "Missing CCU allgather rank specialization";
+    int nranks = 0;
+    const auto& value = ranks->second;
+    const auto parsed = std::from_chars(value.data(), value.data() + value.size(), nranks);
+    INTERNAL_CHECK(parsed.ec == std::errc() && parsed.ptr == value.data() + value.size() && nranks >= 2 &&
+                   nranks <= 64)
+        << "Invalid lowered CCU allgather rank specialization: " << value;
+    const auto id = static_cast<int>(modules.size());
+    // Address/token expansion: nine fixed uint64 words, then one output
+    // address, token and physical rank per domain slot. Match the native ABI.
+    modules.push_back(CcuModule{id,
+                                template_dir,
+                                variables,
+                                {names.begin(), names.end()},
+                                "ccu/module_" + std::to_string(id) + ".cpp",
+                                "pypto_ccu_allgather_" + std::to_string(id),
+                                8 * (9 + 3 * nranks),
+                                64});
+  }
+  return modules;
+}
 
 const char* ParamDirectionToRuntimeName(ParamDirection dir) {
   switch (dir) {
@@ -636,7 +689,9 @@ OrchestrationResult GenerateOrchestration(const ir::ProgramPtr& program, const i
   oss << "}\n\n";
   oss << "}  // extern \"C\"\n";
 
-  return OrchestrationResult{oss.str(), std::move(registrations.entries), std::move(orchestration_signature)};
+  auto ccu_modules = CollectCcuModules(program, registrations.entries);
+  return OrchestrationResult{oss.str(), std::move(registrations.entries), std::move(ccu_modules),
+                             std::move(orchestration_signature)};
 }
 
 }  // namespace codegen

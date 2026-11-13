@@ -555,6 +555,14 @@ orch_code = files["orchestration/orch_func_name.cpp"]
 
 编排文件在生成的文件映射中命名为 `orchestration/<func_name>.cpp`。
 
+`OrchestrationResult.ccu_modules` 按顺序返回当前 callable 使用的 native CCU
+实现描述 `CcuModule`。Codegen 从已生成的 kernel registrations 构造描述，
+无关函数不会创建 mission。每项携带 callable 内的 ID、模板变量、AIV wrapper
+名称、native 源文件路径及入口符号，以及以字节为单位的参数区大小和对齐。
+Python 使用同一份描述渲染 wrapper/module 和序列化配置，不再重新收集 entry
+或分配 ID。ABI 及运行时接入边界见
+[CCU allgather 源码生成](../passes/43-lower_l2_tensor_collectives.md)。
+
 ## Manual Scope 与 TaskId 降级
 
 `with pl.manual_scope():` 区域被降级为 `SIMPLER_SCOPE(ScopeMode::MANUAL)`

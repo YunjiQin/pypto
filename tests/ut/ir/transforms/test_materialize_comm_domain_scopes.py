@@ -41,6 +41,7 @@ from pypto.ir import IRBuilder
 from pypto.ir.op.distributed import tensor_ops as dist_tensor_ops
 from pypto.language.parser.diagnostics import ParserTypeError
 from pypto.pypto_core import DataType, ir, passes
+from pypto.pypto_core.backend import BackendType
 
 _OP_PLD_TENSOR_ALLOC_WINDOW_BUFFER = ir.get_op("pld.tensor.alloc_window_buffer").name
 _OP_PLD_TENSOR_ALLREDUCE = ir.get_op("pld.tensor.allreduce").name
@@ -202,10 +203,11 @@ def _assert_rank2_signal_type(value: ir.Expr, world_size_name: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend950], indirect=True)
 @pytest.mark.parametrize("pre_materialized", [False, True])
 @pytest.mark.parametrize("uses_urma", [False, True])
 @pytest.mark.parametrize("uses_ccu", [False, True])
-def test_program_wide_engine_requirements(uses_urma, uses_ccu, pre_materialized):
+def test_program_wide_engine_requirements(ascend_backend, uses_urma, uses_ccu, pre_materialized):
     """Even an uncalled function contributes engines to every host domain."""
 
     @pl.program
@@ -255,6 +257,8 @@ def test_program_wide_engine_requirements(uses_urma, uses_ccu, pre_materialized)
     if uses_ccu:
         functions.append(_get_func(Before, "unused_ccu"))
     program = ir.Program(functions, "engine_scan", ir.Span.unknown())
+    # Match the pipeline: CHIP collectives become builtin calls before domain analysis.
+    program = passes.lower_l2_tensor_collectives()(program)
     after = passes.materialize_comm_domain_scopes()(program)
     scopes = _get_comm_domain_scopes(_get_func(after, "host_orch"))
     assert len(scopes) == 2

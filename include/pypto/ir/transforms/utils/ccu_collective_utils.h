@@ -9,8 +9,8 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#ifndef PYPTO_IR_TRANSFORMS_UTILS_CCU_BROADCAST_UTILS_H_
-#define PYPTO_IR_TRANSFORMS_UTILS_CCU_BROADCAST_UTILS_H_
+#ifndef PYPTO_IR_TRANSFORMS_UTILS_CCU_COLLECTIVE_UTILS_H_
+#define PYPTO_IR_TRANSFORMS_UTILS_CCU_COLLECTIVE_UTILS_H_
 
 #include <cstddef>
 #include <string>
@@ -38,4 +38,4 @@ inline bool IsCcuControlParameter(const FunctionPtr& func, size_t index) {
 }
 }  // namespace pypto::ir
 
-#endif  // PYPTO_IR_TRANSFORMS_UTILS_CCU_BROADCAST_UTILS_H_
+#endif  // PYPTO_IR_TRANSFORMS_UTILS_CCU_COLLECTIVE_UTILS_H_

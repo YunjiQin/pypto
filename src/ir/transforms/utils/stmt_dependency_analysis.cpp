@@ -27,7 +27,7 @@
 #include "pypto/ir/program.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/base/visitor.h"
-#include "pypto/ir/transforms/utils/ccu_broadcast_utils.h"
+#include "pypto/ir/transforms/utils/ccu_collective_utils.h"
 #include "pypto/ir/transforms/utils/var_collectors.h"
 #include "pypto/ir/verifier/property_verifier_registry.h"
 

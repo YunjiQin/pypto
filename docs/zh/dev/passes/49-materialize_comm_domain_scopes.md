@@ -23,7 +23,7 @@
 `CommDomainScopeStmt.engines` 记录通信域需要的异步工作区引擎 (async workspace engines)。
 物化通信域之前，此 Pass 扫描整个 Program 中每个函数的 Call 和 Submit。
 只要发现 `pld.tensor.indexed_all_to_all_v` 或其降低后的 builtin，所有物化通信域都设置
-`urma`；显式 CCU broadcast/allgather 或其降低后的 builtin 模板身份增加 `ccu`。
+`urma`；降低后的 CCU broadcast/allgather builtin 模板身份增加 `ccu`。
 没有引擎需求时列表为空。
 
 当前采用保守策略，包括未调用函数和无关通信域。精确匹配留待后续实现。
@@ -177,7 +177,9 @@ pass 运行之后：
 
 ### CCU 引擎需求
 
-显式 `engine="ccu"` broadcast/allgather 的 Call/Submit，以及 lowering 后的
-builtin 模板身份，都会为所有域贡献 `ccu`，包括未调用函数中的使用。
+`LowerL2TensorCollectives` 先于本 pass 执行，因此 CHIP CCU 需求仅通过
+Call/Submit 引用的 broadcast/allgather builtin 模板身份收集，为所有域贡献
+`ccu`，包括未调用函数中的使用。原始 HOST collective 的分析仍需保留，
+因为 `LowerHostTensorCollectives` 位于本 pass 之后。
 重复执行合并已有 `urma` 等引擎并保留窗口绑定。
 详见 [CCU lowering](43-lower_l2_tensor_collectives.md#ccu-allgather)。
