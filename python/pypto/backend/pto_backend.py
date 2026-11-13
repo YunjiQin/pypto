@@ -1527,7 +1527,7 @@ _CCU_ALLGATHER_TEMPLATE = ":pypto.runtime.builtins.ccu.allgather"
 
 
 def _ccu_config(entries: list[_codegen_core.CcuModule]) -> str:
-    """Source-only handoff; module order is the runtime's callable-local ID order."""
+    """Native module handoff; module order is the runtime's callable-local ID order."""
     if not entries:
         return ""
     modules = [
@@ -1541,14 +1541,14 @@ def _ccu_config(entries: list[_codegen_core.CcuModule]) -> str:
         for entry in entries
     ]
     return (
-        "\n# Native CCU sources; binary build/ChipCallable packaging is a separate stage.\n"
+        "\n# Native CCU sources compiled and packaged by the runtime builder.\n"
         f"CCU_MODULES = {modules!r}\n"
         "CCU_BUILD_IDENTITY = {\n"
         "    'algorithm': 'sha256',\n"
         "    'pypto_ccu_sdk_identity': 'hcomm/ccu/ccu_res.h',\n"
         "    'pypto_ccu_isa_identity': 'pto/pto-inst.hpp',\n"
         "}\n"
-        "CCU_RUNTIME_SUPPORTED = False\n"
+        "CCU_RUNTIME_SUPPORTED = True\n"
     )
 
 

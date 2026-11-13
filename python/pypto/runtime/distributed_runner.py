@@ -660,6 +660,13 @@ def _register_callables(
     return sub_ids, chip_cids
 
 
+def _register_ccu_callables(w: Any, callables: dict[str, Any], handles: dict[str, Any]) -> None:
+    """Acquire native CCU resources after the full chip hierarchy is initialized."""
+    for name, callable_ in callables.items():
+        if getattr(callable_, "ccu_module_count", 0):
+            w.register_ccu_callable(handles[name])
+
+
 def _check_callback_arity(name: str, fn: Callable[..., Any]) -> None:
     """Validate that a user callback can be invoked as ``fn(args)``.
 
@@ -1715,6 +1722,7 @@ def _execute_distributed(  # pyright: ignore[reportUnusedFunction]
             # the prebuilt runtime-arena cache instead of paying the ~800ms cold
             # build inside the timed dispatch. No-op without a prebuilt arena.
             w.init(prewarm_config=call_config)
+            _register_ccu_callables(w, chip_callables, chip_cids)
             _dispatch(w, entry_fn, tensors, chip_cids, sub_ids, call_config, len(dc.device_ids))
         except BaseException:  # noqa: BLE001 - cleanup must also run for interruption
             if w is not None:
@@ -2108,6 +2116,8 @@ class DistributedWorker(Worker):
 
             claim_program_mode()
             self._w.init(prewarm_config=prewarm_cc)
+            for prog, chip_callables, _ in loaded:
+                _register_ccu_callables(self._w, chip_callables, self._states[prog]["chip_cids"])
 
             # ``Worker.init()`` eagerly starts the chip/sub-worker hierarchy, so
             # the device-memory API is ready before the first dispatch without a

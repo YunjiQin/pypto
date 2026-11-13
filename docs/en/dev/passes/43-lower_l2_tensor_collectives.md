@@ -346,8 +346,8 @@ Normal teardown must not synchronize this resident stream expecting natural
 completion. The pinned simpler #2986 ABI is compatible with the request layout,
 but its normal `DomainRun::stop()` only polls for natural termination and its
 abort path retains resources. That runtime lifecycle needs the corresponding
-normal-shutdown adaptation; this source-only change does not implement or claim
-that integration. CHIP control-flow restrictions remain separately enforced for
+normal-shutdown adaptation. The binary build and registration integration below
+does not yet implement that shutdown adaptation. CHIP control-flow restrictions remain separately enforced for
 cross-rank ordering and domain validation.
 
 The HBM data path ports `CcuAllGatherOp`, `CcuLoopGroupExecutor` and GoSize
@@ -383,12 +383,18 @@ IDs, template variables and native ABI metadata. Python only renders templates
 and serializes this result into `ccu/module_<id>.cpp`, `kernels/aiv/*.cpp` and
 configuration; it does not rescan IR to discover or number CCU entries. `kernel_config.py` includes ordered `CCU_MODULES`
 (source, entry, ID, parameter layout) and `CCU_BUILD_IDENTITY`.
-Each module exports `simpler_ccu_module_manifest` with one kernel record. A future
-binary builder must link `pypto_ccu_sdk_identity` and `pypto_ccu_isa_identity`
-(32-byte SHA256 digests of the exact SDK/ISA headers named in that metadata),
-preserve module order in the callable package, and perform explicit runtime CCU
-registration. `CCU_RUNTIME_SUPPORTED = False` marks this source-only handoff.
-This change does not build modules, package ChipCallables, or validate hardware.
+Each module exports `simpler_ccu_module_manifest` with one kernel record. The
+PyPTO binary builder compiles a Host shared library using simpler's Host compiler,
+SDK discovery and build identities, following simpler's native-domain example.
+It links `pypto_ccu_sdk_identity` and `pypto_ccu_isa_identity`, preserves module
+order in `ChipCallable.ccu_modules`, and stores those bytes in prebuilt artifacts.
+After Worker initialization, distributed execution explicitly calls
+`register_ccu_callable` for each native CCU callable before dispatch.
+`CCU_RUNTIME_SUPPORTED = True` marks this build/registration path. The initial
+integration targets A5; the two-rank BF16 system test exercises two requests per
+execution and repeated executions with changed inputs. Its earlier hardware pass
+used the finite-mission algorithm; the resident-mission revision still requires
+the shutdown adaptation described above.
 
 `LowerL2TensorCollectives` implements CCU allgather validation and ordering in
 `lower_l2/ccu_collectives.cpp`. It runs before `MaterializeCommDomainScopes`, which

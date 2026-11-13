@@ -742,7 +742,7 @@ ready barrier absorbs cross-rank launch skew.
 
 ### `pld.tensor.allgather`
 
-`engine="ccu"` supports Ascend950 CHIP BF16 allgather through source generation:
+`engine="ccu"` supports Ascend950 CHIP BF16 allgather through native-module compilation and runtime registration:
 window input `[1, N]`, target `[NR, N]`, signal INT32 `[NR, 1]`, full packed ND
 static positive shapes, 2–64 ranks and straight-line calls. All windows must
 belong to one domain; input and target must be distinct. Defaults retain the

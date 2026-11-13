@@ -144,10 +144,18 @@ def package_generated_sources(directory: Path, kind: BuildKind) -> None:
         orchestration = dict(config.ORCHESTRATION)
         orchestration["source"] = _local_source(chip, orchestration["source"])
         orchestration["signature"] = _encode_signature(orchestration.get("signature", []))
+        ccu_modules = [dict(module) for module in getattr(config, "CCU_MODULES", [])]
+        for module in ccu_modules:
+            module["source"] = _local_source(chip, str(chip / module["source"]))
         runtime_config = getattr(config, "RUNTIME_CONFIG", {})
         # Reject non-serializable build inputs instead of persisting repr(object).
         metadata = encode_manifest(
-            {"kernels": kernels, "orchestration": orchestration, "runtime": runtime_config}
+            {
+                "kernels": kernels,
+                "orchestration": orchestration,
+                "runtime": runtime_config,
+                "ccu_modules": ccu_modules,
+            }
         )
         (chip / "kernel_config.json").write_bytes(metadata)
         text = (
@@ -157,6 +165,7 @@ def package_generated_sources(directory: Path, kind: BuildKind) -> None:
             f"KERNELS = {kernels!r}\n"
             f"ORCHESTRATION = {orchestration!r}\n"
             f"RUNTIME_CONFIG = {runtime_config!r}\n"
+            f"CCU_MODULES = {ccu_modules!r}\n"
             "for _entry in [*KERNELS, ORCHESTRATION]:\n"
             "    _entry['source'] = str(_ROOT_DIR / _entry['source'])\n"
             "    _entry['signature'] = [getattr(_D, s) for s in _entry['signature']]\n"
@@ -175,6 +184,8 @@ def validate_generated_sources(directory: Path, kind: BuildKind) -> None:
     directory = directory.resolve()
     for chip in chip_directories(directory, kind).values():
         config = read_kernel_config(chip / "kernel_config.py")
+        for module in getattr(config, "CCU_MODULES", []):
+            _local_source(chip, str(chip / module["source"]))
         for entry in [*config.KERNELS, config.ORCHESTRATION]:
             _local_source(chip, entry["source"])
             for helper in _vpto.source_paths(entry.get("vpto_sources")):

@@ -871,7 +871,7 @@ def test_ccu_allgather_full_codegen(tmp_path, host, runtime, ranks):
     assert f"'parameter_size': {8 * (9 + 3 * ranks)}" in config
     assert "'parameter_alignment': 64" in config
     assert "request_count" not in config
-    assert "CCU_RUNTIME_SUPPORTED = False" in config
+    assert "CCU_RUNTIME_SUPPORTED = True" in config
     root = config_paths[0].parent
     wrapper = _sole_file(root / "kernels" / "aiv", "*allgather*.cpp").read_text()
     assert "get_async_ctx(args)" in wrapper

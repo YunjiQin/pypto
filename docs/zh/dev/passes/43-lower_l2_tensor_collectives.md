@@ -295,7 +295,7 @@ Mission 生命周期由 simpler 管理。整个 L2 task 完成并返回 Host 后
 正常回收不能通过同步此常驻 stream 来等待自然退出。固定版本 simpler #2986
 的 ABI 可承载请求布局，但其正常 `DomainRun::stop()` 只查询自然结束状态，
 abort 通路则保留资源，因此 runtime 生命周期还需对应的正常关闭适配。
-本次源码生成改动不实现、也不宣称已完成该 runtime 集成。CHIP 控制流限制仍
+下述二进制构建和注册集成尚未实现该正常关闭适配。CHIP 控制流限制仍
 单独执行，用于保证跨 rank 顺序和域验证。
 
 HBM 数据通路移植 [PTO-ISA CCU 指南](https://gitcode.com/cyz00/pto-isa/blob/ccu_test/docs/zcy/ccu_collective_usage_zh.md)
@@ -324,11 +324,14 @@ C++ orchestration codegen 从当前 callable 的 kernel registrations 收集 CCU
 wrapper ID、模板参数和 native ABI 元数据。Python 仅消费该结果渲染模板和序列化配置，
 输出 `kernels/aiv/*.cpp` 和 `ccu/module_<id>.cpp`，不再遍历 IR 收集或编号 CCU entry。`kernel_config.py` 中
 `CCU_MODULES` 按 ID 顺序记录源码、入口及参数布局；每个模块通过
-`simpler_ccu_module_manifest` 导出一个 kernel record。后续二进制构建需根据
-`CCU_BUILD_IDENTITY` 指定的 SDK/ISA 头文件生成 SHA256，链接 32 字节的
-`pypto_ccu_sdk_identity` 和 `pypto_ccu_isa_identity`，保留模块顺序并显式注册 CCU。
-`CCU_RUNTIME_SUPPORTED = False` 标明仅交付源码；本次不构建模块、不装配
-ChipCallable、不宣称硬件验证。
+`simpler_ccu_module_manifest` 导出一个 kernel record。PyPTO 二进制构建器参考
+simpler 的 native-domain 示例，使用 simpler 的 Host 编译器、SDK 发现和构建身份
+编译 Host 共享库，链接 `pypto_ccu_sdk_identity` 与 `pypto_ccu_isa_identity`。
+模块按原顺序装入 `ChipCallable.ccu_modules`，并保存在 prebuilt 产物中。
+Worker 初始化后，分布式执行在 dispatch 前为每个 native CCU callable 显式调用
+`register_ccu_callable`。`CCU_RUNTIME_SUPPORTED = True` 标明已接入构建和注册路径。
+初始集成面向 A5；双 rank BF16 系统测试执行每轮两个请求及输入变化后的重复调用。
+此前实机通过的是有限 mission 算法；当前常驻 mission 版本仍需完成上述正常关闭适配。
 
 `LowerL2TensorCollectives` 在 `lower_l2/ccu_collectives.cpp` 中实现 CCU allgather
 校验与排序逻辑，并先于 `MaterializeCommDomainScopes` 执行。后者仅从 lowering 后的
