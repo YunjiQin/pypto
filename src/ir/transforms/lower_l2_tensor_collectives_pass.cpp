@@ -391,9 +391,10 @@ class LowerL2TensorCollectivesMutator : public IRMutator {
       : kernels_(kernels), body_(std::move(body)), program_(std::move(program)) {}
 
   ExprPtr VisitExpr_(const CallPtr& op) override {
-    if (IsCcuBroadcast(op)) {
-      CheckOperandIsRowMajor(op->args_[0], op->op_->name_, "target", op->span_);
-      CheckOperandIsRowMajor(op->args_[1], op->op_->name_, "signal", op->span_);
+    if (IsCcuCollective(op)) {
+      for (const auto& arg : op->args_) {
+        CheckOperandIsRowMajor(arg, op->op_->name_, "operand", op->span_);
+      }
     }
     return IRMutator::VisitExpr_(op);
   }
@@ -702,6 +703,7 @@ class LowerL2TensorCollectivesMutator : public IRMutator {
       return SliceKeepsRowMajor(call) ? std::optional<ExprPtr>(call->args_[0]) : std::nullopt;
     }
     if (IsCcuBroadcast(call)) return call->args_[0];
+    if (IsCcuAllGather(call)) return call->args_[1];
     if (IsManagedCollective(call)) return call->args_[1];  // returns its target
     return ReturnedArgument(call->op_, call->args_, result_index);
   }
@@ -820,7 +822,7 @@ ProgramPtr TransformProgram(const ProgramPtr& program) {
     if (new_func.get() != func.get()) modified = true;
   }
   if (!modified) {
-    auto result = LowerCcuBroadcast(program);
+    auto result = LowerCcuCollectives(program);
     CheckNoResidualCollective(result);
     return result;
   }
@@ -833,8 +835,8 @@ ProgramPtr TransformProgram(const ProgramPtr& program) {
     new_functions[gvar] = kernel;
   }
 
-  auto result =
-      LowerCcuBroadcast(std::make_shared<Program>(std::move(new_functions), program->name_, program->span_));
+  auto result = LowerCcuCollectives(
+      std::make_shared<Program>(std::move(new_functions), program->name_, program->span_));
   CheckNoResidualCollective(result);
   return result;
 }

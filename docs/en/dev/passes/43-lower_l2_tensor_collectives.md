@@ -308,10 +308,96 @@ giving `target, signal, order, ctx_target, ctx_signal`. The local order tensor
 needs no context. Same-domain target/signal and matching runtime rank count remain
 caller preconditions. No algorithm scratch is added. Source rendering explicitly
 rejects this template identity pending PR2; entry deduplication and IDs must use
-the same CCU function key as token sharing. Engine collection, AIV/CCU sources and
-runtime integration are not delivered by this IR milestone.
+the same CCU function key as token sharing. Engine collection now recognizes both
+CCU collectives; broadcast source rendering and runtime integration remain unavailable.
 
 The CCU builtin's signal/order are reusable control handles for
 `InOutUseDiscipline`; they retain `InOut` task effects but do not require SSA
 return rebinds. Target keeps normal rebind checking. No CHIP parameter exemption
 is needed because the token is allocated inside the CHIP body.
+
+## CCU allgather
+
+`pld.tensor.allgather(input, target, signal, engine="ccu")` supports Ascend950
+CHIP orchestration, BF16 input `[1, N]`, target `[NR, N]`, INT32 signal `[NR, 1]`,
+static positive full contiguous ND views, and 2–64 ranks. All three arguments
+must be windows in the same domain; input and target must be distinct buffers.
+The pass proves row-major provenance through supported aliases, reuses the
+Host binding checks against each callable's rank count, and rejects HOST/InCore, dynamic shapes, loops,
+conditional calls and nested CHIP dispatch. Cross-rank matching call order and
+same-domain membership remain caller preconditions. Target views must have the
+same window-relative offset on every rank. The 64-rank upper bound comes from
+simpler's registration ABI; it is not an AllGather algorithm limit. Host dispatch
+accepts constant device IDs or one static unit-step rank loop of up to 64 devices.
+
+The AIV builtin uses `:pypto.runtime.builtins.ccu.allgather`. Its ABI is
+`input, target, signal, order, ctx_target`, with directions
+`In, InOut, InOut, InOut, Scalar` and `return target`. Input/signal use canonical
+plain tensor parameter types so context materialization appends **exactly one**
+context, as required by simpler's CCU task admission. The public operands remain
+DistributedTensors. Order is the same local UINT8 scheduling token mechanism as
+broadcast; one token serializes all requests to an entry, including different
+shapes; different rank counts specialize different entries. Signal/order are control handles exempt from return rebind discipline.
+A single AIV block submits metadata as typed `CcuCallArg` values using
+`get_async_ctx(args)` from the original argument base. CCU performs both the
+local and remote payload copies, preserving BF16 bits.
+
+### Native source contract
+
+The emitted module follows [simpler #2986](https://github.com/hw-native-sys/simpler/pull/2986),
+verified at `a6566e3197302b2ac3c7a015adac6861c9d41d5e`. Each request has `4 + 3 * NR` expanded
+64-bit words (`8 * (4 + 3 * NR)` bytes, parameter alignment 64):
+
+| Words | Meaning |
+| ----- | ------- |
+| 0–1 | Local input W address and token |
+| 2 | BF16 chunk byte length |
+| 3 | Output slot byte offset: source domain rank × chunk byte length |
+| 4 + 3r, 5 + 3r | Domain destination r's target base W address and token |
+| 6 + 3r | Destination r's physical L2 rank resolved from the domain's W table |
+
+The AIV computes byte offsets from tensor start offsets and local `windowsIn`;
+the runtime resolves CCU addresses/tokens from W, rather than treating imported
+AIV mappings as CCU addresses. Domain rank controls output row order; physical
+L2 rank selects the registration channel, including reordered subsets.
+The native definition waits for trigger, performs a readiness handshake, then
+issues remote `Write` to every peer and `LocalCopy` to self. A batch has up to
+16 destinations, one transfer-event bit each; it drains before reusing the
+16-bit event for another batch. All batches and peer completion finish before
+recording done. Both readiness and completion publish to all peers before
+waiting on any peer, avoiding dependencies on peer traversal order.
+Readiness and completion use distinct notification bits. A finite CCU loop
+processes the statically counted requests, publishing done for the final request
+before exiting normally. No extra exit task, scratch window, or signal protocol
+is required. The existing runtime retires async done before releasing task deps.
+
+The HBM data path follows `CcuAllGatherOp` in the [PTO-ISA CCU guide](https://gitcode.com/cyz00/pto-isa/blob/ccu_test/docs/zcy/ccu_collective_usage_zh.md)
+at commit `6a60d0d3525aeecd76b0138018cc39fabf708794`. AIV computes the slot
+multiplication because the A5 CCU translator lacks it; CCU adds the slot to each
+output base exactly once. The implementation retains simpler's ready/trigger/done
+contract and has no dependency on the reference branch's private headers. It
+does not adopt `CcuFusionSession`, its descriptor-table lifecycle, or the
+LoopGroup/MS performance paths. The reference LoopGroup scheduler's 32 KiB
+chunk restriction therefore does not constrain this source-generation contract.
+
+Codegen deduplicates entries by template identity and specialization, assigns
+IDs in sorted order per extracted CHIP callable, and renders `ccu/module_<id>.cpp`
+alongside `kernels/aiv/*.cpp`. `kernel_config.py` includes ordered `CCU_MODULES`
+(source, entry, ID, parameter layout, request count) and `CCU_BUILD_IDENTITY`.
+Each module exports `simpler_ccu_module_manifest` with one kernel record. A future
+binary builder must link `pypto_ccu_sdk_identity` and `pypto_ccu_isa_identity`
+(32-byte SHA256 digests of the exact SDK/ISA headers named in that metadata),
+preserve module order in the callable package, and perform explicit runtime CCU
+registration. `CCU_RUNTIME_SUPPORTED = False` marks this source-only handoff.
+This change does not build modules, package ChipCallables, or validate hardware.
+Broadcast retains its explicit unavailable-source diagnostic.
+
+`MaterializeCommDomainScopes` collects raw CCU Call/Submit operations and lowered
+builtin identities across the whole program, including unused functions. It
+merges `ccu` with existing requirements such as `urma` and preserves window
+bindings on reruns. Both single-CHIP and Host→CHIP source output have CPU tests.
+
+The source-generation boundary also supports multiple standalone CHIP entries.
+The existing public `ir.compile` multi-entry execution-metadata wrapper rejects
+`CommCtxType` after writing those sources; use the Host→CHIP path for public
+multi-callable compilation until that wrapper supports hidden contexts.

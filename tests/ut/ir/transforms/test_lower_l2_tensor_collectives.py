@@ -186,6 +186,7 @@ def test_synthesized_kernel_returns_its_target_parameter():
     assert kernel is not None
     assert isinstance(kernel.body, ir.ReturnStmt)
     assert len(kernel.body.value) == 1
+    assert isinstance(kernel.body, ir.ReturnStmt)
     assert kernel.body.value[0] is kernel.params[1]
 
 
@@ -1491,6 +1492,111 @@ def test_ccu_order_isolated_between_host_domains_and_callables(ascend_backend):
     (a,) = [call for call in calls if call.op.name == "chip_a"]
     (b,) = [call for call in calls if call.op.name == "chip_b"]
     assert len(a.args) == len(b.args) == 2
+
+
+def _ccu_allgather_program(dtype="BF16", size="64", ranks=2, input_kind="pld.DistributedTensor", body=None):
+    body = body or "target = pld.tensor.allgather(data, target, signal, engine='ccu')"
+    dynamic = "n: pl.Scalar[pl.INDEX], " if size == "n" else ""
+    return pl.parse_program(f"""
+@pl.program
+class AllGather:
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def chip(self, {dynamic}
+             data: {input_kind}[[1, {size}], pl.{dtype}],
+             target: pl.InOut[pld.DistributedTensor[[{ranks}, {size}], pl.{dtype}]],
+             signal: pl.InOut[pld.DistributedTensor[[{ranks}, 1], pl.INT32]]
+    ) -> pld.DistributedTensor[[{ranks}, {size}], pl.{dtype}]:
+        {body}
+        return target
+""")
+
+
+@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend950], indirect=True)
+@pytest.mark.parametrize("ranks", [2, 3, 4, 8, 17, 64])
+def test_ccu_allgather_signature_alias_order_ctx(ascend_backend, ranks):
+    before = _ccu_allgather_program(
+        ranks=ranks,
+        body=(
+            "target = pld.tensor.allgather(data, target, signal, engine='ccu')\n"
+            "        target = pld.tensor.allgather(data, target, signal, engine='ccu')"
+        ),
+    )
+    ir.assert_structural_equal(before, pl.parse_program(ir.python_print(before)))
+    after = passes.lower_l2_tensor_collectives()(before)
+    ir.assert_structural_equal(after, ir.deserialize(ir.serialize(after)))
+    ir.assert_structural_equal(after, passes.lower_l2_tensor_collectives()(after))
+    kernels = [
+        f
+        for f in after.functions.values()
+        if f.attrs.get("builtin_template_dir") == ":pypto.runtime.builtins.ccu.allgather"
+    ]
+    assert len(kernels) == 1
+    kernel = kernels[0]
+    assert f"nranks_cpp={ranks}" in kernel.attrs["builtin_template_vars"]
+    assert kernel.param_directions == [ir.ParamDirection.In] + [ir.ParamDirection.InOut] * 3
+    assert isinstance(kernel.body, ir.ReturnStmt)
+    assert kernel.body.value[0] is kernel.params[1]
+    calls = [c for c in _collect_calls(_require_ccu_func(after, "chip").body) if c.op.name == kernel.name]
+    assert len(calls) == 2
+    assert calls[0].args[3] is calls[1].args[3]
+    assert calls[0].attrs["core_num"].value == 1
+    after = passes.materialize_dist_tensor_ctx()(passes.derive_call_directions()(after))
+    kernel = _require_ccu_func(after, kernel.name)
+    assert len(kernel.params) == 5
+    assert isinstance(kernel.params[4].type, ir.CommCtxType)
+    calls = [c for c in _collect_calls(_require_ccu_func(after, "chip").body) if c.op.name == kernel.name]
+    assert all(len(c.args) == 5 for c in calls)
+    assert list(calls[0].arg_directions) == [ir.ArgDirection.Input] + [ir.ArgDirection.InOut] * 3 + [
+        ir.ArgDirection.Scalar
+    ]
+
+
+@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend950], indirect=True)
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        ({"dtype": "FP32"}, "only BF16"),
+        ({"input_kind": "pl.Tensor"}, "DistributedTensor window"),
+        ({"ranks": 1}, "2..64 ranks"),
+        ({"ranks": 65}, "2..64 ranks"),
+        ({"size": "0"}, "static positive"),
+        ({"size": "n"}, "static positive"),
+        (
+            {
+                "body": "for i in pl.range(2):\n"
+                "            target = pld.tensor.allgather(data, target, signal, engine='ccu')"
+            },
+            "straight-line",
+        ),
+    ],
+)
+def test_ccu_allgather_capability_diagnostics(ascend_backend, options, message):
+    with pytest.raises(ValueError, match=message):
+        passes.lower_l2_tensor_collectives()(_ccu_allgather_program(**options))
+
+
+@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend910], indirect=True)
+def test_ccu_allgather_unsupported_backend(ascend_backend):
+    with pytest.raises(ValueError, match="unsupported by this backend"):
+        passes.lower_l2_tensor_collectives()(_ccu_allgather_program())
+
+
+@pytest.mark.parametrize("location", ["InCore", "HOST"])
+def test_ccu_allgather_rejects_other_rails(location):
+    source = ir.python_print(_ccu_allgather_program())
+    if location == "InCore":
+        source = source.replace("pl.FunctionType.Orchestration", "pl.FunctionType.InCore")
+        source = source.replace("pl.Level.CHIP", "pl.Level.CHIP_DIE").replace(
+            "pl.Role.Orchestrator", "pl.Role.SubWorker"
+        )
+        transform = passes.lower_composite_ops()
+    else:
+        source = source.replace("pl.Level.CHIP", "pl.Level.HOST").replace(
+            "pl.FunctionType.Orchestration", "pl.FunctionType.Opaque"
+        )
+        transform = passes.lower_host_tensor_collectives()
+    with pytest.raises(ValueError, match="supported only in CHIP"):
+        transform(pl.parse_program(source))
 
 
 if __name__ == "__main__":

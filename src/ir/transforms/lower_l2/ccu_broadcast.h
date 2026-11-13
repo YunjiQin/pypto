@@ -15,10 +15,12 @@
 #include "pypto/ir/program.h"
 
 namespace pypto::ir {
+bool IsCcuAllGather(const CallPtr& call);
+bool IsCcuCollective(const CallPtr& call);
 bool IsCcuBroadcast(const CallPtr& call);
 
 // Part of LowerL2TensorCollectives, before direction/dependency derivation.
-ProgramPtr LowerCcuBroadcast(const ProgramPtr& program);
+ProgramPtr LowerCcuCollectives(const ProgramPtr& program);
 }  // namespace pypto::ir
 
 #endif  // SRC_IR_TRANSFORMS_LOWER_L2_CCU_BROADCAST_H_

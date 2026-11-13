@@ -39,7 +39,15 @@ bool IsCcuBroadcast(const CallPtr& call) {
   return IsOp(call, "pld.tensor.broadcast") && call->GetKwarg<std::string>("engine", "default") == "ccu";
 }
 
+bool IsCcuAllGather(const CallPtr& call) {
+  return IsOp(call, "pld.tensor.allgather") && call->GetKwarg<std::string>("engine", "default") == "ccu";
+}
+bool IsCcuCollective(const CallPtr& call) { return IsCcuBroadcast(call) || IsCcuAllGather(call); }
+
 namespace {
+
+// SimplerCcuRegistrationBinding::channels has SIMPLER_CCU_MAX_RANKS entries.
+constexpr int64_t kMaxCcuRanks = 64;
 
 bool IsOrchAt(const FunctionPtr& func, Level level) {
   return (IsOrchestrationLike(func->func_type_) || func->role_ == Role::Orchestrator) &&
@@ -85,23 +93,30 @@ class CcuFinder : public IRVisitor {
  public:
   explicit CcuFinder(FunctionPtr func) : func_(std::move(func)) {}
   bool found = false;
+  std::set<int64_t> rank_counts;
 
  protected:
   void VisitExpr_(const CallPtr& call) override {
-    if (IsCcuBroadcast(call)) {
+    if (IsCcuCollective(call)) {
       CHECK_SPAN(IsOrchAt(func_, Level::CHIP), call->span_)
-          << "pld.tensor.broadcast engine='ccu' is supported only in CHIP orchestration, not HOST/InCore";
-      CHECK_SPAN(depth_ == 0, call->span_) << "CHIP CCU broadcast requires a straight-line sequence; loops "
+          << "CCU collective is supported only in CHIP orchestration, not HOST/InCore";
+      CHECK_SPAN(depth_ == 0, call->span_) << "CHIP CCU collective requires a straight-line sequence; loops "
                                               "and conditional calls are unsupported";
       found = true;
+      if (IsCcuBroadcast(call)) {
+        rank_counts.insert(2);
+      } else {
+        auto target = As<DistributedTensorType>(call->args_[1]->GetType());
+        if (auto ranks = As<ConstInt>(target->shape_[0])) rank_counts.insert(ranks->value_);
+      }
     }
     IRVisitor::VisitExpr_(call);
   }
   void VisitExpr_(const SubmitPtr& submit) override {
-    CHECK_SPAN(
-        !IsOp(submit, "pld.tensor.broadcast") || submit->GetKwarg<std::string>("engine", "default") != "ccu",
-        submit->span_)
-        << "CCU broadcast direct-op Submit is unsupported; submit a CHIP callable instead";
+    CHECK_SPAN(!(IsOp(submit, "pld.tensor.broadcast") || IsOp(submit, "pld.tensor.allgather")) ||
+                   submit->GetKwarg<std::string>("engine", "default") != "ccu",
+               submit->span_)
+        << "CCU collective direct-op Submit is unsupported; submit a CHIP callable instead";
     IRVisitor::VisitExpr_(submit);
   }
   void VisitStmt_(const ForStmtPtr& op) override { Nested(op); }
@@ -119,32 +134,33 @@ class CcuFinder : public IRVisitor {
   int depth_ = 0;
 };
 
-// Validation and specialization are deliberately an allowlist: two ranks,
-// FP32, static positive packed ND tensors with no partial valid region.
+// Both collectives require static positive packed ND views with no partial
+// valid region. Dtype and rank restrictions are checked by each lowering.
 std::string ValidateView(const DistributedTensorTypePtr& type, const Span& span) {
-  CHECK_SPAN(type && !type->shape_.empty(), span) << "CCU broadcast requires a nonempty static shape";
+  CHECK_SPAN(type && !type->shape_.empty(), span) << "CCU collective requires a nonempty static shape";
   std::string key;
   int64_t stride = 1;
   const auto& view = type->tensor_view_;
-  CHECK_SPAN(!view || view->layout == TensorLayout::ND, span) << "CCU broadcast requires contiguous ND views";
+  CHECK_SPAN(!view || view->layout == TensorLayout::ND, span)
+      << "CCU collective requires contiguous ND views";
   CHECK_SPAN(!view || view->stride.empty() || view->stride.size() == type->shape_.size(), span)
-      << "CCU broadcast requires full contiguous strides";
+      << "CCU collective requires full contiguous strides";
   CHECK_SPAN(!view || view->valid_shape.empty() || view->valid_shape.size() == type->shape_.size(), span)
-      << "CCU broadcast requires a full valid view";
+      << "CCU collective requires a full valid view";
   for (size_t i = type->shape_.size(); i-- > 0;) {
     auto extent = As<ConstInt>(type->shape_[i]);
-    CHECK_SPAN(extent && extent->value_ > 0, span) << "CCU broadcast requires static positive dimensions";
+    CHECK_SPAN(extent && extent->value_ > 0, span) << "CCU collective requires static positive dimensions";
     if (view && !view->stride.empty()) {
       auto actual = As<ConstInt>(view->stride[i]);
-      CHECK_SPAN(actual && actual->value_ == stride, span) << "CCU broadcast requires contiguous ND strides";
+      CHECK_SPAN(actual && actual->value_ == stride, span) << "CCU collective requires contiguous ND strides";
     }
     if (view && !view->valid_shape.empty()) {
       auto valid = As<ConstInt>(view->valid_shape[i]);
       CHECK_SPAN(valid && valid->value_ == extent->value_, span)
-          << "CCU broadcast requires a full valid view";
+          << "CCU collective requires a full valid view";
     }
     CHECK_SPAN(extent->value_ <= std::numeric_limits<int64_t>::max() / stride, span)
-        << "CCU broadcast element count exceeds INT64_MAX";
+        << "CCU collective element count exceeds INT64_MAX";
     stride *= extent->value_;
   }
   for (const auto& dim : type->shape_) key += "_" + std::to_string(As<ConstInt>(dim)->value_);
@@ -166,7 +182,8 @@ class CcuLowerer : public IRMutator {
  protected:
   ExprPtr VisitExpr_(const CallPtr& op) override {
     auto call = As<Call>(IRMutator::VisitExpr_(op));
-    if (!IsCcuBroadcast(call)) return call;
+    if (!IsCcuCollective(call)) return call;
+    if (IsCcuAllGather(call)) return LowerAllGather(call);
     auto target = As<DistributedTensorType>(call->args_[0]->GetType());
     auto signal = As<DistributedTensorType>(call->args_[1]->GetType());
     auto shape_key = ValidateView(target, call->span_);
@@ -186,14 +203,7 @@ class CcuLowerer : public IRMutator {
     // Root/dtype/rank specialization identifies the CCU function, while shape
     // only specializes the AIV wrapper's tensor signature and return alias.
     const auto entry = "dtype_cpp=float,nranks_cpp=2,root_cpp=" + std::to_string(root);
-    auto [token, inserted] = tokens_.try_emplace(std::string(kCcuBroadcastTemplate) + ":" + entry);
-    if (inserted) {
-      auto shape = std::make_shared<MakeTuple>(std::vector<ExprPtr>{Index(1, call->span_)}, call->span_);
-      auto alloc = OpRegistry::GetInstance().Create(
-          "tensor.create", {shape}, {{"dtype", DataType::UINT8}, {"layout", TensorLayout::ND}}, call->span_);
-      token->second = std::make_shared<Var>(names_->Fresh("_ccu_order_"), alloc->GetType(), call->span_);
-      allocations_.push_back(std::make_shared<AssignStmt>(token->second, alloc, call->span_));
-    }
+    auto token = Order(std::string(kCcuBroadcastTemplate) + ":" + entry, call->span_);
     auto name = "__builtin_broadcast_ccu__fp32_p2_r" + std::to_string(root) + shape_key;
     if (!kernels_->count(name)) {
       std::vector<VarPtr> params;
@@ -214,13 +224,78 @@ class CcuLowerer : public IRMutator {
     }
     // The explicit single-block launch is compiler-owned, never an API option.
     std::vector<std::pair<std::string, std::any>> attrs{{kAttrCoreNum, Index(1, call->span_)}};
-    return std::make_shared<Call>(std::make_shared<GlobalVar>(name),
-                                  std::vector<ExprPtr>{call->args_[0], call->args_[1], token->second},
-                                  std::vector<std::pair<std::string, std::any>>{}, attrs, call->GetType(),
-                                  call->span_);
+    return std::make_shared<Call>(
+        std::make_shared<GlobalVar>(name), std::vector<ExprPtr>{call->args_[0], call->args_[1], token},
+        std::vector<std::pair<std::string, std::any>>{}, attrs, call->GetType(), call->span_);
   }
 
  private:
+  VarPtr Order(const std::string& key, const Span& span) {
+    auto [token, inserted] = tokens_.try_emplace(key);
+    if (inserted) {
+      auto shape = std::make_shared<MakeTuple>(std::vector<ExprPtr>{Index(1, span)}, span);
+      auto alloc = OpRegistry::GetInstance().Create(
+          "tensor.create", {shape}, {{"dtype", DataType::UINT8}, {"layout", TensorLayout::ND}}, span);
+      token->second = std::make_shared<Var>(names_->Fresh("_ccu_order_"), alloc->GetType(), span);
+      allocations_.push_back(std::make_shared<AssignStmt>(token->second, alloc, span));
+    }
+    return token->second;
+  }
+
+  ExprPtr LowerAllGather(const CallPtr& call) {
+    const auto& span = call->span_;
+    auto input = As<DistributedTensorType>(call->args_[0]->GetType());
+    auto target = As<DistributedTensorType>(call->args_[1]->GetType());
+    auto signal = As<DistributedTensorType>(call->args_[2]->GetType());
+    CHECK_SPAN(input, span) << "CCU allgather input must be a DistributedTensor window";
+    ValidateView(input, span);
+    auto shape_key = ValidateView(target, span);
+    ValidateView(signal, span);
+    CHECK_SPAN(input->dtype_ == DataType::BF16, span) << "CCU allgather supports only BF16";
+    const int64_t nranks = As<ConstInt>(target->shape_[0])->value_;
+    CHECK_SPAN(nranks >= 2 && nranks <= kMaxCcuRanks, span)
+        << "CCU allgather requires 2..64 ranks, matching the simpler registration ABI";
+    CHECK_SPAN(signal->shape_.size() == 2 && As<ConstInt>(signal->shape_[0])->value_ == nranks &&
+                   As<ConstInt>(signal->shape_[1])->value_ == 1,
+               span)
+        << "CCU allgather requires signal shape [NR, 1] matching target [NR, N]";
+    CHECK_SPAN(As<ConstInt>(input->shape_[1])->value_ <= std::numeric_limits<int64_t>::max() / (2 * nranks),
+               span)
+        << "CCU allgather target byte size exceeds INT64_MAX";
+    const auto* handler = PassContext::Current()->GetBackendHandler();
+    CHECK_SPAN(handler && handler->SupportCcu(), span)
+        << "CCU allgather is unsupported by this backend; compiler lowering requires Ascend950";
+    const std::string entry = "dtype_cpp=bfloat16_t,nranks_cpp=" + std::to_string(nranks);
+    auto token = Order(std::string(kCcuAllGatherTemplate) + ":" + entry, span);
+    auto name = "__builtin_allgather_ccu__bf16_p" + std::to_string(nranks) + shape_key;
+    if (!kernels_->count(name)) {
+      // Only target carries a ctx: simpler requires the selected CCU domain
+      // exactly once in task scalar arguments. All operands belong to it.
+      std::vector<VarPtr> params{
+          std::make_shared<Var>("input", std::make_shared<TensorType>(input->shape_, input->dtype_), span),
+          std::make_shared<Var>(
+              "target", std::make_shared<DistributedTensorType>(target->shape_, target->dtype_), span),
+          std::make_shared<Var>("signal", std::make_shared<TensorType>(signal->shape_, signal->dtype_), span),
+          std::make_shared<Var>("order", OrderType(span), span)};
+      auto body = std::make_shared<ReturnStmt>(std::vector<ExprPtr>{params[1]}, span);
+      std::vector<std::pair<std::string, std::any>> attrs{
+          {kAttrBuiltinTemplateDir, std::string(kCcuAllGatherTemplate)},
+          {kAttrBuiltinTemplateVars, entry},
+          {kAttrRequireContiguousOperands, true}};
+      (*kernels_)[name] = std::make_shared<Function>(
+          name, params,
+          std::vector<ParamDirection>{ParamDirection::In, ParamDirection::InOut, ParamDirection::InOut,
+                                      ParamDirection::InOut},
+          std::vector<TypePtr>{params[1]->GetType()}, body, span, FunctionType::AIV, std::nullopt,
+          std::nullopt, attrs);
+    }
+    return std::make_shared<Call>(
+        std::make_shared<GlobalVar>(name),
+        std::vector<ExprPtr>{call->args_[0], call->args_[1], call->args_[2], token},
+        std::vector<std::pair<std::string, std::any>>{},
+        std::vector<std::pair<std::string, std::any>>{{kAttrCoreNum, Index(1, span)}}, call->GetType(), span);
+  }
+
   // Each Lowerer instance owns one CHIP invocation's tokens. A shared InOut
   // tensor creates a WAW chain only for repeated uses of the same CCU entry.
   // No remote access, Host parameter, communication window or ctx is needed.
@@ -231,7 +306,7 @@ class CcuLowerer : public IRMutator {
 };
 
 // A deliberately local binding analysis: direct window/SSA aliases, constant
-// devices or one static two-device dispatch loop. No cross-function provenance
+// devices or one bounded static rank-dispatch loop. No cross-function provenance
 // or general domain proof is introduced. Coverage is collected for ALL dispatch
 // consumers so another call cannot silently enlarge a CCU window's domain.
 class HostBindings : public IRVisitor {
@@ -260,8 +335,11 @@ class HostBindings : public IRVisitor {
     auto start = Constant(op->start_);
     auto stop = Constant(op->stop_);
     auto step = Constant(op->step_);
-    if (start && stop && step && *start >= 0 && *step == 1 && *stop - *start == 2)
-      loop_devices_[op->loop_var_.get()] = {*start, *start + 1};
+    if (start && stop && step && *start >= 0 && *step == 1 && *stop > *start &&
+        *stop - *start <= kMaxCcuRanks) {
+      auto& devices = loop_devices_[op->loop_var_.get()];
+      for (int64_t rank = *start; rank < *stop; ++rank) devices.insert(rank);
+    }
     IRVisitor::VisitStmt_(op);
     loop_devices_.erase(op->loop_var_.get());
     --loop_depth_;
@@ -313,7 +391,7 @@ class HostBindings : public IRVisitor {
     }
     if (ccu) {
       CHECK_SPAN(!ranks.empty() && unsupported_depth_ == 0 && loop_depth_ == (rank_loop ? 1 : 0), call->span_)
-          << "CCU CHIP dispatch requires constant devices or one static two-device rank loop; "
+          << "CCU CHIP dispatch requires constant devices or one static rank loop of at most 64 devices; "
              "conditional/repeated dispatch and dynamic device bindings are unsupported";
       devices[call->op_->name_].insert(ranks.begin(), ranks.end());
     }
@@ -327,7 +405,7 @@ class HostBindings : public IRVisitor {
       }
       if (it == windows_.end()) continue;
       // Unknown non-CCU device coverage poisons the proof, rather than being
-      // ignored and accepting a larger payload domain than the qualified pair.
+      // ignored and accepting a larger payload domain than the declared collective domain.
       if (ranks.empty()) coverage[it->second].insert(-1);
       coverage[it->second].insert(ranks.begin(), ranks.end());
       if (ccu) buffers[call->op_->name_].insert(it->second);
@@ -369,8 +447,9 @@ class CcuDispatchChecker : public IRVisitor {
 
 }  // namespace
 
-ProgramPtr LowerCcuBroadcast(const ProgramPtr& program) {
+ProgramPtr LowerCcuCollectives(const ProgramPtr& program) {
   Chips chips;
+  std::map<std::string, std::set<int64_t>> rank_counts;
   Names names;
   names.VisitProgram(program);
   for (const auto& [gvar, func] : program->functions_) {
@@ -384,6 +463,7 @@ ProgramPtr LowerCcuBroadcast(const ProgramPtr& program) {
                func->span_)
         << "LowerL2TensorCollectives must run before MaterializeDistTensorCtx for CCU broadcast";
     chips.insert(func->name_);
+    rank_counts[func->name_] = std::move(finder.rank_counts);
   }
   if (chips.empty()) return program;
 
@@ -399,10 +479,18 @@ ProgramPtr LowerCcuBroadcast(const ProgramPtr& program) {
       HostBindings bindings(chips);
       bindings.VisitStmt(func->body_);
       for (const auto& [callee, devices] : bindings.devices) {
-        CHECK_SPAN(devices.size() == 2, func->span_) << "CCU broadcast requires a static two-device domain";
+        for (int64_t nranks : rank_counts.at(callee)) {
+          if (nranks == 2) {
+            CHECK_SPAN(devices.size() == 2, func->span_)
+                << "CCU collective requires a static two-device domain";
+          } else {
+            CHECK_SPAN(devices.size() == static_cast<size_t>(nranks), func->span_)
+                << "CCU collective Host domain size must match target rank count " << nranks;
+          }
+        }
         for (const Var* buffer : bindings.buffers.at(callee)) {
           CHECK_SPAN(bindings.coverage.at(buffer) == devices, func->span_)
-              << "CCU broadcast supports one statically bound domain per callable; window device coverage "
+              << "CCU collective supports one statically bound domain per callable; window device coverage "
                  "differs";
         }
       }

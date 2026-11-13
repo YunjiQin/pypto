@@ -1,0 +1,137 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
+// Generated native module. Link with build_identity.cpp from the build toolchain.
+#include <array>
+#include <cstring>
+#include "hcomm/ccu/ccu_primitives.hpp"
+#include "hcomm/ccu/ccu_res.h"
+#include "platform_comm/ccu/ccu_native_abi.h"
+
+extern const uint8_t pypto_ccu_sdk_identity[32];
+extern const uint8_t pypto_ccu_isa_identity[32];
+
+namespace {
+namespace ccu = AscendC::ccu;
+constexpr uint32_t kRanks = {{nranks_cpp}};
+constexpr uint32_t kWords = 4 + 3 * kRanks;
+static_assert(kRanks >= 2 && kRanks <= SIMPLER_CCU_MAX_RANKS);
+// The exported C entry never throws, including when instruction construction fails.
+struct InstructionError {};
+void Check(CcuResult result) {
+  if (result != CCU_SUCCESS) throw InstructionError{};
+}
+int32_t AllGather(const SimplerCcuRegistrationBinding *binding) noexcept {
+  try {
+    std::array<ccu::Variable, SIMPLER_CCU_TASK_ARGUMENT_COUNT> launch;
+    for (uint32_t i = 0; i < launch.size(); ++i) Check(ccu::LoadArg(launch[i], i));
+    ccu::Event trigger(binding->trigger_event_handle), done(binding->done_event_handle), copied;
+    ccu::Variable completed, one;
+    completed = 0;
+    one = 1;
+    // Straight-line CHIP code gives an exact finite number of requests.
+    // The final business request records done and exits without a hidden task.
+    CCU_WHILE(completed != {{request_count}}) {
+      Check(ccu::EventWait(trigger, 1));
+      std::array<ccu::Variable, kWords> words;
+      for (uint32_t i = 0; i < words.size(); ++i) {
+        ccu::Variable offset, address;
+        offset = uint64_t{i} * sizeof(uint64_t);
+        address = launch[0] + offset;
+        Check(ccu::Load(address, words[i]));
+      }
+      ccu::LocalAddr source;
+      source.addr = words[0];
+      source.token = words[1];
+      // Publish to ALL peers before waiting on any. Pairwise record/wait
+      // interleaving can deadlock when rank order differs between domains.
+      auto notify = [&](uint16_t mask, bool record) {
+        for (uint32_t slot = 0; slot < kRanks; ++slot) {
+          for (uint32_t peer = 0; peer < binding->rank_count; ++peer) {
+            if (peer == binding->rank_id) continue;
+            CCU_IF(words[6 + 3 * slot] == peer) {
+              if (record) Check(ccu::NotifyRecord(binding->channels[peer], binding->ccu_id, mask));
+              else Check(ccu::NotifyWait(binding->channels[peer], binding->ccu_id, mask));
+            }
+          }
+        }
+      };
+      notify(1, true);
+      notify(1, false);
+      // One completion bit per destination, including self. Reuse the 16-bit
+      // event only after a batch drains, supporting all ranks in simpler's ABI.
+      for (uint32_t begin = 0; begin < kRanks; begin += 16) {
+        const uint32_t end = (begin + 16 < kRanks) ? begin + 16 : kRanks;
+        for (uint32_t slot = begin; slot < end; ++slot) {
+          ccu::LocalAddr local_destination;
+          ccu::RemoteAddr destination;
+          local_destination.addr = words[4 + 3 * slot];
+          local_destination.addr += words[3];
+          local_destination.token = words[5 + 3 * slot];
+          destination.addr = words[4 + 3 * slot];
+          destination.addr += words[3];
+          destination.token = words[5 + 3 * slot];
+          const auto bit = static_cast<uint16_t>(1u << (slot - begin));
+          // Slot indexes domain order; PeerRank selects physical channels,
+          // including reordered subsets of the registration context.
+          for (uint32_t peer = 0; peer < binding->rank_count; ++peer) {
+            CCU_IF(words[6 + 3 * slot] == peer) {
+              if (peer == binding->rank_id) {
+                Check(ccu::LocalCopy(local_destination, source, words[2], copied, bit));
+              } else {
+                Check(ccu::Write(binding->channels[peer], destination, source, words[2], copied, bit));
+              }
+            }
+          }
+        }
+        Check(ccu::EventWait(copied, static_cast<uint16_t>((1u << (end - begin)) - 1)));
+      }
+      notify(2, true);
+      notify(2, false);
+      Check(ccu::EventRecord(done, 1));
+      completed = completed + one;
+    }
+    return CCU_SUCCESS;
+  } catch (...) {
+    return CCU_E_INTERNAL;
+  }
+}
+struct Manifest {
+  SimplerCcuModuleManifest header;
+  SimplerCcuKernelRecord kernel;
+  char symbol[sizeof("{{entry_symbol}}") - 1];
+};
+Manifest MakeManifest() {
+  Manifest result{};
+  result.header.struct_size = sizeof(result.header);
+  result.header.manifest_size = sizeof(result);
+  result.header.kernel_record_size = sizeof(result.kernel);
+  result.header.kernel_count = 1;
+  result.header.kernel_records_offset = offsetof(Manifest, kernel);
+  result.header.string_table_offset = offsetof(Manifest, symbol);
+  result.header.string_table_size = sizeof(result.symbol);
+  std::memcpy(result.header.sdk_build_id, pypto_ccu_sdk_identity, 32);
+  std::memcpy(result.header.pto_isa_build_id, pypto_ccu_isa_identity, 32);
+  std::memcpy(result.symbol, "{{entry_symbol}}", sizeof(result.symbol));
+  result.kernel = {sizeof(SimplerCcuKernelRecord), 0, kWords * sizeof(uint64_t), 64,
+      SIMPLER_CCU_KERNEL_CAP_THREE_EVENTS, offsetof(Manifest, symbol), sizeof(result.symbol),
+      sizeof(SimplerCcuRegistrationBinding), SIMPLER_CCU_REGISTRATION_ARGUMENT_COUNT,
+      SIMPLER_CCU_TASK_ARGUMENT_COUNT};
+  return result;
+}
+}  // namespace
+extern "C" int32_t {{entry_symbol}}(const SimplerCcuRegistrationBinding *binding) noexcept {
+  return AllGather(binding);
+}
+extern "C" const SimplerCcuModuleManifest *simpler_ccu_module_manifest() noexcept {
+  static const auto manifest = MakeManifest();
+  return &manifest.header;
+}
