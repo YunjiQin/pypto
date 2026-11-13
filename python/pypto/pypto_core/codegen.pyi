@@ -99,6 +99,26 @@ class KernelRegistration:
     @property
     def signature(self) -> list[str]: ...
 
+class CcuModule:
+    """Native CCU source and ABI descriptor; sizes and alignment are in bytes."""
+
+    @property
+    def ccu_id(self) -> int: ...
+    @property
+    def template_dir(self) -> str: ...
+    @property
+    def variables(self) -> dict[str, str]: ...
+    @property
+    def wrappers(self) -> list[str]: ...
+    @property
+    def source(self) -> str: ...
+    @property
+    def entry_symbol(self) -> str: ...
+    @property
+    def parameter_size(self) -> int: ...
+    @property
+    def parameter_alignment(self) -> int: ...
+
 class OrchestrationResult:
     """Result of orchestration code generation."""
 
@@ -110,6 +130,11 @@ class OrchestrationResult:
     @property
     def kernel_registrations(self) -> list[KernelRegistration]:
         """Distinct runtime registrations, in func_id order; code may be shared."""
+        ...
+
+    @property
+    def ccu_modules(self) -> list[CcuModule]:
+        """Native modules in callable-local ID order; also supplies AIV wrapper IDs."""
         ...
 
     @property
@@ -213,6 +238,7 @@ __all__ = [
     "DistributedCodegen",
     "OrchestrationResult",
     "KernelRegistration",
+    "CcuModule",
     "collect_vars_from_shape_expr",
     "collect_tensor_shape_dyn_vars",
     "generate_orchestration",

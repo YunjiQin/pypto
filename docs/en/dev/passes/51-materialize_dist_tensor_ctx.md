@@ -3,6 +3,14 @@
 Materializes one explicit `CommCtxType` parameter and argument for each
 `DistributedTensorType` function parameter.
 
+CHIP callables containing lowered CCU allgather share one context across their
+distributed parameters. `LowerCcuCollectives` has already checked that all their
+Host window bindings belong to one statically bound domain. Only the first
+distributed parameter contributes a signature/dispatch context slot; aliases
+and nested device calls forward that shared SSA value. This also satisfies
+simpler's requirement that the selected CCU context occur exactly once in the
+CHIP task's scalar arguments. Other functions retain one context per parameter.
+
 ## Overview
 
 Distributed tensors need a communication context at every dispatch boundary:

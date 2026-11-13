@@ -7,7 +7,8 @@ rewrites a `pld.tensor.*` collective written in a **CHIP orchestration body**
 into a call to a compiler-synthesized AIV kernel, so the collective becomes one
 ordinary task inside the caller's own pipeline.
 
-Today it handles `pld.tensor.all_to_all_v` with a compile-time `core_num`.
+It handles `pld.tensor.all_to_all_v` with a compile-time `core_num`, indexed
+all-to-all-v, and the CCU BF16 allgather path described below.
 
 The HOST rail ([`LowerHostTensorCollectives`](50-lower_host_tensor_collectives.md))
 solves the same problem one level up, and differently: it fans the collective
@@ -169,7 +170,8 @@ passes earlier, so re-reporting them here would blame the wrong pass.
 
 ## What this pass does *not* do
 
-- It does not create a `CommDomain` or allocate any collective staging buffer.
+- It does not create a `CommDomain` or allocate collective payload staging.
+  CCU allgather does synthesize local scheduling tokens.
   L3 still creates the domain, exchanges window addresses and binds the
   windows; L2 consumes local views and an already-built context.
 - It does not fan out per device. The `device=` dispatch stays in the HOST
@@ -278,3 +280,125 @@ Only A5 URMA PER_PEER transport is supported, with one writer per destination.
 Callers must order exchanges sharing queues; reusing the same InOut signal
 creates that dependency even when payload windows differ. HOST and InCore
 calls are unsupported. See the [user contract](../../user/distributed/20-all_to_all.md#indexed-alltoallv-on-a5-urma).
+
+## CCU allgather
+
+`pld.tensor.allgather(input, target, signal, engine="ccu")` supports Ascend950
+CHIP orchestration, BF16 input `[1, N]`, target `[NR, N]`, INT32 signal `[NR, 1]`,
+static positive full contiguous ND views, and 2–64 ranks. All three arguments
+must be windows in the same domain; input and target must be distinct buffers.
+The pass proves row-major provenance through supported aliases, reuses the
+Host binding checks against each callable's rank count, and rejects HOST/InCore, dynamic shapes, loops,
+conditional calls and nested CHIP dispatch. Cross-rank matching call order and
+same-domain membership remain caller preconditions. Target views must have the
+same window-relative offset on every rank. The 64-rank upper bound comes from
+simpler's registration ABI; it is not an AllGather algorithm limit. Host dispatch
+accepts constant device IDs or one static unit-step rank loop of up to 64 devices.
+
+The AIV builtin uses `:pypto.runtime.builtins.ccu.allgather`. Its ABI is
+`input, target, signal, order, ctx_target`, with directions
+`In, InOut, InOut, InOut, Scalar` and `return target`. Input/signal use canonical
+plain tensor parameter types so context materialization appends **exactly one**
+context, as required by simpler's CCU task admission. The public operands remain
+DistributedTensors. Order is an ordinary UINT8 `[1]` scheduling tensor allocated inside each CHIP
+invocation. One token serializes all requests to an entry, including different
+shapes; different rank counts specialize different entries. Signal/order are control handles exempt from return rebind discipline.
+A single AIV block submits metadata as typed `CcuCallArg` values using
+`get_async_ctx(args)` from the original argument base. CCU performs both the
+local and remote payload copies, preserving BF16 bits.
+
+### Native source contract
+
+The emitted module follows [simpler #2986](https://github.com/hw-native-sys/simpler/pull/2986),
+verified at `a6566e3197302b2ac3c7a015adac6861c9d41d5e`. Each request has `9 + 3 * NR` expanded
+64-bit words (`8 * (9 + 3 * NR)` bytes, parameter alignment 64):
+
+| Words | Meaning |
+| ----- | ------- |
+| 0–1 | Local input W address and token |
+| 2 | BF16 chunk byte length |
+| 3 | Output slot byte offset: source domain rank × chunk byte length |
+| 4 | Number of complete 4 GiB segments |
+| 5–8 | Final segment GoSize: address offset, main iterations, parallel config, residual bytes |
+| 9 + 3r, 10 + 3r | Domain destination r's target base W address and token |
+| 11 + 3r | Destination r's physical L2 rank resolved from the domain's W table |
+
+The AIV computes byte offsets from tensor start offsets and local `windowsIn`;
+the runtime resolves CCU addresses/tokens from W, rather than treating imported
+AIV mappings as CCU addresses. Domain rank controls output row order; physical
+L2 rank selects the registration channel, including reordered subsets.
+The native definition waits for trigger, performs a readiness handshake, then
+issues remote `Write` to every peer and `LocalCopy` to self. Each chunk processes
+up to 16 destinations per event mask, draining that mask before reuse for another
+batch. This destination batching is independent of the 16 LoopGroup lanes.
+Both readiness and completion publish to all peers before waiting on any peer.
+All chunks and peer completion finish before recording done.
+Readiness and completion use distinct notification bits. The native mission
+runs a resident CCU loop: wait for trigger, execute one request, publish done,
+then wait for the next trigger indefinitely. There is no static request count,
+exit request or final wake. Per-request async done still retires before task
+dependencies are released; it does not terminate the mission.
+
+Mission lifetime belongs to simpler. After the entire L2 task finishes and
+returns to Host, simpler must stop/close the mission stream and confirm that it
+no longer accesses parameters, events or windows before releasing resources.
+Normal teardown must not synchronize this resident stream expecting natural
+completion. The pinned simpler #2986 ABI is compatible with the request layout,
+but its normal `DomainRun::stop()` only polls for natural termination and its
+abort path retains resources. That runtime lifecycle needs the corresponding
+normal-shutdown adaptation; this source-only change does not implement or claim
+that integration. CHIP control-flow restrictions remain separately enforced for
+cross-rank ordering and domain validation.
+
+The HBM data path ports `CcuAllGatherOp`, `CcuLoopGroupExecutor` and GoSize
+encoding from the [PTO-ISA CCU guide](https://gitcode.com/cyz00/pto-isa/blob/ccu_test/docs/zcy/ccu_collective_usage_zh.md)
+at commit `6a60d0d3525aeecd76b0138018cc39fabf708794`. It uses the reference
+32 KiB / 16-lane HBM policy and allocates one shared array of 16 events, with
+no MS buffers. `ccu/allgather_schedule.hpp` supplies the common host/AIV encoding.
+
+AIV computes the source-rank slot and GoSize outside CCU, whose A5 translator
+lacks multiplication. The native module constructs actual `Func`, `Loop` and
+`LoopGroup` instructions: the main group repeats 16 chunks with a 512 KiB
+iteration stride; the remainder group handles a residual chunk followed by full
+chunks. Main and remainder use distinct Loop objects and two address slots,
+rebinding from stable input/output bases after hardware address advancement.
+Events are reused across groups, segments and requests. The 13-bit loop-count
+field is bounded by splitting rows into 4 GiB segments; the exact-boundary
+8192nd stripe uses the reference's remainder-group encoding.
+
+The adaptation retains simpler's ready/trigger/done contract and typed W-table
+argument resolution. It does not import `CcuFusionSession`, descriptor-table
+lifecycle management or MS paths. Unlike the reference descriptor-table frontend,
+which requires chunk-aligned lengths, this source interface also encodes partial
+chunks through GoSize's residual path. This is covered by CPU source-contract
+tests, not a claim of target SDK or hardware qualification. Tests interpret
+LoopGroup address/event strides and check BF16 data, repeated missions, tail
+coverage, rank permutations and the 4 GiB boundary; they do not simulate hardware
+concurrency, instruction synthesis or performance.
+
+C++ orchestration codegen derives CCU entries from the callable's kernel
+registrations, deduplicates by template identity and specialization, and assigns
+IDs in sorted order. `OrchestrationResult.ccu_modules` carries the shared wrapper
+IDs, template variables and native ABI metadata. Python only renders templates
+and serializes this result into `ccu/module_<id>.cpp`, `kernels/aiv/*.cpp` and
+configuration; it does not rescan IR to discover or number CCU entries. `kernel_config.py` includes ordered `CCU_MODULES`
+(source, entry, ID, parameter layout) and `CCU_BUILD_IDENTITY`.
+Each module exports `simpler_ccu_module_manifest` with one kernel record. A future
+binary builder must link `pypto_ccu_sdk_identity` and `pypto_ccu_isa_identity`
+(32-byte SHA256 digests of the exact SDK/ISA headers named in that metadata),
+preserve module order in the callable package, and perform explicit runtime CCU
+registration. `CCU_RUNTIME_SUPPORTED = False` marks this source-only handoff.
+This change does not build modules, package ChipCallables, or validate hardware.
+
+`LowerL2TensorCollectives` implements CCU allgather validation and ordering in
+`lower_l2/ccu_collectives.cpp`. It runs before `MaterializeCommDomainScopes`, which
+collects CCU requirements from lowered builtin Call/Submit identities across the
+whole program, including unused functions. Raw HOST collective analysis remains
+necessary because HOST lowering runs after domain materialization. The pass
+merges `ccu` with existing requirements such as `urma` and preserves window
+bindings on reruns. Both single-CHIP and Host→CHIP source output have CPU tests.
+
+The source-generation boundary also supports multiple standalone CHIP entries.
+The existing public `ir.compile` multi-entry execution-metadata wrapper rejects
+`CommCtxType` after writing those sources; use the Host→CHIP path for public
+multi-callable compilation until that wrapper supports hidden contexts.

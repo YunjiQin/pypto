@@ -73,12 +73,24 @@ void BindCodegen(nb::module_& m) {
       .def_ro("core_type", &KernelRegistration::core_type)
       .def_ro("signature", &KernelRegistration::signature);
 
+  nb::class_<CcuModule>(codegen_module, "CcuModule", "Callable-local native CCU module descriptor")
+      .def_ro("ccu_id", &CcuModule::ccu_id)
+      .def_ro("template_dir", &CcuModule::template_dir)
+      .def_ro("variables", &CcuModule::variables)
+      .def_ro("wrappers", &CcuModule::wrappers)
+      .def_ro("source", &CcuModule::source)
+      .def_ro("entry_symbol", &CcuModule::entry_symbol)
+      .def_ro("parameter_size", &CcuModule::parameter_size)
+      .def_ro("parameter_alignment", &CcuModule::parameter_alignment);
+
   // OrchestrationResult - result of orchestration code generation
   nb::class_<OrchestrationResult>(codegen_module, "OrchestrationResult",
                                   "Result of orchestration code generation")
       .def_ro("code", &OrchestrationResult::code, "Generated C++ orchestration code")
       .def_ro("kernel_registrations", &OrchestrationResult::kernel_registrations,
               "Runtime registrations keyed by code, core type and final tensor signature")
+      .def_ro("ccu_modules", &OrchestrationResult::ccu_modules,
+              "Native CCU modules in callable-local ID order, shared by wrappers and config")
       .def_ro("orchestration_signature", &OrchestrationResult::orchestration_signature,
               "Orchestration entry per-tensor ArgDirection name list (scalars excluded), in "
               "orch_args tensor order; sets the ChipCallable signature");

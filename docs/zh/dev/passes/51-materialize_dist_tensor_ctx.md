@@ -3,6 +3,12 @@
 本 pass 为每个 `DistributedTensorType` 函数参数显式物化一个对应的
 `CommCtxType` 参数和实参。
 
+包含已降低 CCU allgather 的 CHIP callable 为所有分布式参数共享一个上下文。
+`LowerCcuCollectives` 已校验其 Host 窗口绑定属于同一个静态通信域；只有第一个
+分布式参数会追加签名和 dispatch 上下文槽，别名及内部设备调用转发同一个 SSA 值。
+这满足 simpler 要求选定 CCU context 在 CHIP task 的 scalar 参数中恰好出现一次的约束。
+其他函数仍按每个分布式参数分别追加上下文。
+
 ## 概览
 
 DistributedTensor 的通信上下文需要沿完整调用链传递：host orchestration

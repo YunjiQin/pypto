@@ -237,3 +237,105 @@ recv_counts 可以是本地 Tensor；send_counts 必须是窗口。
 每个目标队列只有一个写入者。调用者必须为共享队列的交换建立顺序；即使
 payload 窗口不同，复用同一个 InOut signal 也能建立此依赖。
 不支持 HOST 和 InCore 调用。参见[用户约定](../../user/distributed/20-all_to_all.md#a5-urma-索引-alltoallv)。
+
+## CCU allgather
+
+`pld.tensor.allgather(input, target, signal, engine="ccu")` 支持 Ascend950 CHIP
+编排、BF16 输入 `[1, N]`、目标 `[NR, N]`、INT32 signal `[NR, 1]`、2–64 个 rank，
+以及完整连续 ND 静态正尺寸视图。三个操作数必须属于同一域；输入和目标不得别名。
+按每个 callable 的 rank 数检查 Host 绑定，复用连续性来源分析和本地 UINT8 order token；
+拒绝 HOST/InCore、动态尺寸、循环、条件调用和嵌套 CHIP dispatch。
+同域关系及跨 rank 调用顺序一致仍是调用前置条件；所有 rank 的目标视图必须具有
+相同的窗口内偏移。64 rank 上限来自 simpler 注册 ABI，并非 AllGather 算法限制。
+Host dispatch 支持常量设备 ID 或最多 64 个设备、步长为 1 的静态 rank 循环。
+
+AIV builtin 的模板身份为 `:pypto.runtime.builtins.ccu.allgather`，ABI 是
+`input, target, signal, order, ctx_target`，方向依次为
+`In, InOut, InOut, InOut, Scalar`，返回 target 别名。公共输入仍为
+DistributedTensor；builtin 的 input/signal 使用普通 Tensor 参数类型，以便
+context 物化只追加一个域 context，满足 simpler 的任务准入契约。
+Order 是在每次 CHIP 调用内分配的普通 UINT8 `[1]` 调度 tensor。
+不同 rank 数特化为不同入口；相同入口的不同 shape 调用共享 order，形成完整异步完成依赖；signal/order
+作为控制句柄免于返回值 rebind 检查。单个 AIV block 用原始
+`get_async_ctx(args)` 提交 typed `CcuCallArg` 元数据；CCU 完成本地和远端
+数据搬运，保留 BF16 位模式。
+
+### Native source contract
+
+对齐 [simpler #2986](https://github.com/hw-native-sys/simpler/pull/2986) 的
+`a6566e3197302b2ac3c7a015adac6861c9d41d5e`。请求展开为 `9 + 3 * NR` 个 uint64 word，
+共 `8 * (9 + 3 * NR)` 字节，参数对齐为 64：
+
+| Words | Meaning |
+| ----- | ------- |
+| 0–1 | 本地输入 W 地址和 token |
+| 2 | BF16 分块字节数 |
+| 3 | 输出槽位字节偏移：源域 rank × 分块字节数 |
+| 4 | 完整 4 GiB 分段数量 |
+| 5–8 | 最后一段的 GoSize：地址偏移、主循环次数、并行配置、剩余字节数 |
+| 9 + 3r, 10 + 3r | 域内目标 r 的输出基址 W 地址和 token |
+| 11 + 3r | 从域 W 表解析出的目标 r 的物理 L2 rank |
+
+AIV 根据 tensor start offset 与本地 windowsIn 算字节偏移，由 runtime 解析
+CCU 地址/token；不把 AIV 映射当作 CCU 地址。域 rank 确定输出行顺序，物理
+L2 rank 选择 registration channel，支持重排子集的映射。
+
+Native 定义等待 trigger、完成就绪握手后，对每个 peer 发起远端 `Write`，
+对自身发起 `LocalCopy`。每个数据块以最多 16 个目标为一批，等待完成后再复用
+传输事件位；目标分批与 LoopGroup 的 16 个 lane 是两个独立维度。
+就绪和完成均先向所有 peer 发布通知，再等待各 peer。所有数据块与 peer
+均完成后才发布 done。
+就绪和完成使用不同通知位。Native mission 使用常驻 CCU 循环：等待 trigger，
+执行一次请求并发布 done，然后无限等待下一次 trigger。不再静态统计请求次数，
+也不增加退出请求或最后一次唤醒。Runtime 先回收每次请求的异步 done，再释放
+任务依赖；done 不终止 mission。
+
+Mission 生命周期由 simpler 管理。整个 L2 task 完成并返回 Host 后，simpler
+负责停止/关闭 mission stream，确认其不再访问参数、事件或窗口后再释放资源。
+正常回收不能通过同步此常驻 stream 来等待自然退出。固定版本 simpler #2986
+的 ABI 可承载请求布局，但其正常 `DomainRun::stop()` 只查询自然结束状态，
+abort 通路则保留资源，因此 runtime 生命周期还需对应的正常关闭适配。
+本次源码生成改动不实现、也不宣称已完成该 runtime 集成。CHIP 控制流限制仍
+单独执行，用于保证跨 rank 顺序和域验证。
+
+HBM 数据通路移植 [PTO-ISA CCU 指南](https://gitcode.com/cyz00/pto-isa/blob/ccu_test/docs/zcy/ccu_collective_usage_zh.md)
+提交 `6a60d0d3525aeecd76b0138018cc39fabf708794` 的 `CcuAllGatherOp`、
+`CcuLoopGroupExecutor` 和 GoSize 编码。采用参考的 32 KiB / 16 lane HBM 策略，
+分配一个共享的 16 事件数组，不分配 MS buffer。公共 host/AIV 编码位于生成的
+`ccu/allgather_schedule.hpp`。
+
+AIV 在 CCU 外计算源 rank 槽位和 GoSize，避免 A5 translator 不支持的乘法。
+Native 模块构造实际 `Func`、`Loop` 和 `LoopGroup`：主 group 每轮处理 16 个
+数据块，迭代步长为 512 KiB；剩余 group 先处理残块，再处理剩余完整数据块。
+主循环和剩余循环使用不同 Loop 对象及两组地址槽位，硬件推进地址后，从稳定的
+输入/输出基址重新绑定。多个 group、分段和请求复用事件数组。为避免 13 位
+循环次数字段溢出，将长行分成 4 GiB 段；边界的第 8192 轮使用参考实现的
+剩余 group 编码。
+
+适配保留 simpler 的 ready/trigger/done 契约和 typed W 表参数解析，未引入
+`CcuFusionSession`、描述符表生命周期管理或 MS 通路。参考的描述符表前端
+要求长度按数据块对齐；本源码接口还通过 GoSize 的 residual 通路编码不完整
+数据块。这部分只有 CPU 源码契约验证，不代表目标 SDK 或硬件已验证。
+测试解释 LoopGroup 地址和事件步长，检查 BF16 数据、连续任务、尾块覆盖、
+rank 重排及 4 GiB 边界；不模拟硬件并发、指令综合或性能。
+
+C++ orchestration codegen 从当前 callable 的 kernel registrations 收集 CCU 模块，
+按模板身份及特化参数去重并排序编号。`OrchestrationResult.ccu_modules` 统一携带
+wrapper ID、模板参数和 native ABI 元数据。Python 仅消费该结果渲染模板和序列化配置，
+输出 `kernels/aiv/*.cpp` 和 `ccu/module_<id>.cpp`，不再遍历 IR 收集或编号 CCU entry。`kernel_config.py` 中
+`CCU_MODULES` 按 ID 顺序记录源码、入口及参数布局；每个模块通过
+`simpler_ccu_module_manifest` 导出一个 kernel record。后续二进制构建需根据
+`CCU_BUILD_IDENTITY` 指定的 SDK/ISA 头文件生成 SHA256，链接 32 字节的
+`pypto_ccu_sdk_identity` 和 `pypto_ccu_isa_identity`，保留模块顺序并显式注册 CCU。
+`CCU_RUNTIME_SUPPORTED = False` 标明仅交付源码；本次不构建模块、不装配
+ChipCallable、不宣称硬件验证。
+
+`LowerL2TensorCollectives` 在 `lower_l2/ccu_collectives.cpp` 中实现 CCU allgather
+校验与排序逻辑，并先于 `MaterializeCommDomainScopes` 执行。后者仅从 lowering 后的
+builtin Call/Submit 身份收集 CCU 需求，包括未调用函数；HOST collective 的原始算子
+分析仍保留，因为 HOST lowering 位于域物化之后。该 pass 合并 ccu 与 urma 等已有需求，
+重复物化保留窗口绑定。CPU 测试覆盖单 CHIP 与 Host→CHIP 源码输出。
+
+源码生成边界也支持多个独立 CHIP 入口；现有公共 `ir.compile` 多入口执行元数据
+封装在写出源码后拒绝 `CommCtxType`。该封装支持隐藏 context 前，公共多 callable
+编译应使用 Host→CHIP 通路。

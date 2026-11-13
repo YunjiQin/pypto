@@ -33,6 +33,7 @@
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/utils/auto_name_utils.h"
+#include "pypto/ir/transforms/utils/ccu_collective_utils.h"
 #include "pypto/ir/transforms/utils/op_predicates.h"
 #include "pypto/ir/transforms/utils/return_lineage_utils.h"
 #include "pypto/ir/type.h"
@@ -44,6 +45,7 @@ namespace ir {
 namespace {
 
 struct FunctionCtxPlan {
+  bool shared_ccu_context = false;
   std::vector<size_t> dist_param_indices;
   std::unordered_map<const Var*, VarPtr> param_to_ctx;
   std::vector<std::optional<size_t>> returned_param_indices;
@@ -67,7 +69,11 @@ struct FunctionCtxPlan {
 
 class LocalNameCollector : public IRVisitor {
  public:
+  LocalNameCollector() = default;
+  explicit LocalNameCollector(const std::unordered_set<std::string>& ccu_builtins)
+      : ccu_builtins_(&ccu_builtins) {}
   std::unordered_set<std::string> names;
+  bool uses_ccu_allgather = false;
 
  protected:
   void VisitStmt_(const AssignStmtPtr& op) override {
@@ -83,6 +89,19 @@ class LocalNameCollector : public IRVisitor {
     }
     IRVisitor::VisitExpr_(op);
   }
+
+  void VisitExpr_(const CallPtr& op) override {
+    uses_ccu_allgather |= ccu_builtins_ && ccu_builtins_->count(op->op_->name_) != 0;
+    IRVisitor::VisitExpr_(op);
+  }
+
+  void VisitExpr_(const SubmitPtr& op) override {
+    uses_ccu_allgather |= ccu_builtins_ && ccu_builtins_->count(op->op_->name_) != 0;
+    IRVisitor::VisitExpr_(op);
+  }
+
+ private:
+  const std::unordered_set<std::string>* ccu_builtins_ = nullptr;
 };
 
 [[nodiscard]] std::string MakeUniqueName(const std::string& base_name,
@@ -126,7 +145,8 @@ class LocalNameCollector : public IRVisitor {
          (func->role_.has_value() && *func->role_ == Role::Orchestrator);
 }
 
-[[nodiscard]] FunctionCtxPlan BuildFunctionCtxPlan(const FunctionPtr& func) {
+[[nodiscard]] FunctionCtxPlan BuildFunctionCtxPlan(const FunctionPtr& func,
+                                                   const std::unordered_set<std::string>& ccu_builtins) {
   FunctionCtxPlan plan;
   if (!func) return plan;
   plan.returned_param_indices = return_lineage::ExplicitReturnedParamIndices(func);
@@ -134,16 +154,27 @@ class LocalNameCollector : public IRVisitor {
   for (const auto& param : func->params_) {
     used_names.insert(param->name_hint_);
   }
-  LocalNameCollector collector;
+  LocalNameCollector collector(ccu_builtins);
   collector.VisitStmt(func->body_);
   used_names.insert(collector.names.begin(), collector.names.end());
+  plan.shared_ccu_context = collector.uses_ccu_allgather;
+  // LowerCcuCollectives validates a single statically bound domain for every
+  // distributed operand of these CHIP callables. Share the context throughout
+  // the body and append it only once: simpler rejects duplicate selected CCU
+  // contexts in the CHIP task's scalar arguments, not just in its AIV children.
+  VarPtr shared_ctx;
   for (size_t i = 0; i < func->params_.size(); ++i) {
     const auto& param = func->params_[i];
     if (!As<DistributedTensorType>(param->GetType())) continue;
+    if (collector.uses_ccu_allgather && shared_ctx) {
+      plan.param_to_ctx[param.get()] = shared_ctx;
+      continue;
+    }
     auto ctx = std::make_shared<Var>(MakeUniqueName(MakeCtxParamBaseName(param), &used_names),
                                      GetCommCtxType(), param->span_);
     plan.dist_param_indices.push_back(i);
     plan.param_to_ctx[param.get()] = ctx;
+    shared_ctx = ctx;
   }
   return plan;
 }
@@ -682,16 +713,22 @@ class MaterializeDistTensorCtxMutator : public IRMutator {
     params.push_back(it->second);
     dirs.push_back(ParamDirection::In);
   }
+  auto attrs = func->attrs_;
+  if (plan.shared_ccu_context) attrs.emplace_back(kAttrCcuSharedContext, true);
   return std::make_shared<Function>(func->name_, std::move(params), std::move(dirs), func->return_types_,
                                     func->body_, func->span_, func->func_type_, func->level_, func->role_,
-                                    func->attrs_, func->requires_runtime_binding_, func->ir_stage_);
+                                    attrs, func->requires_runtime_binding_, func->ir_stage_);
 }
 
 [[nodiscard]] ProgramPtr TransformProgram(const ProgramPtr& program) {
+  std::unordered_set<std::string> ccu_builtins;
+  for (const auto& [gvar, func] : program->functions_) {
+    if (IsCcuAllGatherBuiltin(func)) ccu_builtins.insert(func->name_);
+  }
   std::unordered_map<std::string, FunctionCtxPlan> plans;
   for (const auto& [gvar, func] : program->functions_) {
     if (!HasDistTensorParam(func)) continue;
-    auto plan = BuildFunctionCtxPlan(func);
+    auto plan = BuildFunctionCtxPlan(func, ccu_builtins);
     if (!plan.dist_param_indices.empty()) plans.emplace(func->name_, std::move(plan));
   }
   if (plans.empty()) return program;
