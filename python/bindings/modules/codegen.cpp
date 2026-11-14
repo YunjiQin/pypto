@@ -73,6 +73,12 @@ void BindCodegen(nb::module_& m) {
       .def_ro("core_type", &KernelRegistration::core_type)
       .def_ro("signature", &KernelRegistration::signature);
 
+  nb::class_<BuiltinSourceSpec>(codegen_module, "BuiltinSourceSpec", "Template artifact selected by codegen")
+      .def_ro("template_dir", &BuiltinSourceSpec::template_dir)
+      .def_ro("template_file", &BuiltinSourceSpec::template_file)
+      .def_ro("output_path", &BuiltinSourceSpec::output_path)
+      .def_ro("variables", &BuiltinSourceSpec::variables);
+
   nb::class_<CcuModule>(codegen_module, "CcuModule", "Callable-local native CCU module descriptor")
       .def_ro("ccu_id", &CcuModule::ccu_id)
       .def_ro("template_dir", &CcuModule::template_dir)
@@ -89,6 +95,8 @@ void BindCodegen(nb::module_& m) {
       .def_ro("code", &OrchestrationResult::code, "Generated C++ orchestration code")
       .def_ro("kernel_registrations", &OrchestrationResult::kernel_registrations,
               "Runtime registrations keyed by code, core type and final tensor signature")
+      .def_ro("builtin_sources", &OrchestrationResult::builtin_sources,
+              "Template source artifacts with complete paths and substitutions")
       .def_ro("ccu_modules", &OrchestrationResult::ccu_modules,
               "Native CCU modules in callable-local ID order, shared by wrappers and config")
       .def_ro("orchestration_signature", &OrchestrationResult::orchestration_signature,

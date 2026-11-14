@@ -693,7 +693,7 @@ def _compile_and_assemble_locked(
     ]
 
     # Native modules use callable-local IDs in the emitted package order.
-    ccu_modules = []
+    ccu_modules: list[bytes] = []
     for index, module in enumerate(getattr(kernel_config, "CCU_MODULES", [])):
         if module["ccu_id"] != index:
             raise ValueError("CCU_MODULES must be ordered by contiguous callable-local ccu_id")
@@ -707,7 +707,7 @@ def _compile_and_assemble_locked(
         func_name=func_name,
         binary=orch_so_binary,
         children=[(fid, callable_) for fid, callable_, _ in kernel_binaries],
-        **({"ccu_modules": ccu_modules} if ccu_modules else {}),
+        ccu_modules=ccu_modules,
     )
     # ``orch_so_binary`` is the buffer the runtime hashes into the ``hid=`` of this
     # callable's [STRACE] markers; pair it with the per-program display name (NOT

@@ -298,7 +298,9 @@ def _read_ccu_modules(
     if not isinstance(modules, list):
         raise ValueError(f"Invalid prebuilt CCU module list: {root}")
     if modules:
-        record["ccu_modules"] = [_binary(root, module, validated_files, binary_cache) for module in modules]
+        record["ccu_modules"] = [
+            _binary(root, module, validated_files, binary_cache) for module in cast("list[Any]", modules)
+        ]
 
 
 def _read_chip(

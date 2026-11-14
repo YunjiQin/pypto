@@ -997,7 +997,25 @@ def test_ccu_entry_ids_are_deterministic_and_submit_aware():
         )
         for name, variant in (("first", "b"), ("second", "a"), ("unused", "c"))
     ]
+    # Ordinary AIV builtins and CCU wrappers use the same artifact contract.
+    # An unreferenced ordinary definition must not produce an artifact either.
+    kernels.extend(
+        ir.Function(
+            name,
+            [],
+            [],
+            ir.ReturnStmt([], span),
+            span,
+            type=ir.FunctionType.AIV,
+            attrs={
+                "builtin_template_dir": ":pypto.runtime.builtins.collectives.all_to_all_v",
+                "builtin_template_vars": "dtype_cpp=float",
+            },
+        )
+        for name in ("ordinary", "unused_ordinary")
+    )
     calls: list[ir.Stmt] = [
+        ir.EvalStmt(ir.Call(ir.GlobalVar("ordinary"), [], ir.TupleType([]), span), span),
         ir.EvalStmt(ir.Call(ir.GlobalVar("first"), [], ir.TupleType([]), span), span),
         ir.EvalStmt(ir.Submit(ir.GlobalVar("second"), [], [], ir.TupleType([]), span), span),
     ]
@@ -1015,10 +1033,15 @@ def test_ccu_entry_ids_are_deterministic_and_submit_aware():
     program = ir.Program([chip, other, *kernels], "ids", span)
     program = passes.materialize_runtime_scopes()(program)
     chip = next(f for f in program.functions.values() if f.name == "chip")
-    entries = codegen.generate_orchestration(program, chip).ccu_modules
+    result = codegen.generate_orchestration(program, chip)
+    entries = result.ccu_modules
     assert [(e.ccu_id, e.wrappers) for e in entries] == [(0, ["second"]), (1, ["first"])]
     assert all(e.parameter_size == 8 * (9 + 3 * 2) and e.parameter_alignment == 64 for e in entries)
-    sources = _render_builtin_kernel_sources(program, entries)
+    specs = result.builtin_sources
+    assert len({spec.output_path for spec in specs}) == len(specs) == 6
+    sources = _render_builtin_kernel_sources(specs)
+    assert "kernels/aiv/ordinary.cpp" in sources
+    assert "kernels/aiv/unused_ordinary.cpp" not in sources
     assert "submit_ccu_mission(ctx, comm, 1, call_args)" in sources["kernels/aiv/first.cpp"]
     assert "submit_ccu_mission(ctx, comm, 0, call_args)" in sources["kernels/aiv/second.cpp"]
     assert "kernels/aiv/unused.cpp" not in sources
@@ -1028,8 +1051,8 @@ def test_ccu_entry_ids_are_deterministic_and_submit_aware():
         "ccu/allgather_schedule.hpp",
     }
     reordered = ir.Program([*reversed(kernels), chip], "ids", span)
-    reordered_entries = codegen.generate_orchestration(reordered, chip).ccu_modules
-    assert sources == _render_builtin_kernel_sources(reordered, reordered_entries)
+    reordered_result = codegen.generate_orchestration(reordered, chip)
+    assert sources == _render_builtin_kernel_sources(reordered_result.builtin_sources)
 
 
 def test_ccu_multi_callable_entries_and_shape_deduplication(tmp_path):

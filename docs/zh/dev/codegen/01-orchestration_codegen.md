@@ -559,9 +559,15 @@ orch_code = files["orchestration/orch_func_name.cpp"]
 实现描述 `CcuModule`。Codegen 从已生成的 kernel registrations 构造描述，
 无关函数不会创建 mission。每项携带 callable 内的 ID、模板变量、AIV wrapper
 名称、native 源文件路径及入口符号，以及以字节为单位的参数区大小和对齐。
-Python 使用同一份描述渲染 wrapper/module 和序列化配置，不再重新收集 entry
+C++ 根据这些描述构造渲染规格；Python 序列化运行时配置，不再重新收集 entry
 或分配 ID。ABI 及运行时接入边界见
 [CCU allgather 源码生成](../passes/43-lower_l2_tensor_collectives.md)。
+
+`OrchestrationResult.builtin_sources` 统一描述普通 AIV builtin、CCU 提交 wrapper、
+native module 和共享头文件。每个 `BuiltinSourceSpec` 提供 `template_dir`、
+`template_file`、`output_path` 和完整的替换变量 `variables`。C++ 仅选择已注册的
+kernel，注入 CCU ID，共享头文件只输出一次。Python 直接渲染列表，不再遍历 IR
+或硬编码具体算子的路径、文件名和模板判断。
 
 ## Manual Scope 与 TaskId 降级
 

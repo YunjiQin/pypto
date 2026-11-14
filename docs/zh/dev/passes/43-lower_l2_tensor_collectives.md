@@ -321,7 +321,8 @@ rank 重排及 4 GiB 边界；不模拟硬件并发、指令综合或性能。
 
 C++ orchestration codegen 从当前 callable 的 kernel registrations 收集 CCU 模块，
 按模板身份及特化参数去重并排序编号。`OrchestrationResult.ccu_modules` 统一携带
-wrapper ID、模板参数和 native ABI 元数据。Python 仅消费该结果渲染模板和序列化配置，
+wrapper ID、模板参数和 native ABI 元数据。`builtin_sources` 提供完整模板路径、输出路径与替换变量，含 wrapper ID 和共享调度头文件。
+Python 仅按描述渲染模板并序列化模块配置，
 输出 `kernels/aiv/*.cpp` 和 `ccu/module_<id>.cpp`，不再遍历 IR 收集或编号 CCU entry。`kernel_config.py` 中
 `CCU_MODULES` 按 ID 顺序记录源码、入口及参数布局；每个模块通过
 `simpler_ccu_module_manifest` 导出一个 kernel record。PyPTO 二进制构建器参考

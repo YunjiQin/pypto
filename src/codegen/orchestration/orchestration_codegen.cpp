@@ -76,6 +76,22 @@ CoreType InferFunctionCoreType(const FunctionPtr& func) {
 
 namespace {
 
+std::map<std::string, std::string> BuiltinVariables(const FunctionPtr& func) {
+  // Lowering owns this metadata. Keep substitution parsing in codegen so both
+  // native identity and template rendering use the same specialization.
+  std::map<std::string, std::string> variables;
+  std::istringstream substitutions(func->GetAttr<std::string>(kAttrBuiltinTemplateVars));
+  std::string item;
+  while (std::getline(substitutions, item, ',')) {
+    const auto equal = item.find('=');
+    INTERNAL_CHECK_SPAN(equal != std::string::npos && equal > 0 && equal + 1 < item.size(), func->span_)
+        << "Invalid builtin specialization: " << item;
+    const bool inserted = variables.emplace(item.substr(0, equal), item.substr(equal + 1)).second;
+    INTERNAL_CHECK_SPAN(inserted, func->span_) << "Duplicate builtin specialization key: " << item;
+  }
+  return variables;
+}
+
 // Reuse the registrations produced while emitting Call/Submit dispatches. This
 // keeps native missions scoped to the actual callable and avoids a second IR
 // scan that could register kernels reachable only from unused functions.
@@ -88,16 +104,7 @@ std::vector<CcuModule> CollectCcuModules(const ProgramPtr& program,
     if (!seen.insert(registration.code_name).second) continue;
     auto func = program->GetFunction(registration.code_name);
     if (!IsCcuAllGatherBuiltin(func)) continue;
-    std::map<std::string, std::string> variables;
-    std::istringstream substitutions(func->GetAttr<std::string>(kAttrBuiltinTemplateVars));
-    std::string item;
-    while (std::getline(substitutions, item, ',')) {
-      const auto equal = item.find('=');
-      INTERNAL_CHECK_SPAN(equal != std::string::npos && equal > 0 && equal + 1 < item.size(), func->span_)
-          << "Invalid CCU builtin specialization: " << item;
-      const bool inserted = variables.emplace(item.substr(0, equal), item.substr(equal + 1)).second;
-      INTERNAL_CHECK_SPAN(inserted, func->span_) << "Duplicate CCU specialization key: " << item;
-    }
+    auto variables = BuiltinVariables(func);
     wrappers[{kCcuAllGatherTemplate, std::move(variables)}].insert(func->name_);
   }
   std::vector<CcuModule> modules;
@@ -124,6 +131,44 @@ std::vector<CcuModule> CollectCcuModules(const ProgramPtr& program,
                                 64});
   }
   return modules;
+}
+
+std::vector<BuiltinSourceSpec> CollectBuiltinSources(const ProgramPtr& program,
+                                                     const std::vector<KernelRegistration>& registrations,
+                                                     const std::vector<CcuModule>& modules) {
+  std::vector<BuiltinSourceSpec> sources;
+  std::map<std::string, int> wrapper_ids;
+  std::set<std::string> shared_templates;
+  for (const auto& module : modules) {
+    // The supported HBM implementation shares its scheduling header across
+    // rank specializations; each native module still has its own entry symbol.
+    if (shared_templates.insert(module.template_dir).second) {
+      sources.push_back({module.template_dir, "templates/schedule.hpp.in", "ccu/allgather_schedule.hpp", {}});
+    }
+    auto variables = module.variables;
+    variables["entry_symbol"] = module.entry_symbol;
+    sources.push_back({module.template_dir, "templates/module.cpp.in", module.source, std::move(variables)});
+    for (const auto& name : module.wrappers) wrapper_ids.emplace(name, module.ccu_id);
+  }
+  // Kernel registrations already cover Call/Submit and nested dispatch. Emit
+  // each code unit once, even when multiple runtime signatures reference it.
+  std::set<std::string> names;
+  for (const auto& registration : registrations) names.insert(registration.code_name);
+  for (const auto& name : names) {
+    auto func = program->GetFunction(name);
+    if (!func || !func->HasAttr(kAttrBuiltinTemplateDir)) continue;
+    auto template_dir = func->GetAttr<std::string>(kAttrBuiltinTemplateDir);
+    INTERNAL_CHECK_SPAN(!template_dir.empty(), func->span_) << "Empty builtin template directory";
+    auto variables = BuiltinVariables(func);
+    variables["template_package"] = template_dir.front() == ':' ? template_dir.substr(1) : template_dir;
+    if (const auto id = wrapper_ids.find(name); id != wrapper_ids.end()) {
+      variables["ccu_id"] = std::to_string(id->second);
+    }
+    const auto core = func->func_type_ == FunctionType::AIC ? "aic" : "aiv";
+    sources.push_back({template_dir, "templates/kernel.cpp.in",
+                       "kernels/" + std::string(core) + "/" + name + ".cpp", std::move(variables)});
+  }
+  return sources;
 }
 
 const char* ParamDirectionToRuntimeName(ParamDirection dir) {
@@ -692,8 +737,9 @@ OrchestrationResult GenerateOrchestration(const ir::ProgramPtr& program, const i
   oss << "}  // extern \"C\"\n";
 
   auto ccu_modules = CollectCcuModules(program, registrations.entries);
-  return OrchestrationResult{oss.str(), std::move(registrations.entries), std::move(ccu_modules),
-                             std::move(orchestration_signature)};
+  auto builtin_sources = CollectBuiltinSources(program, registrations.entries, ccu_modules);
+  return OrchestrationResult{oss.str(), std::move(registrations.entries), std::move(builtin_sources),
+                             std::move(ccu_modules), std::move(orchestration_signature)};
 }
 
 }  // namespace codegen

@@ -379,8 +379,10 @@ concurrency, instruction synthesis or performance.
 C++ orchestration codegen derives CCU entries from the callable's kernel
 registrations, deduplicates by template identity and specialization, and assigns
 IDs in sorted order. `OrchestrationResult.ccu_modules` carries the shared wrapper
-IDs, template variables and native ABI metadata. Python only renders templates
-and serializes this result into `ccu/module_<id>.cpp`, `kernels/aiv/*.cpp` and
+IDs, template variables and native ABI metadata. `builtin_sources` supplies the
+complete template/output paths and substitutions, including wrapper IDs and the
+shared schedule header. Python only renders these specifications
+and serializes the module metadata into `ccu/module_<id>.cpp`, `kernels/aiv/*.cpp` and
 configuration; it does not rescan IR to discover or number CCU entries. `kernel_config.py` includes ordered `CCU_MODULES`
 (source, entry, ID, parameter layout) and `CCU_BUILD_IDENTITY`.
 Each module exports `simpler_ccu_module_manifest` with one kernel record. The

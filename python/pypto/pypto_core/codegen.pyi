@@ -99,6 +99,18 @@ class KernelRegistration:
     @property
     def signature(self) -> list[str]: ...
 
+class BuiltinSourceSpec:
+    """Template artifact selected by codegen, with complete rendering variables."""
+
+    @property
+    def template_dir(self) -> str: ...
+    @property
+    def template_file(self) -> str: ...
+    @property
+    def output_path(self) -> str: ...
+    @property
+    def variables(self) -> dict[str, str]: ...
+
 class CcuModule:
     """Native CCU source and ABI descriptor; sizes and alignment are in bytes."""
 
@@ -130,6 +142,11 @@ class OrchestrationResult:
     @property
     def kernel_registrations(self) -> list[KernelRegistration]:
         """Distinct runtime registrations, in func_id order; code may be shared."""
+        ...
+
+    @property
+    def builtin_sources(self) -> list[BuiltinSourceSpec]:
+        """Template artifacts used by this callable, including shared headers."""
         ...
 
     @property
@@ -239,6 +256,7 @@ __all__ = [
     "OrchestrationResult",
     "KernelRegistration",
     "CcuModule",
+    "BuiltinSourceSpec",
     "collect_vars_from_shape_expr",
     "collect_tensor_shape_dyn_vars",
     "generate_orchestration",

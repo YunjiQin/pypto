@@ -31,6 +31,15 @@ struct KernelRegistration {
   std::vector<std::string> signature;  ///< Tensor directions in payload order; scalars excluded.
 };
 
+/// One template-rendered artifact, with no operator-specific decisions left
+/// for the Python backend. Paths are relative to the template package/artifact.
+struct BuiltinSourceSpec {
+  std::string template_dir;
+  std::string template_file;
+  std::string output_path;
+  std::map<std::string, std::string> variables;
+};
+
 /// One native CCU implementation shared by the listed AIV submission wrappers.
 /// IDs are contiguous and local to this orchestration callable, sorted by
 /// template and specialization (tensor shape is a wrapper-only specialization).
@@ -49,7 +58,8 @@ struct CcuModule {
 struct OrchestrationResult {
   std::string code;
   std::vector<KernelRegistration> kernel_registrations;
-  std::vector<CcuModule> ccu_modules;  ///< Shared source/config contract for native missions.
+  std::vector<BuiltinSourceSpec> builtin_sources;  ///< Only artifacts used by this callable.
+  std::vector<CcuModule> ccu_modules;              ///< Shared source/config contract for native missions.
   /// Orchestration entry's per-tensor runtime ArgDirection names ("IN"/"OUT"/
   /// "INOUT"), in orch_args tensor order (declaration order, scalars skipped).
   /// This matches the orch tensor index the runtime uses in

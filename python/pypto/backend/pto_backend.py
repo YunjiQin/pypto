@@ -46,7 +46,6 @@ from typing import Any
 from pypto._external_source import EXTERNAL_INCLUDE_DIRS_ATTR, decode_external_include_dirs
 from pypto._function_attrs import (
     BUILTIN_TEMPLATE_DIR_ATTR,
-    BUILTIN_TEMPLATE_VARS_ATTR,
     DUAL_AIV_DISPATCH_ATTR,
     EXTERNAL_SOURCE_ATTR,
 )
@@ -1495,37 +1494,6 @@ def _external_include_dirs_of(func: _ir_core.Function) -> tuple[str, ...]:
         raise RuntimeError(f"Invalid external include metadata on function '{func.name}': {e}") from e
 
 
-def _builtin_template_of(func: _ir_core.Function) -> tuple[str, dict[str, str]] | None:
-    """Return ``(template_dir, variables)`` for a builtin-template kernel, else None.
-
-    ``LowerL2TensorCollectives`` synthesizes an AIV function per managed CHIP/L2
-    collective whose implementation is the hand-written builtin kernel the HOST
-    rail also renders — named indirectly by ``builtin_template_dir`` (a
-    package-resource handle) plus a ``key=value`` substitution list. Like an
-    external kernel it gets no PyPTO codegen; unlike one it is *generated*, so
-    the rendered source is written to ``kernels/<ct>/<name>.cpp`` under the
-    artifact dir, which is exactly where the manifest already points.
-    """
-    attrs = dict(func.attrs)
-    template_dir = attrs.get(BUILTIN_TEMPLATE_DIR_ATTR)
-    if template_dir is None:
-        return None
-    variables: dict[str, str] = {}
-    raw = attrs.get(BUILTIN_TEMPLATE_VARS_ATTR, "")
-    for item in filter(None, (part.strip() for part in raw.split(","))):
-        key, sep, value = item.partition("=")
-        if not sep:
-            raise RuntimeError(
-                f"Invalid {BUILTIN_TEMPLATE_VARS_ATTR} entry {item!r} on function '{func.name}': "
-                "expected 'key=value'"
-            )
-        variables[key.strip()] = value.strip()
-    return template_dir, variables
-
-
-_CCU_ALLGATHER_TEMPLATE = ":pypto.runtime.builtins.ccu.allgather"
-
-
 def _ccu_config(entries: list[_codegen_core.CcuModule]) -> str:
     """Native module handoff; module order is the runtime's callable-local ID order."""
     if not entries:
@@ -1552,41 +1520,17 @@ def _ccu_config(entries: list[_codegen_core.CcuModule]) -> str:
     )
 
 
-def _render_builtin_kernel_sources(
-    program: _ir_core.Program, entries: list[_codegen_core.CcuModule]
-) -> dict[str, str]:
-    """Render every builtin-template kernel in *program* into artifact sources."""
+def _render_builtin_kernel_sources(sources: list[_codegen_core.BuiltinSourceSpec]) -> dict[str, str]:
+    """Render the complete artifact list selected by C++ codegen."""
     rendered: dict[str, str] = {}
-    wrapper_entries = {name: entry for entry in entries for name in entry.wrappers}
-    if entries:
-        schedule = _resolve_builtin_template_dir(_CCU_ALLGATHER_TEMPLATE) / "templates" / "schedule.hpp.in"
-        rendered["ccu/allgather_schedule.hpp"] = _render_builtin_template(schedule, {})
-    for entry in entries:
-        template = _resolve_builtin_template_dir(entry.template_dir) / "templates" / "module.cpp.in"
-        rendered[entry.source] = _render_builtin_template(
-            template,
-            {**entry.variables, "entry_symbol": entry.entry_symbol},
-        )
-    for func in program.functions.values():
-        spec = _builtin_template_of(func)
-        if spec is None:
-            continue
-        template_dir, variables = spec
-        if template_dir == _CCU_ALLGATHER_TEMPLATE:
-            if func.name not in wrapper_entries:
-                continue  # Unreferenced definitions must not create an untriggered mission.
-            variables = {**variables, "ccu_id": str(wrapper_entries[func.name].ccu_id)}
-        templates_dir = _resolve_builtin_template_dir(template_dir) / "templates"
-        kernel_template = templates_dir / "kernel.cpp.in"
-        if not kernel_template.is_file():
+    for source in sources:
+        template = _resolve_builtin_template_dir(source.template_dir) / source.template_file
+        if not template.is_file():
             raise FileNotFoundError(
-                f"builtin template_dir {template_dir!r} has no templates/kernel.cpp.in for "
-                f"function '{func.name}'"
+                f"builtin template_dir {source.template_dir!r} has no {source.template_file!r} "
+                f"for artifact {source.output_path!r}"
             )
-        core_type = "aic" if func.func_type == _ir_core.FunctionType.AIC else "aiv"
-        rendered[f"kernels/{core_type}/{func.name}.cpp"] = _render_builtin_template(
-            kernel_template, {"template_package": template_dir.lstrip(":"), **variables}
-        )
+        rendered[source.output_path] = _render_builtin_template(template, source.variables)
     return rendered
 
 
@@ -2413,7 +2357,7 @@ def _generate_single_chip(
     # PyPTO codegen, so they are skipped in the same places external kernels are
     # — but their source is written into this artifact, not referenced in place.
     def _skips_pto_codegen(func: _ir_core.Function) -> bool:
-        return _external_source_of(func) is not None or _builtin_template_of(func) is not None
+        return _external_source_of(func) is not None or BUILTIN_TEMPLATE_DIR_ATTR in func.attrs
 
     emitted_incore_funcs = [
         func for members in groups.values() for func in members if not _skips_pto_codegen(func)
@@ -2530,7 +2474,7 @@ def _generate_single_chip(
     )
 
     # Orchestration + config
-    ccu_modules: list[_codegen_core.CcuModule] = []
+    builtin_sources: list[_codegen_core.BuiltinSourceSpec] = []
     if orch_func is not None:
         try:
             if not skip_ptoas and any(
@@ -2543,7 +2487,7 @@ def _generate_single_chip(
                 )
             with _profiling_stage(prof, "orchestration_codegen"):
                 orch_result = _codegen_core.generate_orchestration(transformed_program, orch_func)
-            ccu_modules = orch_result.ccu_modules
+            builtin_sources = orch_result.builtin_sources
             result_files[f"orchestration/{orch_func.name}.cpp"] = (
                 f"// Orchestration Function: {orch_func.name}\n"
                 f"// Generated by PyPTO IR Compiler\n\n"
@@ -2578,13 +2522,13 @@ def _generate_single_chip(
                         if unit.helpers
                     },
                 )
-                result_files["kernel_config.py"] += _ccu_config(ccu_modules)
+                result_files["kernel_config.py"] += _ccu_config(orch_result.ccu_modules)
         except Exception as e:
             logger.error("Failed to generate orchestration '%s': %s", orch_func.name, e)
             errors.append((orch_func.name, e))
     # Rendering consumes codegen metadata without changing its identities.
     # Keep template diagnostics outside the orchestration error wrapper.
-    result_files.update(_render_builtin_kernel_sources(transformed_program, ccu_modules))
+    result_files.update(_render_builtin_kernel_sources(builtin_sources))
 
     if errors:
         report = _format_error_report(errors, output_dir)
