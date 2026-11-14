@@ -277,5 +277,152 @@ def test_host_domain_urma_put_peer(test_config, device_ids):
     _run_host_peer_transfer(test_config, device_ids, host_peer_put_chip)
 
 
+def _build_host_four_rank_exchange():
+    """Exchange each rank's Host DDR row with all three remote peers."""
+
+    @pl.jit.incore
+    def publish(
+        src: pld.DistributedTensor[[1, 64], pl.FP32],
+        dst: pl.InOut[pld.DistributedTensor[[4, 64], pl.FP32]],
+    ) -> pld.DistributedTensor[[4, 64], pl.FP32]:
+        ctx = pld.get_comm_ctx(dst)
+        rank = pld.rank(ctx)
+        dst = pl.store(pl.load(src, [0, 0], [1, 64]), [rank, 0], dst)
+        for peer in pl.range(pld.nranks(ctx)):
+            if peer != rank:
+                pld.tensor.put_async(
+                    dst,
+                    peer=peer,
+                    src=src,
+                    dst_offsets=[rank, 0],
+                    src_offsets=[0, 0],
+                    shape=[1, 64],
+                    engine=pld.CommEngine.URMA,
+                )
+        return dst
+
+    @pl.jit.incore
+    def announce(
+        published: pld.DistributedTensor[[4, 64], pl.FP32],
+        signal: pl.InOut[pld.DistributedTensor[[4, 1], pl.INT32]],
+    ) -> pld.DistributedTensor[[4, 1], pl.INT32]:
+        # The published input orders notification after all outgoing PUTs retire.
+        ctx = pld.get_comm_ctx(signal)
+        rank = pld.rank(ctx)
+        for peer in pl.range(pld.nranks(ctx)):
+            if peer != rank:
+                pld.system.notify(signal, peer=peer, offsets=[rank, 0], value=1, op=pld.NotifyOp.Set)
+        return signal
+
+    @pl.jit.incore
+    def await_peers(
+        signal: pl.InOut[pld.DistributedTensor[[4, 1], pl.INT32]],
+    ) -> pld.DistributedTensor[[4, 1], pl.INT32]:
+        ctx = pld.get_comm_ctx(signal)
+        rank = pld.rank(ctx)
+        for peer in pl.range(pld.nranks(ctx)):
+            if peer != rank:
+                pld.system.wait(signal, offsets=[peer, 0], expected=1, cmp=pld.WaitCmp.Ge)
+        return signal
+
+    @pl.jit.incore
+    def fetch(
+        src: pld.DistributedTensor[[1, 64], pl.FP32],
+        signal: pld.DistributedTensor[[4, 1], pl.INT32],
+        dst: pl.InOut[pld.DistributedTensor[[4, 64], pl.FP32]],
+    ) -> pld.DistributedTensor[[4, 64], pl.FP32]:
+        # Every peer has filled its source before publishing its completion signal.
+        ctx = pld.get_comm_ctx(dst)
+        rank = pld.rank(ctx)
+        dst = pl.store(pl.load(src, [0, 0], [1, 64]), [rank, 0], dst)
+        for peer in pl.range(pld.nranks(ctx)):
+            if peer != rank:
+                pld.tensor.get_async(
+                    dst,
+                    peer=peer,
+                    src=src,
+                    dst_offsets=[peer, 0],
+                    src_offsets=[0, 0],
+                    shape=[1, 64],
+                    engine=pld.CommEngine.URMA,
+                )
+        return dst
+
+    @pl.jit.incore
+    def readback(
+        data: pld.DistributedTensor[[4, 64], pl.FP32],
+        signal: pld.DistributedTensor[[4, 1], pl.INT32],
+        out: pl.Out[pl.Tensor[[4, 64], pl.FP32]],
+    ) -> pl.Tensor[[4, 64], pl.FP32]:
+        return pl.store(pl.load(data, [0, 0], [4, 64]), [0, 0], out)
+
+    @pl.jit
+    def chip_orch(
+        inp: pl.Tensor[[1, 64], pl.FP32],
+        out_put: pl.Out[pl.Tensor[[4, 64], pl.FP32]],
+        out_get: pl.Out[pl.Tensor[[4, 64], pl.FP32]],
+        src: pl.InOut[pld.DistributedTensor[[1, 64], pl.FP32]],
+        recv_put: pl.InOut[pld.DistributedTensor[[4, 64], pl.FP32]],
+        recv_get: pl.InOut[pld.DistributedTensor[[4, 64], pl.FP32]],
+        signal: pl.InOut[pld.DistributedTensor[[4, 1], pl.INT32]],
+    ) -> pl.Tensor[[4, 64], pl.FP32]:
+        filled = fill_host(inp, src)
+        published = publish(filled, recv_put)
+        announced = announce(published, signal)
+        waited = await_peers(announced)
+        fetched = fetch(filled, waited, recv_get)
+        readback(published, waited, out_put)
+        return readback(fetched, waited, out_get)
+
+    @pl.jit.host
+    def host_orch(
+        inputs: pl.Tensor[[4, 1, 64], pl.FP32],
+        outputs_put: pl.Out[pl.Tensor[[4, 4, 64], pl.FP32]],
+        outputs_get: pl.Out[pl.Tensor[[4, 4, 64], pl.FP32]],
+    ) -> pl.Tensor[[4, 4, 64], pl.FP32]:
+        src_buf = pld.alloc_window_buffer([1, 64], dtype=pl.FP32, memory_source="host")
+        put_buf = pld.alloc_window_buffer([4, 64], dtype=pl.FP32, memory_source="host")
+        get_buf = pld.alloc_window_buffer([4, 64], dtype=pl.FP32, memory_source="host")
+        signal_buf = pld.alloc_window_buffer([4, 1], dtype=pl.INT32, memory_source="device")
+        for r in pl.range(4):
+            src = pld.window(src_buf, [1, 64], dtype=pl.FP32)
+            recv_put = pld.window(put_buf, [4, 64], dtype=pl.FP32)
+            recv_get = pld.window(get_buf, [4, 64], dtype=pl.FP32)
+            signal = pld.window(signal_buf, [4, 1], dtype=pl.INT32)
+            chip_orch(inputs[r], outputs_put[r], outputs_get[r], src, recv_put, recv_get, signal, device=r)
+        return outputs_get
+
+    return host_orch
+
+
+@pytest.mark.platforms("a5")
+def test_host_domain_urma_four_rank_exchange(test_config, device_ids):
+    """All four ranks PUT to and GET from every peer's Host DDR window."""
+    if len(device_ids) < 4:
+        pytest.skip("Host URMA exchange requires four A5 devices")
+    inputs = torch.arange(1, 257, dtype=torch.float32).reshape(4, 1, 64)
+    outputs_put = torch.full((4, 4, 64), -1.0, dtype=torch.float32)
+    outputs_get = torch.full_like(outputs_put, -1)
+    compiled = _build_host_four_rank_exchange().compile(
+        inputs,
+        outputs_put,
+        outputs_get,
+        config=RunConfig(
+            platform=test_config.platform,
+            distributed_config=DistributedConfig(device_ids=device_ids[:4], num_sub_workers=0),
+        ),
+    )
+    if test_config.codegen_only:
+        pytest.skip("--codegen-only compiled four-rank Host URMA exchange without device execution")
+    for step in range(3):
+        inputs.add_(1000)
+        outputs_put.fill_(-1)
+        outputs_get.fill_(-1)
+        compiled(inputs, outputs_put, outputs_get, config=RunConfig(platform=test_config.platform))
+        expected = inputs.transpose(0, 1).expand(4, 4, 64)
+        assert torch.equal(outputs_put, expected), f"Host peer PUT mismatch on dispatch {step}"
+        assert torch.equal(outputs_get, expected), f"Host peer GET mismatch on dispatch {step}"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
