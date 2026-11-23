@@ -157,7 +157,14 @@ KNOWN_ISSUES.md
 .scratch/
 
 # Documentation build
-docs/_build/
+# Keep generated documentation ignored, except the shared-domain/L4 design sources.
+docs/_build/*
+!docs/_build/SharedDomain/
+!docs/_build/L4/
+docs/_build/SharedDomain/*
+docs/_build/L4/*
+!docs/_build/SharedDomain/*.md
+!docs/_build/L4/*.md
 site/
 
 # Package managers
