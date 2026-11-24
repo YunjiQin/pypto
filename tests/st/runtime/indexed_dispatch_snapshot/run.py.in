@@ -1,0 +1,142 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+"""Compile, validate and time a complete indexed dispatch on allocated A5 devices."""
+
+import argparse
+import hashlib
+import json
+import os
+import subprocess
+from pathlib import Path
+
+import torch
+from simpler import Worker
+
+from .test_indexed_dispatch import TestIndexedDispatch
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument("--nranks", type=int, default=8)
+    parser.add_argument("--device", help="Comma-separated device IDs supplied by task-submit")
+    parser.add_argument("--local-experts", type=int, default=3)
+    parser.add_argument("--tokens", type=int, default=72)
+    parser.add_argument("--dtype", choices=("bf16", "fp8"), default="bf16")
+    parser.add_argument("--transport", choices=("mte", "urma"), default="urma")
+    parser.add_argument("--routing", choices=("uniform", "spread", "local", "hotspot", "empty"), default="uniform")
+    parser.add_argument("--alignment", type=int, default=1)
+    parser.add_argument("--warmup", type=int, default=5)
+    parser.add_argument("--samples", type=int, default=100)
+    parser.add_argument("--output", type=Path, default=Path("outputs/indexed_dispatch/results.json"))
+    args = parser.parse_args()
+    if not 2 <= args.nranks <= 8 or not 1 <= args.tokens <= 72:
+        parser.error("supports 2..8 ranks and 1..72 tokens")
+    if args.local_experts != 3:
+        parser.error("this snapshot requires local-experts=3")
+    if args.alignment <= 0 or args.warmup < 0 or args.samples <= 0:
+        parser.error("alignment/samples must be positive and warmup nonnegative")
+    torch.set_num_threads(1)
+    case = TestIndexedDispatch()
+    compiled = case._compile_l3_callables("a5")
+    if args.compile_only:
+        print("A5 indexed dispatch compile PASS", flush=True)
+        return
+    devices = [int(v) for v in (args.device or os.environ["TASK_DEVICE"]).split(",")]
+    if len(devices) != args.nranks:
+        parser.error("TASK_DEVICE must contain exactly nranks devices")
+    worker = Worker(level=3, device_ids=devices, num_sub_workers=0, platform="a5", runtime="tensormap_and_ringbuffer")
+    handles = {"indexed_dispatch": worker.register(compiled["indexed_dispatch"])}
+    worker.init()
+    params = vars(args) | {"iterations": args.warmup + args.samples}
+    try:
+        case._run_and_validate_l3(worker, handles, {}, {"params": params, "config": {}})
+    finally:
+        worker.close()
+    timing = case.timings[:, args.warmup :]
+    # SYS_CNT is the nanosecond architectural counter; get_sys_cnt() is a separate 50-MHz API.
+    spans = (timing[:, :, :, 5].amax(dim=2) - timing[:, :, :, 0].amin(dim=2)).double() / 1000
+    samples = spans.amax(dim=0)
+    stages = {}
+    for name, start, end in (
+        ("route", 0, 1),
+        ("transfer_and_control", 1, 3),
+        ("count_exchange", 1, 10),
+        ("remote_submit_or_mte", 10, 11),
+        ("self_ready_and_copy", 11, 12),
+        ("cq_wait_after_self", 12, 2),
+        ("receive_readiness", 2, 3),
+        ("histogram_prefix", 3, 4),
+        ("expand", 4, 5),
+    ):
+        values = (timing[:, :, :, end] - timing[:, :, :, start]).double() / 1000
+        stages[name] = {
+            "max_lane_mean_us": values.amax(dim=(0, 2)).mean().item(),
+            "all_lane_mean_us": values.mean().item(),
+        }
+    sources = {
+        str(p.relative_to(Path(__file__).parent)): hashlib.sha256(p.read_bytes()).hexdigest()
+        for p in Path(__file__).parent.rglob("*")
+        if p.suffix in (".py", ".cpp", ".h")
+    }
+    result = {
+        "shape": {
+            "nranks": args.nranks,
+            "tokens_per_rank": args.tokens,
+            "hidden": 5120,
+            "topk": 6,
+            "local_experts": args.local_experts,
+            "alignment": args.alignment,
+            "dtype": args.dtype,
+        },
+        "routing": args.routing,
+        "seed": 41,
+        "transport": args.transport,
+        "devices": devices,
+        "warmup": args.warmup,
+        "samples": args.samples,
+        "metric": (
+            "max-rank device dispatch span including route, transfer, barriers, histogram/prefix "
+            "and expansion; excludes task launch, host staging, round-start barrier and timing publication"
+        ),
+        "min_us": samples.min().item(),
+        "median_us": torch.quantile(samples, 0.5).item(),
+        "mean_us": samples.mean().item(),
+        "p95_us": torch.quantile(samples, 0.95).item(),
+        "max_us": samples.max().item(),
+        "samples_us": samples.tolist(),
+        "per_rank_samples_us": spans.tolist(),
+        "stages": stages,
+        "timing_schema_version": 2,
+        "aiv_workers": timing.shape[2],
+        "raw_timing_ns": timing.tolist(),
+        "send_records": timing[:, 0, : args.nranks, 6].tolist(),
+        "write_sqes_per_rank": timing[:, 0, :, 8].sum(dim=1).tolist(),
+        "correctness": "PASS: final full payload/metadata/weights/scales/counts/reverse mapping and expert padding",
+        "source_sha256": sources,
+        "simpler_revision": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+        "pto_isa_pin": Path("pto_isa.pin").read_text().strip(),
+    }
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(result, indent=2) + "\n")
+    print(
+        json.dumps(
+            {
+                k: v
+                for k, v in result.items()
+                if k not in ("source_sha256", "samples_us", "per_rank_samples_us", "raw_timing_ns")
+            },
+            indent=2,
+        ),
+        flush=True,
+    )
+
+
+if __name__ == "__main__":
+    main()

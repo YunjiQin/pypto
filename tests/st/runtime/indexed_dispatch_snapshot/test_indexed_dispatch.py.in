@@ -1,0 +1,244 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+"""End-to-end device tests for rank-deduplicated indexed dispatch."""
+
+import torch
+from simpler.task_interface import ArgDirection as D
+from simpler.task_interface import CommBufferSpec, DataType, TaskArgs, TensorArgType
+
+from examples.a5.tensormap_and_ringbuffer.indexed_dispatch.reference import make_inputs, reference_dispatch
+from simpler_setup import Scalar, SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
+from simpler_setup.scene_test import _rehosted_buffer_for, _rehosted_ref_for
+
+CONTROL_STRIDE = 512
+
+
+def dispatch_workers(peers):
+    return (32 // peers) * peers
+
+
+def dispatch_orchestration(orch, callables, task_args, config):
+    peers = task_args.nranks
+    n, words = task_args.x_0.shape
+    meta_words = task_args.meta_0.shape[1]
+    control_words = (dispatch_workers(peers) * CONTROL_STRIDE + peers * peers + 15) // 16 * 16
+    specs = [
+        CommBufferSpec(name="reserved", dtype="int32", count=64, nbytes=256),
+        CommBufferSpec(name="x", dtype="int32", count=n * 2560, nbytes=n * 2560 * 4),
+        CommBufferSpec(name="meta", dtype="int32", count=n * 56, nbytes=(n * 56 * 4 + 63) // 64 * 64),
+        CommBufferSpec(
+            name="records",
+            dtype="int32",
+            count=peers * n * (2560 + 56),
+            nbytes=(peers * n * (2560 + 56) * 4 + 63) // 64 * 64,
+        ),
+        CommBufferSpec(name="control", dtype="int32", count=control_words, nbytes=control_words * 4),
+    ]
+    handle = orch.get_or_allocate_domain(
+        name="indexed_dispatch",
+        members=list(range(peers)),
+        retain_after_run=True,
+        window_size=max(16 * 1024 * 1024, sum(s.nbytes for s in specs)),
+        buffers=specs,
+    )
+    for rank in range(peers):
+        for name in ("x", "meta", "control"):
+            value = getattr(task_args, f"{name}_{rank}")
+            orch.copy_to(
+                handle[rank].buffers[name],
+                _rehosted_buffer_for(task_args, value),
+                nbytes=value.numel() * value.element_size(),
+            )
+    for rank in range(peers):
+        domain = handle[rank]
+        args = TaskArgs()
+        for name, shape, direction in (
+            ("x", (n, words), TensorArgType.INPUT),
+            ("meta", (n, meta_words), TensorArgType.INPUT),
+            ("records", (peers * n, words + meta_words), TensorArgType.INOUT),
+            ("control", (control_words,), TensorArgType.INOUT),
+        ):
+            args.add_tensor(domain.buffers[name].tensor(shape, DataType.INT32), direction)
+        for name in ("expert_x", "expert_meta", "counts", "stats"):
+            args.add_tensor(
+                _rehosted_ref_for(task_args, getattr(task_args, f"{name}_{rank}")),
+                TensorArgType.OUTPUT_EXISTING,
+            )
+        args.add_scalar(domain.device_ctx)
+        args.add_scalar(task_args.iterations)
+        args.add_scalar(task_args.alignment)
+        args.add_scalar(task_args.transport)
+        orch.submit_next_level(callables.indexed_dispatch, args, config, worker=rank)
+
+
+@scene_test(level=3, runtime="tensormap_and_ringbuffer")
+class TestIndexedDispatch(SceneTestCase):
+    CALLABLE = {
+        "orchestration": dispatch_orchestration,
+        "callables": [
+            {
+                "name": "indexed_dispatch",
+                "orchestration": {
+                    "source": "kernels/orchestration/dispatch.cpp",
+                    "function_name": "indexed_dispatch",
+                    "config_name": "indexed_dispatch_config",
+                    "signature": [D.IN, D.IN, D.INOUT, D.INOUT, D.OUT, D.OUT, D.OUT, D.OUT, D.IN, D.IN, D.IN, D.IN],
+                },
+                "incores": [
+                    {
+                        "func_id": 0,
+                        "source": "kernels/aiv/dispatch.cpp",
+                        "core_type": "aiv",
+                        "extra_include_dirs": [
+                            "${ASCEND_HOME_PATH}/asc",
+                            "${ASCEND_HOME_PATH}/aarch64-linux/asc",
+                            "${ASCEND_HOME_PATH}/x86_64-linux/asc",
+                        ],
+                        "signature": [D.IN, D.IN, D.INOUT, D.INOUT, D.OUT, D.OUT, D.OUT, D.OUT, D.IN, D.IN, D.IN, D.IN],
+                    }
+                ],
+            }
+        ],
+    }
+    CASES = [
+        {
+            "name": f"{transport}_{dtype}_{routing}",
+            "platforms": ["a5"],
+            "config": {"device_count": 2, "num_sub_workers": 0},
+            "params": {
+                "nranks": 2,
+                "tokens": 8,
+                "topk": 2,
+                "dtype": dtype,
+                "routing": routing,
+                "transport": transport,
+                "alignment": 4,
+                "iterations": 3,
+            },
+        }
+        for transport in ("mte", "urma")
+        for dtype in ("bf16", "fp8")
+        for routing in ("uniform", "empty", "local", "hotspot")
+    ]
+
+    CASES += [
+        {
+            "name": f"urma_{dtype}_single_source",
+            "platforms": ["a5"],
+            "config": {"device_count": 2, "num_sub_workers": 0},
+            "params": {
+                "nranks": 2,
+                "tokens": 8,
+                "topk": 6,
+                "dtype": dtype,
+                "transport": "urma",
+                "alignment": 4,
+                "iterations": 3,
+                "single_source": True,
+            },
+        }
+        for dtype in ("bf16", "fp8")
+    ]
+
+    def generate_args(self, params):
+        if params.get("local_experts", 3) != 3:
+            raise ValueError("This measured snapshot requires exactly 3 local experts")
+        peers, tokens = params.get("nranks", 8), params.get("tokens", 72)
+        x, meta = make_inputs(
+            nranks=peers,
+            tokens=tokens,
+            topk=params.get("topk", 6),
+            dtype=params.get("dtype", "bf16"),
+            routing=params.get("routing", "uniform"),
+            local_experts=params.get("local_experts", 3),
+        )
+        if params.get("single_source", False):
+            meta[0, :, :6] = -1
+            meta[0, :, 0] = 65536
+            meta[0, :, 1] = -65536
+            meta[0, :, 6:12] = 0
+        expected = reference_dispatch(
+            x, meta, alignment=params.get("alignment", 1), local_experts=params.get("local_experts", 3)
+        )
+        iterations = params.get("iterations", 105)
+        specs = []
+        for rank in range(peers):
+            specs.extend(
+                [
+                    TensorArg(f"x_{rank}", x[rank]),
+                    TensorArg(f"meta_{rank}", meta[rank]),
+                    TensorArg(
+                        f"control_{rank}",
+                        torch.zeros(
+                            (dispatch_workers(peers) * CONTROL_STRIDE + peers * peers + 15) // 16 * 16,
+                            dtype=torch.int32,
+                        ),
+                    ),
+                    TensorArg(f"expert_x_{rank}", torch.full_like(expected["expert_x"][rank], 0x345678)),
+                    TensorArg(f"expert_meta_{rank}", torch.full_like(expected["expert_metadata"][rank], -1)),
+                    TensorArg(f"counts_{rank}", torch.zeros_like(expected["expert_counts"][rank])),
+                    TensorArg(f"stats_{rank}", torch.zeros(iterations, dispatch_workers(peers), 16, dtype=torch.int64)),
+                ]
+            )
+        specs.extend(
+            [
+                Scalar("nranks", peers),
+                Scalar("iterations", iterations),
+                Scalar("alignment", params.get("alignment", 1)),
+                Scalar("transport", int(params.get("transport", "urma") == "urma")),
+            ]
+        )
+        return TaskArgsBuilder(*specs)
+
+    def compute_golden(self, args, params):
+        peers = params.get("nranks", 8)
+        expected = reference_dispatch(
+            torch.stack([getattr(args, f"x_{r}") for r in range(peers)]),
+            torch.stack([getattr(args, f"meta_{r}") for r in range(peers)]),
+            alignment=params.get("alignment", 1),
+            local_experts=params.get("local_experts", 3),
+        )
+        for r in range(peers):
+            getattr(args, f"expert_x_{r}").copy_(expected["expert_x"][r])
+            getattr(args, f"expert_meta_{r}").copy_(expected["expert_metadata"][r])
+            getattr(args, f"counts_{r}").copy_(expected["expert_counts"][r])
+
+    def compare_outputs(self, actual, expected, output_names, params):
+        del output_names
+        peers = params.get("nranks", 8)
+        for r in range(peers):
+            counts = getattr(actual, f"counts_{r}")
+            torch.testing.assert_close(counts, getattr(expected, f"counts_{r}"), rtol=0, atol=0)
+            for count, start, end in counts.tolist():
+                assert end - start == count
+                torch.testing.assert_close(
+                    getattr(actual, f"expert_x_{r}")[start:end],
+                    getattr(expected, f"expert_x_{r}")[start:end],
+                    rtol=0,
+                    atol=0,
+                )
+                torch.testing.assert_close(
+                    getattr(actual, f"expert_meta_{r}")[start:end],
+                    getattr(expected, f"expert_meta_{r}")[start:end],
+                    rtol=0,
+                    atol=0,
+                )
+                padding_end = start + (count + params.get("alignment", 1) - 1) // params.get(
+                    "alignment", 1
+                ) * params.get("alignment", 1)
+                assert torch.count_nonzero(getattr(actual, f"expert_x_{r}")[end:padding_end]) == 0
+            stats = getattr(actual, f"stats_{r}")
+            assert torch.all(stats[:, :, 9] == 2)
+            stamps = stats[:, :, [0, 1, 10, 11, 12, 2, 3, 4, 5]]
+            assert torch.all(stamps[:, :, 1:] >= stamps[:, :, :-1])
+        self.timings = torch.stack([getattr(actual, f"stats_{r}").clone() for r in range(peers)])
+
+
+if __name__ == "__main__":
+    SceneTestCase.run_module(__name__)
