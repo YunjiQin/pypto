@@ -1,6 +1,6 @@
 # 跨 program 共享通信域实现方案
 
-状态：**设计稿，未实现、未执行硬件验收**。文中的新增接口、metadata 和生成代码是目标契约，不是当前可运行 API。
+This directory preserves the original design. The implementation derives window/context pairing from parameter order and stores the public parameter types in schema 4. Standalone HOST entries receive external window indices and domain references through the existing positional TaskArgs. See the [implemented L3 contract](../../zh/dev/06-persistent-l3.md) and the [device acceptance tests](../../../tests/st/distributed/test_shared_domain.py).
 
 目标：Prefill 与 Decode 独立编译，在同一个 L3 worker 中通过各自的 `DistributedTensor` 形参使用同一个外部通信域。用户不传 ctx；编译器追加配对 ctx，`submit` 自动补齐。L3 的窗口绑定和编排体不区分资源由本地 worker 还是 L4 创建。
 
@@ -66,4 +66,4 @@ with DistributedWorker([prefill_compiled, decode_compiled]) as worker:
 
 ## 交付边界
 
-本分支交付 SharedDomain 与 L4 的设计文档，不包含功能实现。`.gitignore` 仅允许跟踪这两个设计目录的 Markdown，其他构建输出继续忽略。正式实现时应将稳定契约同步到 `docs/en/dev/` 及 `docs/zh/dev/`。
+This implementation covers external domain creation, binding, reuse and release on one L3 worker. Cross-node orchestration belongs to the subsequent L4 project.
