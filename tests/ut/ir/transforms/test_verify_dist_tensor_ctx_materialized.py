@@ -18,6 +18,7 @@ untouched (no function declares a DistributedTensor parameter).
 """
 
 import pypto.language as pl
+import pypto.language.distributed as pld
 import pytest
 from pypto import ir, passes
 
@@ -75,12 +76,14 @@ def test_chip_orchestration_get_comm_ctx_is_flagged():
     assert "chip_orch" in errors[0].message
 
 
-def test_host_orchestration_get_comm_ctx_is_allowed():
-    """Host codegen resolves the query from the window's per-rank context."""
+def test_host_parameter_query_requires_materialization():
+    """Incoming windows already have a paired context in materialized IR."""
     # `func_type=Orchestration` implies level=CHIP, so host orchestration is
     # spelled with the HOST level plus the Orchestrator role.
     host = _get_ctx_function("host_orch", level=ir.Level.HOST, role=ir.Role.Orchestrator)
-    assert _errors(ir.Program([host], "host_get_ctx", _span())) == []
+    assert any(
+        "pld.system.get_comm_ctx" in d.message for d in _errors(ir.Program([host], "host_get_ctx", _span()))
+    )
 
 
 def test_program_without_get_comm_ctx_passes():
@@ -108,3 +111,23 @@ def test_property_is_verified_on_the_default_path():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def test_external_window_cannot_use_another_parameters_context():
+    @pl.program
+    class Mismatched:
+        @pl.function(level=pl.Level.CHIP, role=pl.Role.Orchestrator)
+        def chip(self, a: pld.DistributedTensor[[4], pl.FP32], ctx: pld.CommCtx):
+            return
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host(
+            self,
+            a: pld.DistributedTensor[[4], pl.FP32],
+            b: pld.DistributedTensor[[4], pl.FP32],
+            a_ctx: pld.CommCtx,
+            b_ctx: pld.CommCtx,
+        ):
+            self.chip(a, b_ctx, device=0)
+
+    assert any("Incorrect paired CommCtx" in d.message for d in _errors(Mismatched))

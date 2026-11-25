@@ -510,7 +510,11 @@ def signature_tensor_meta(
     remains extent-independent. ``dynvar_cls`` is the lazily-imported ``DynVar``
     type. ``param_name`` / ``func_name`` only feed diagnostics.
     """
+    from pypto.language.distributed.typing import DistributedTensor  # noqa: PLC0415
+
     shape = annotation.shape
+    if isinstance(annotation, DistributedTensor) and annotation.memref is not None:
+        raise ValueError(f"DistributedTensor parameter {param_name!r} must begin at the buffer start")
     extents = [
         1 if (i in dyn_for_param or isinstance(dim, dynvar_cls)) else int(dim) for i, dim in enumerate(shape)
     ]

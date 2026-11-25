@@ -123,6 +123,8 @@ class LocalNameCollector : public IRVisitor {
   used_names.insert(collector.names.begin(), collector.names.end());
   for (size_t i = 0; i < func->params_.size(); ++i) {
     const auto& param = func->params_[i];
+    CHECK_SPAN(!IsHostOrch(func) || !IsA<CommCtxType>(param->GetType()), param->span_)
+        << "HOST entry CommCtx parameters are supplied by MaterializeDistTensorCtx";
     if (!As<DistributedTensorType>(param->GetType())) continue;
     auto ctx = std::make_shared<Var>(MakeUniqueName(MakeCtxParamBaseName(param), &used_names),
                                      GetCommCtxType(), param->span_);
@@ -258,9 +260,8 @@ class MaterializeDistTensorCtxMutator : public IRMutator {
     if (IsOp(call, "pld.system.get_comm_ctx")) {
       INTERNAL_CHECK_SPAN(call->args_.size() == 1, call->span_)
           << "MaterializeDistTensorCtx: pld.system.get_comm_ctx expects exactly one argument";
-      if (IsHostOrch(current_func_)) return call;
-
       auto ctx = LookupExistingCtx(call->args_[0]);
+      if (!ctx && IsHostOrch(current_func_)) return call;
       CHECK_SPAN(ctx, call->span_)
           << "Cannot resolve pld.system.get_comm_ctx(" << DescribeDistValue(call->args_[0]) << ") in '"
           << (current_func_ ? current_func_->name_ : std::string("<unknown>"))
@@ -485,13 +486,26 @@ class MaterializeDistTensorCtxMutator : public IRMutator {
 /// code.
 class GetCommCtxCallChecker : public IRVisitor {
  public:
-  GetCommCtxCallChecker(std::vector<Diagnostic>& diagnostics, std::string func_name)
-      : diagnostics_(diagnostics), func_name_(std::move(func_name)) {}
+  GetCommCtxCallChecker(std::vector<Diagnostic>& diagnostics, const FunctionPtr& func)
+      : diagnostics_(diagnostics), func_name_(func->name_), host_(IsHostOrch(func)) {}
 
  protected:
+  void VisitStmt_(const AssignStmtPtr& stmt) override {
+    if (host_) {
+      auto value = As<Call>(stmt->value_);
+      if (value && IsOp(value, "pld.tensor.window")) local_views_.insert(stmt->var_.get());
+    }
+    IRVisitor::VisitStmt_(stmt);
+  }
+
   void VisitExpr_(const CallPtr& op) override {
     IRVisitor::VisitExpr_(op);
     if (!op || !op->op_ || !IsOp(op, "pld.system.get_comm_ctx")) return;
+    if (host_ && op->args_.size() == 1) {
+      const auto& arg = op->args_.front();
+      auto type = As<DistributedTensorType>(arg->GetType());
+      if (type && (type->window_buffer_ || local_views_.count(AsVarLike(arg).get()))) return;
+    }
     diagnostics_.emplace_back(
         DiagnosticSeverity::Error, "DistTensorCtxMaterialized", 0,
         "Function '" + func_name_ +
@@ -504,6 +518,98 @@ class GetCommCtxCallChecker : public IRVisitor {
  private:
   std::vector<Diagnostic>& diagnostics_;
   std::string func_name_;
+  bool host_;
+  std::unordered_set<const Var*> local_views_;
+};
+
+// A type check alone cannot distinguish two CommCtx arguments. For an external
+// HOST window follow the window lineage and check its actual paired context.
+class ExternalCtxChecker : public IRVisitor {
+ public:
+  ExternalCtxChecker(const ProgramPtr& program, const FunctionPtr& host, std::vector<Diagnostic>& diagnostics)
+      : program_(program), diagnostics_(diagnostics) {
+    for (const auto& [gv, func] : program->functions_) {
+      auto& plan = plans_[func->name_];
+      plan.returned_param_indices = return_lineage::ExplicitReturnedParamIndices(func);
+      for (size_t i = 0; i < func->params_.size(); ++i) {
+        if (As<DistributedTensorType>(func->params_[i]->GetType())) plan.dist_param_indices.push_back(i);
+      }
+    }
+    auto& plan = plans_.at(host->name_);
+    const auto first_ctx = host->params_.size() - plan.dist_param_indices.size();
+    for (size_t j = 0; j < plan.dist_param_indices.size(); ++j) {
+      const auto& ctx = host->params_.at(first_ctx + j);
+      if (!IsA<CommCtxType>(ctx->GetType()) ||
+          host->param_directions_.at(first_ctx + j) != ParamDirection::In) {
+        Error("HOST DistributedTensor requires a paired input CommCtx suffix", host->span_);
+        return;
+      }
+      plan.param_to_ctx.emplace(host->params_[plan.dist_param_indices[j]].get(), ctx);
+    }
+    aliases_ = std::make_unique<DistParamAliasCollector>(program_, &plans_, &plan);
+    aliases_->VisitStmt(host->body_);
+    VisitStmt(host->body_);
+  }
+
+ protected:
+  void VisitStmt_(const AssignStmtPtr& op) override {
+    if (IsA<CommCtxType>(op->var_->GetType())) {
+      if (auto src = AsVarLike(op->value_)) {
+        const auto it = ctx_aliases_.find(src.get());
+        ctx_aliases_[op->var_.get()] = it == ctx_aliases_.end() ? src.get() : it->second;
+      }
+    }
+    IRVisitor::VisitStmt_(op);
+  }
+
+  void VisitExpr_(const CallPtr& call) override {
+    CheckPairing(call->op_, call->args_, call->span_);
+    IRVisitor::VisitExpr_(call);
+  }
+
+  void VisitExpr_(const SubmitPtr& submit) override {
+    CheckPairing(submit->op_, submit->args_, submit->span_);
+    IRVisitor::VisitExpr_(submit);
+  }
+
+ private:
+  void Error(const std::string& message, const Span& span) {
+    diagnostics_.emplace_back(DiagnosticSeverity::Error, "DistTensorCtxMaterialized", 0, message, span);
+  }
+
+  void CheckPairing(const OpPtr& op, const std::vector<ExprPtr>& args, const Span& span) {
+    auto gv = As<GlobalVar>(op);
+    if (!gv) return;
+    auto it = plans_.find(gv->name_);
+    if (it == plans_.end()) return;
+    const auto& indices = it->second.dist_param_indices;
+    if (indices.empty()) return;
+    if (args.size() < indices.size()) {
+      Error("Missing CommCtx arguments calling " + gv->name_, span);
+      return;
+    }
+    // The suffix is at the end of the actuals even when Submit omits an Out.
+    const size_t first_ctx = args.size() - indices.size();
+    for (size_t j = 0; j < indices.size(); ++j) {
+      if (indices[j] >= first_ctx) {
+        Error("A DistributedTensor output must be supplied explicitly", span);
+        continue;
+      }
+      auto expected = aliases_->ResolveCtx(args[indices[j]]);
+      if (!expected) continue;
+      auto actual = AsVarLike(args[first_ctx + j]).get();
+      auto alias = ctx_aliases_.find(actual);
+      if (expected.get() != (alias == ctx_aliases_.end() ? actual : alias->second)) {
+        Error("Incorrect paired CommCtx for DistributedTensor calling " + gv->name_, span);
+      }
+    }
+  }
+
+  ProgramPtr program_;
+  std::vector<Diagnostic>& diagnostics_;
+  std::unordered_map<std::string, FunctionCtxPlan> plans_;
+  std::unique_ptr<DistParamAliasCollector> aliases_;
+  std::unordered_map<const Var*, const Var*> ctx_aliases_;
 };
 
 class DistTensorCtxMaterializedPropertyVerifierImpl : public PropertyVerifier {
@@ -513,9 +619,12 @@ class DistTensorCtxMaterializedPropertyVerifierImpl : public PropertyVerifier {
   void Verify(const ProgramPtr& program, std::vector<Diagnostic>& diagnostics) override {
     if (!program) return;
     for (const auto& [gv, func] : program->functions_) {
-      if (!func || !func->body_ || IsHostOrch(func)) continue;
-      GetCommCtxCallChecker checker(diagnostics, func->name_);
+      if (!func || !func->body_) continue;
+      GetCommCtxCallChecker checker(diagnostics, func);
       checker.VisitStmt(func->body_);
+      if (IsHostOrch(func) && HasDistTensorParam(func)) {
+        ExternalCtxChecker pairing(program, func, diagnostics);
+      }
     }
   }
 };
